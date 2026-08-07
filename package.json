@@ -1,0 +1,64 @@
+{
+  "name": "bismar",
+  "version": "0.1.0",
+  "description": "Bundle JS packages into single files and measure min+gzip size of every export",
+  "files": [
+    "bismar.js",
+    "bismar.d.ts",
+    "public.js",
+    "public.d.ts",
+    "refs.js",
+    "refs.d.ts",
+    "registries.js",
+    "registries.d.ts",
+    "size.js",
+    "size.d.ts",
+    "interactive.js",
+    "interactive.d.ts",
+    "env.js",
+    "env.d.ts",
+    "fs-modify.js",
+    "fs-modify.d.ts",
+    "vendor",
+    "src/vendor/speed-highlight/LICENSE"
+  ],
+  "bin": {
+    "bismar": "bismar.js"
+  },
+  "dependencies": {
+    "esbuild": "0.28.1"
+  },
+  "devDependencies": {
+    "@microsoft/tsdoc": "0.16.0",
+    "@types/node": "24.2.1",
+    "prettier": "3.6.2",
+    "typescript": "6.0.2"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x bismar.js",
+    "format": "npx prettier --write src test/*.ts",
+    "test": "node --test-reporter=spec --test-reporter-destination=stderr test/index.ts",
+    "test:bun": "echo 'No bun'",
+    "test:deno": "echo 'No deno'"
+  },
+  "keywords": [
+    "bundle",
+    "bundler",
+    "size",
+    "gzip",
+    "esbuild",
+    "iife",
+    "single-file"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulmillr/jsbt.git"
+  },
+  "type": "module",
+  "main": "public.js",
+  "module": "public.js",
+  "types": "public.d.ts",
+  "sideEffects": false,
+  "author": "Paul Miller (https://paulmillr.com)",
+  "license": "MIT"
+}

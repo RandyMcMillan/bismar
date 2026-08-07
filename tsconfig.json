@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "Node20",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "sourceMap": false,
+    "declaration": true,
+    "declarationMap": false,
+    // The vendored speed-highlight sources under src/vendor are plain JS, so
+    // one tsc pass compiles them alongside our own code. This is why there is
+    // no "isolatedDeclarations": TypeScript rejects it with allowJs (TS5053).
+    "allowJs": true,
+    "skipLibCheck": true,
+    "allowUnreachableCode": false,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "src",
+    "outDir": "."
+  },
+  "include": ["src"],
+  "exclude": ["node_modules"]
+}
