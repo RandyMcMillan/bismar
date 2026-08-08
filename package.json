@@ -1,6 +1,6 @@
 {
   "name": "bismar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with min+gzip stats per export",
   "files": [
     "bismar.js",
