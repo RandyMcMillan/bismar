@@ -1,7 +1,7 @@
 {
   "name": "bismar",
   "version": "0.1.0",
-  "description": "Bundle JS packages into single files and measure min+gzip size of every export",
+  "description": "Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with min+gzip stats per export",
   "files": [
     "bismar.js",
     "bismar.d.ts",
@@ -37,7 +37,7 @@
   },
   "scripts": {
     "build": "tsc && chmod +x bismar.js",
-    "format": "npx prettier --write src test/*.ts",
+    "format": "npx prettier --write src/*.ts test/*.ts",
     "test": "node --test-reporter=spec --test-reporter-destination=stderr test/index.ts",
     "test:bun": "echo 'No bun'",
     "test:deno": "echo 'No deno'"
@@ -49,7 +49,14 @@
     "gzip",
     "esbuild",
     "iife",
-    "single-file"
+    "single-file",
+    "diff",
+    "navigator",
+    "registry",
+    "npm",
+    "jsr",
+    "crates",
+    "pypi"
   ],
   "repository": {
     "type": "git",

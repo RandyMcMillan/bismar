@@ -1,6 +1,6 @@
 # bismar
 
-> Bundle JS packages into single files and measure min+gzip size of every export
+> Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with min+gzip stats per export
 
 A bismar is the old Norse hand balance for weighing goods. This one:
 
@@ -9,6 +9,9 @@ A bismar is the old Norse hand balance for weighing goods. This one:
 - `bismar <selector> --bundle` packs the selection into a single-file IIFE
 - `bismar <selector> --size` prints min+gzip size stats: it weighs the bundle
 - `bismar --diff <a> <b>` compares two packages recursively
+
+Non-JS ecosystems are browse/diff/download-only: their code is never executed
+or bundled.
 
 Used by [noble cryptography](https://paulmillr.com/noble/) to ensure bundles stay small.
 
@@ -54,7 +57,9 @@ $ bismar -ds crate:serde 1.0.218 1.0.219           # changed files with size del
 Selectors: `npm:x` / `jsr:@scope/x` / `crate:x` / … reach a registry — the
 prefix is always required; `./x`, `../x`, and absolute paths mean the
 filesystem; any bare name, scoped or not, means the local package's public
-surface. File
+surface. Prefixes have aliases: `js:` for npm:, `rust:`/`rs:`/`cargo:` for
+crate:, `ruby:`/`rb:` for gem:, `python:`/`py:` for pypi:, `php:` for
+composer:, `github:` for gh:, `golang:` for go:. File
 selectors take an optional trailing export (`./src/util.js/twice`) and mix
 freely with modules and refs; several selectors bundle together.
 
