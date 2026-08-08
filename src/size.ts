@@ -49,7 +49,6 @@ import {
   explicitRef,
   type ExternalRef,
   installedRef,
-  isNpmSelector,
   noPkgErr,
   npmHintOf,
   parseNpmRef,
@@ -599,13 +598,15 @@ const sizeLine = (
   const tag = dataHeavy(data) ? ` ${paint(DATA_HEAVY_TAG, color.dim, on)}` : '';
   return `${label} ${sizeTail(data.loc, data.minBytes, data.gzBytes)}${tag}`;
 };
-const CSV_HEADERS = ['module', 'export', 'loc', 'minified_bytes', 'gzipped_bytes'];
+// Headerless machine rows, each value tagged with its unit: sort/awk still
+// parse the leading digits, and a row stays self-describing after filtering.
+// Column order: module, export, loc, minified bytes, gzipped bytes.
 const csvCells = (data: RowData) => [
   data.module,
   exportLabel(data.export),
-  data.loc,
-  data.minBytes,
-  data.gzBytes,
+  `${data.loc}loc`,
+  `${data.minBytes}b`,
+  `${data.gzBytes}b`,
 ];
 // Display file for a module: the real export file basename (`ml-kem.js`), or the
 // exports-map key basename when the key is the user-visible spelling.
@@ -647,7 +648,7 @@ const runList = async (
   for (const bare of only) {
     // `.` and the package's own name mean the local package itself: no filter.
     if (bare === '.' || bare === ctx.pkg.name) continue;
-    if (isNpmSelector(bare, ctx.pkg.name)) {
+    if (explicitRef(bare)) {
       const ref = parseNpmRef(asRef(bare));
       if (!refs.has(ref.label)) refs.set(ref.label, ref);
     } else wanted.add(firstModule(ctx.pkg.name, bare));
@@ -739,7 +740,6 @@ export type SizeOpts = {
   outDir: string;
   silent?: boolean;
   single?: boolean;
-  sort?: boolean;
 };
 export const runSize = async (opts: SizeOpts): Promise<void> => {
   let only = [...(opts.only ?? [])];
@@ -772,7 +772,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
       if (!sel) err(`missing input file: ${bad(raw)}`);
       return sel;
     }
-    if (!BARE_FILE.test(raw) || isNpmSelector(raw, pkgName)) return undefined;
+    if (!BARE_FILE.test(raw) || explicitRef(raw)) return undefined;
     if (localNames?.has(firstModule(pkgName, raw))) return undefined;
     return splitFileSel(raw);
   };
@@ -795,10 +795,10 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
       only = [];
     }
   }
-  // Registry names need their prefix (or an @scope): a bare leftover in a
+  // Registry names need their prefix: a bare leftover in a
   // package-less directory can only be a mistake — say where to go.
   if (!input && !hasPkg && only.length) {
-    const stray = only.find((raw) => !isNpmSelector(raw, '') && !fileish(raw));
+    const stray = only.find((raw) => !explicitRef(raw) && !fileish(raw));
     if (stray !== undefined) noPkgErr(stray, baseDir);
   }
   // Prefix-explicit refs and file picks work from anywhere: without a local
@@ -817,7 +817,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
   if (!opts.listOnly) loadBuild();
   let mods = input ? inputMods(ctx, input) : noLocal ? [] : readModules(ctx);
   const localNames = new Set(mods.map((mod) => mod.module));
-  const npmish = (raw: string): boolean => !opts.localOnly && isNpmSelector(raw, ctx.pkg.name);
+  const npmish = (raw: string): boolean => !opts.localOnly && explicitRef(raw);
   // Implicit npm fallbacks keep the local escape route visible on a registry miss.
   const localHint = (error: unknown, implicit: boolean): never => {
     const msg = (error as Error).message;
@@ -1241,14 +1241,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     // The line must be gone before whatever comes next: table, bundle, or error.
     progressDone();
   }
-  // --sort emits two ascending gzip-size groups: module bundles first, then individual
-  // exports; the heaviest of each group lands next to the prompt. Default is unsorted.
-  if (opts.sort) {
-    const rank = (data: RowData): number => (data.export && data.export !== ALL ? 1 : 0);
-    results.sort((a, b) => rank(a) - rank(b) || a.gzBytes - b.gzBytes);
-  }
   if (show && results.length) {
-    if (csv) console.log(csvRow(CSV_HEADERS));
     for (const data of results) {
       if (csv) console.log(csvRow(csvCells(data)));
       else console.log(sizeLine(data, modFile, labelWidth, colorOn));
@@ -1257,7 +1250,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
 };
 // Build exactly one artifact — the widest bundle of the selection — and return it.
 export const buildFirst = async (
-  opts: Omit<SizeOpts, 'onBuilt' | 'onRow' | 'silent' | 'single' | 'sort'>
+  opts: Omit<SizeOpts, 'onBuilt' | 'onRow' | 'silent' | 'single'>
 ): Promise<Built | undefined> => {
   let built: Built | undefined;
   await runSize({

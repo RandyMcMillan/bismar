@@ -30,12 +30,23 @@ should('package build marks the bismar bin executable', () => {
 should('bismar --help documents the single command, every flag and its alias', async () => {
   const out = await capture(() => runCli(['--help'], { tty: false }));
   deepStrictEqual(/^usage:\n  bismar \[<selector>\]/.test(out), true, out);
-  for (const flag of ['--bundle', '--size', '--minify', '--checksum', '--size-sorted', '--list'])
+  for (const flag of ['--bundle', '--size', '--minify', '--list', '--diff', '--clear'])
     deepStrictEqual(out.includes(flag), true, `${flag}\n${out}`);
-  for (const alias of ['-b,', '-s,', '-m,', '-c,', '-l,'])
+  for (const alias of ['-b,', '-s,', '-m,', '-l,', '-d,'])
     deepStrictEqual(out.includes(alias), true, `${alias}\n${out}`);
   // No subcommands and no other binaries: positionals are always selectors.
   deepStrictEqual(/bismar (bundle|size) |jsbt-check|<command>/.test(out), false, out);
+  // Combined shorts and the namespace table are documented too.
+  deepStrictEqual(out.includes('short flags combine: bismar -bm == bismar -b -m'), true, out);
+  deepStrictEqual(out.includes('npm: (or js:)'), true, out);
+  deepStrictEqual(out.includes('crate: (or rust: rs: cargo:)'), true, out);
+});
+
+should('bismar refuses unknown selector namespaces with the full listing', async () => {
+  await rejects(
+    () => runCli(['foo:bar'], { tty: false }),
+    /unknown namespace: foo:; use one of:\nnpm: \(or js:\)\njsr:/
+  );
 });
 
 should('bare bismar off a terminal errs with the mode hints', async () => {
@@ -57,22 +68,13 @@ should('bismar rejects unknown options and cross-mode flag combos', async () => 
     () => runCli(['--size', '--minify'], { tty: false }),
     /--minify shapes the emitted bundle; drop --size/
   );
-  await rejects(
-    () => runCli(['--size', '--checksum'], { tty: false }),
-    /--checksum shapes the emitted bundle; drop --size/
-  );
-  // --size-sorted implies --size, so the contradiction names the flag actually typed.
-  await rejects(
-    () => runCli(['--size-sorted', '--minify'], { tty: false }),
-    /--minify shapes the emitted bundle; drop --size-sorted/
-  );
+  // Deleted flags read as unknown options, not silent no-ops.
+  await rejects(() => runCli(['--checksum'], { tty: false }), /unknown option: --checksum/);
+  await rejects(() => runCli(['-c'], { tty: false }), /unknown option: -c/);
+  await rejects(() => runCli(['--size-sorted'], { tty: false }), /unknown option: --size-sorted/);
   await rejects(
     () => runCli(['-b', '-s'], { tty: false }),
     /--size replaces the bundle output; drop --bundle/
-  );
-  await rejects(
-    () => runCli(['-b', '--size-sorted'], { tty: false }),
-    /--size-sorted replaces the bundle output; drop --bundle/
   );
   await rejects(
     () => runCli(['-b', '--list'], { tty: false }),

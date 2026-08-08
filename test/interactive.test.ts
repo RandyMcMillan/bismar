@@ -1,7 +1,9 @@
 // Tests for `bismar -i`: filesystem-style navigation of modules and exports,
 // driven headlessly through the injectable io of runInteractive.
 import assert, { deepStrictEqual } from 'node:assert';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -9,8 +11,10 @@ import { test as should } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
+// Politeness waits only add latency against the local search stand-in here.
+process.env.BISMAR_RPS = '0';
 
-const { runInteractive } = await import('../src/interactive.ts');
+const { chooseTarget, runInteractive } = await import('../src/interactive.ts');
 const { highlightText } = await import('../src/vendor/speed-highlight/terminal.js');
 
 const FIXTURE = resolve('test/vectors/plain');
@@ -26,7 +30,7 @@ type Session = {
 };
 const open = (
   selector: string | undefined,
-  over: { cols?: number; cwd?: string } = {}
+  over: { cols?: number; cwd?: string; menu?: boolean } = {}
 ): Session => {
   const input = new PassThrough();
   let raw = '';
@@ -42,7 +46,7 @@ const open = (
     rows: 16,
   };
   return {
-    done: runInteractive(selector, { cwd: over.cwd ?? FIXTURE, io }),
+    done: runInteractive(selector, { cwd: over.cwd ?? FIXTURE, io, menu: over.menu }),
     raw: () => raw,
     send: (keys: string) => void input.write(keys),
     text: () => strip(raw),
@@ -55,13 +59,256 @@ const drive = async (selector: string | undefined, keys: string) => {
   return { frames: session.raw(), text: session.text() };
 };
 // Background auto-measure fills stats in on its own schedule; poll for them.
-const waitFor = async (session: Session, re: RegExp): Promise<void> => {
+const waitFor = async (session: Pick<Session, 'text'>, re: RegExp): Promise<void> => {
   for (let i = 0; i < 300; i++) {
     if (re.test(session.text())) return;
     await new Promise((res) => setTimeout(res, 50));
   }
   throw new Error(`timed out waiting for ${re}\n${session.text()}`);
 };
+
+// Headless chooseTarget harness: drives the launcher menu alone; `state` is
+// the parked stage a reopened launcher resumes from.
+const openMenu = (dirLabel: string, state: Record<string, unknown> = {}) => {
+  const input = new PassThrough();
+  let raw = '';
+  const io = {
+    cols: 80,
+    input,
+    output: {
+      write: (text: string) => {
+        raw += text;
+        return true;
+      },
+    },
+    rows: 16,
+  };
+  return {
+    done: chooseTarget(dirLabel, io, state),
+    send: (keys: string) => void input.write(keys),
+    raw: () => raw,
+    text: () => strip(raw),
+  };
+};
+
+should('launcher menu offers the current dir and the six registry searches', async () => {
+  // Bare `bismar` (menu: true) asks first; enter on the first option browses
+  // the current package, and the session follows in the same terminal.
+  const session = open(undefined, { menu: true });
+  session.send('\rq');
+  await session.done;
+  const text = session.text();
+  deepStrictEqual(/bismar · what to open\?/.test(text), true, text);
+  deepStrictEqual(/▸ browse current directory \(plain\)/.test(text), true, text);
+  for (const label of ['JS/NPM', 'JS/JSR', 'Rust/Cargo', 'Ruby/Gems', 'Python/PyPi', 'GitHub'])
+    deepStrictEqual(text.includes(`search ${label}`), true, `${label}\n${text}`);
+  deepStrictEqual(/↑↓ move · enter select · q quit/.test(text), true, text);
+  deepStrictEqual(/@bismar-test\/plain · files/.test(text), true, text);
+});
+
+should('launcher opens pinned and exact-name queries without searching', async () => {
+  // Option order: dir, npm, jsr, crate, gem, pypi, gh. A @version pin skips
+  // search — search apis know nothing about versions — and type-ahead past the
+  // submit is handed to the session that follows.
+  const gem = openMenu('x');
+  gem.send('jjjj\rrailties@7.1.0\rq');
+  deepStrictEqual(await gem.done, { leftover: ['q'], selector: 'gem:railties@7.1.0' });
+  deepStrictEqual(/name: railties@7\.1\.0/.test(gem.text()), true, gem.text());
+  deepStrictEqual(/e\.g\. railties/.test(gem.text()), true, gem.text());
+  const gh = openMenu('x');
+  gh.send('G\rpaulmillr/qr@main\r');
+  deepStrictEqual((await gh.done)?.selector, 'gh:paulmillr/qr@main');
+  // pypi has no search api: enter opens the exact name, and the prompt says so.
+  const pypi = openMenu('x');
+  pypi.send('jjjjj\rrequests\r');
+  deepStrictEqual((await pypi.done)?.selector, 'pypi:requests');
+  deepStrictEqual(
+    /search Python\/PyPi · exact package name, no search api/.test(pypi.text()),
+    true,
+    pypi.text()
+  );
+  deepStrictEqual(/enter open · esc back/.test(pypi.text()), true, pypi.text());
+  // A typed canonical prefix stays single instead of doubling up.
+  const typed = openMenu('x');
+  typed.send('jjjjj\rpypi:requests\r');
+  deepStrictEqual((await typed.done)?.selector, 'pypi:requests');
+  // Backspace edits the buffer; esc backs out to the menu; q then quits (the
+  // caller opens nothing) — and q inside the prompt is just a character.
+  const editing = openMenu('x');
+  editing.send('jjj\rsqq\x7f\x7fserde\x1bq');
+  deepStrictEqual(await editing.done, undefined);
+  deepStrictEqual(/name: sq/.test(editing.text()), true, editing.text());
+  // ← backs out of the prompt to the menu like esc; backspace keeps editing.
+  const arrow = openMenu('x');
+  arrow.send('j\rab\x1b[Dq');
+  deepStrictEqual(await arrow.done, undefined);
+  deepStrictEqual(/name: ab/.test(arrow.text()), true, arrow.text());
+  // The menu drew again after the ← (its footer follows the prompt frames).
+  const frames = arrow.text();
+  deepStrictEqual(frames.lastIndexOf('what to open?') > frames.indexOf('name: ab'), true, frames);
+});
+
+should('launcher searches a registry and opens the picked hit', async () => {
+  // Local registry stand-ins: search is one request per submitted query.
+  const routes: Record<string, string> = {
+    '/api/v1/crates?q=serde&per_page=10': JSON.stringify({
+      crates: [
+        { description: 'A serialization framework', max_stable_version: '1.0.219', name: 'serde' },
+        { description: null, max_version: '1.0.140', name: 'serde_json' },
+      ],
+    }),
+    '/api/v1/crates?q=nothing&per_page=10': JSON.stringify({ crates: [] }),
+  };
+  const server = createServer((req, res) => {
+    // The tarball answers HEAD with its packed size, jsr-CDN-style.
+    if (req.url === '/preact.tgz') {
+      res.setHeader('content-length', '407547');
+      return void res.end();
+    }
+    const body = routes[req.url ?? ''];
+    if (!body) {
+      res.statusCode = 404;
+      return void res.end('{}');
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(body);
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  // The version is deliberately unpublishable: garnish caches machine-wide per
+  // pkg@version, and a real one must never be seeded with stand-in numbers.
+  routes['/-/v1/search?text=preact&size=10'] = JSON.stringify({
+    objects: [{ package: { description: 'Fast vdom', name: 'preact', version: '0.0.0-bismarui' } }],
+  });
+  routes['/preact/0.0.0-bismarui'] = JSON.stringify({
+    dependencies: { a: '1', b: '2' },
+    dist: { tarball: `${base}/preact.tgz` },
+  });
+  process.env.BISMAR_CRATES_API = base;
+  process.env.BISMAR_NPM_API = base;
+  try {
+    // Submit a query, get the hits listing, pick the second one.
+    const session = openMenu('x');
+    session.send('jjj\rserde\r');
+    await waitFor(session, /2 matches/);
+    session.send('j\r');
+    deepStrictEqual((await session.done)?.selector, 'crate:serde_json');
+    const text = session.text();
+    deepStrictEqual(/searching Rust\/Cargo for serde…/.test(text), true, text);
+    deepStrictEqual(/serde {2}1\.0\.219 · A serialization framework/.test(text), true, text);
+    deepStrictEqual(/▸ serde_json {2}1\.0\.140/.test(text), true, text);
+    deepStrictEqual(/↑↓ move · enter open · esc back/.test(text), true, text);
+    // JS hits garnish in the background: packed tarball bytes and dep count
+    // land after the version once the metadata answers (npm rows carry no
+    // description on purpose).
+    const js = openMenu('x');
+    js.send('j\rpreact\r');
+    await waitFor(js, /preact {2}0\.0\.0-bismarui · 2 deps · 398\.00kb tgz(?! ·)/);
+    js.send('\r');
+    deepStrictEqual((await js.done)?.selector, 'npm:preact');
+    // No matches keeps the prompt open with a note instead of a dead end.
+    const empty = openMenu('x');
+    empty.send('jjj\rnothing\r');
+    await waitFor(empty, /no matches for nothing/);
+    empty.send('\x1bq');
+    deepStrictEqual(await empty.done, undefined);
+    // The launcher parks its stage: reopened (as ← from a session does), it
+    // resumes on the same hits listing with the same cursor.
+    const state: Record<string, unknown> = {};
+    const first = openMenu('x', state);
+    first.send('jjj\rserde\r');
+    await waitFor(first, /2 matches/);
+    first.send('j\r');
+    deepStrictEqual((await first.done)?.selector, 'crate:serde_json');
+    const again = openMenu('x', state);
+    await waitFor(again, /2 matches/);
+    again.send('k\r');
+    deepStrictEqual((await again.done)?.selector, 'crate:serde');
+  } finally {
+    delete process.env.BISMAR_CRATES_API;
+    delete process.env.BISMAR_NPM_API;
+    server.closeAllConnections();
+    await new Promise((res) => server.close(res));
+  }
+});
+
+should('search hits paint a zero dep count green, others dim', async () => {
+  // A clean, dependency-free install is worth flagging: 0 deps shows green,
+  // any other count stays dim like the rest of the garnish.
+  process.env.FORCE_COLOR = '1';
+  const routes: Record<string, string> = {
+    '/-/v1/search?text=x&size=10': JSON.stringify({
+      objects: [
+        { package: { name: 'clean-pkg', version: '0.0.0-bismarzero' } },
+        { package: { name: 'heavy-pkg', version: '0.0.0-bismartwo' } },
+      ],
+    }),
+    '/clean-pkg/0.0.0-bismarzero': JSON.stringify({ dependencies: {} }),
+    '/heavy-pkg/0.0.0-bismartwo': JSON.stringify({ dependencies: { a: '1', b: '2' } }),
+  };
+  const server = createServer((req, res) => {
+    const body = routes[req.url ?? ''];
+    if (!body) {
+      res.statusCode = 404;
+      return void res.end('{}');
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(body);
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  process.env.BISMAR_NPM_API = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const menu = openMenu('x');
+    menu.send('j\rx\r');
+    // Wait for both dep counts to land in the stripped text.
+    await waitFor(menu, /clean-pkg[\s\S]*0 deps[\s\S]*heavy-pkg[\s\S]*2 deps/);
+    menu.send('\x1b\x1bq');
+    await menu.done;
+    const frames = menu.raw();
+    // Green wraps exactly "0 deps"; the "2 deps" row is never green.
+    deepStrictEqual(frames.includes(`\x1b[32m0 deps\x1b[0m`), true, strip(frames));
+    deepStrictEqual(/\x1b\[32m2 deps/.test(frames), false, strip(frames));
+  } finally {
+    delete process.env.FORCE_COLOR;
+    delete process.env.BISMAR_NPM_API;
+    server.closeAllConnections();
+    await new Promise((res) => server.close(res));
+  }
+});
+
+should('← from a session root climbs back into the launcher', async () => {
+  // Menu-launched sessions treat ← at their root as one more level up: the
+  // launcher reopens (parked stage intact) instead of the key dying there.
+  const session = open(undefined, { menu: true });
+  session.send('\rhq');
+  await session.done;
+  const frames = session
+    .raw()
+    .split('\x1b[H')
+    .map((frame) => strip(frame));
+  const menus = frames.filter((frame) => /what to open\?/.test(frame));
+  deepStrictEqual(menus.length >= 2, true, session.text());
+  // The session frame sat between the two menu frames.
+  deepStrictEqual(/@bismar-test\/plain · files/.test(session.text()), true, session.text());
+});
+
+should('launcher browses a package-less directory as plain files', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-dir-'));
+  try {
+    writeFileSync(join(cwd, 'notes.txt'), 'hello\n');
+    const session = open(undefined, { cwd, menu: true });
+    session.send('\rq');
+    await session.done;
+    const text = session.text();
+    // Files-only session rooted at the directory: footprint in the header, no
+    // modules view on offer.
+    deepStrictEqual(/bismar-i-dir-[^ ]* · files · 1 file, [\d.]+kb/.test(text), true, text);
+    deepStrictEqual(/notes\.txt/.test(text), true, text);
+    deepStrictEqual(/m modules/.test(text), false, text);
+  } finally {
+    rmSync(cwd, { force: true, recursive: true });
+  }
+});
 
 should('interactive mode navigates modules and exports like a filesystem', async () => {
   const res = await drive(undefined, 'mj\rq');
@@ -136,6 +383,27 @@ should('interactive mode forces the npm: prefix for bare names', async () => {
   }
 });
 
+should('interactive modules view measures unscoped npm refs', async () => {
+  // The pinned label of an unscoped ref (`qr@0.6.0`) is not an npm selector by
+  // itself — rows must measure through the prefixed spelling (`npm:qr@0.6.0`),
+  // or every row of such a package shows (build failed).
+  const session = open('npm:qr');
+  session.send('m');
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (/\d+ LOC, [\d.]+kb min|\(build failed\)/.test(session.text())) break;
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  session.send('q');
+  await session.done;
+  deepStrictEqual(/\(build failed\)/.test(session.text()), false, session.text());
+  deepStrictEqual(
+    /\d+ LOC, [\d.]+kb min, [\d.]+kb gzip/.test(session.text()),
+    true,
+    session.text()
+  );
+});
+
 should('interactive mode climbs back up via the .. entry and via h', async () => {
   // k moves from the first export onto `..`; enter on it returns to the root
   // with the module cursor preserved.
@@ -170,8 +438,9 @@ should('interactive mode syntax-highlights paged source when colors are on', asy
   }
 });
 
-should('vendored highlighter supports Ruby, Rust, Go, PHP, and HTML', async () => {
+should('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async () => {
   const cases = [
+    ['py', 'def greet(name):', 'def'],
     ['rb', 'def greet(name)', 'def'],
     ['rs', 'fn greet(name: &str)', 'fn'],
     ['go', 'func greet(name string)', 'func'],
@@ -185,6 +454,22 @@ should('vendored highlighter supports Ruby, Rust, Go, PHP, and HTML', async () =
       true,
       `${lang} was not highlighted: ${JSON.stringify(highlighted)}`
     );
+  }
+});
+
+should('interactive mode syntax-highlights Python file previews', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-python-'));
+  process.env.FORCE_COLOR = '1';
+  try {
+    writeFileSync(join(cwd, 'greet.py'), 'def greet(name):\n    return f"Hello, {name}"\n');
+    const session = open(undefined, { cwd, menu: true });
+    session.send('\r\rqq');
+    await session.done;
+    deepStrictEqual(session.raw().includes('\x1b[31mdef\x1b[0m'), true, session.raw());
+    deepStrictEqual(/def greet\(name\):/.test(session.text()), true, session.text());
+  } finally {
+    delete process.env.FORCE_COLOR;
+    rmSync(cwd, { force: true, recursive: true });
   }
 });
 
@@ -252,6 +537,43 @@ should('mouse clicks and wheel drive the listings; the pager releases tracking',
   const mods = await drive(undefined, 'm\x1b[<0;2;4M\x1b[<0;2;4M' + 'q');
   deepStrictEqual(/@bismar-test\/plain\/index\.js/.test(mods.text), true, mods.text);
   deepStrictEqual(/▸ add/.test(mods.text), true, mods.text);
+});
+
+should('files view skips symlinked entries instead of following them', async (t) => {
+  // Registry archives extract through the system tar and can ship symlinks
+  // aimed anywhere (~/.ssh); the files view must never list — let alone
+  // preview or descend into — anything a symlink points at.
+  if (process.platform === 'win32') return void t.skip('posix symlinks');
+  const outside = mkdtempSync(join(tmpdir(), 'bismar-i-outside-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-syml-'));
+  try {
+    writeFileSync(join(outside, 'secret.txt'), 'sesame\n');
+    writeFileSync(
+      join(cwd, 'package.json'),
+      `${JSON.stringify({
+        main: './index.js',
+        name: '@bismar-test/syml',
+        private: true,
+        type: 'module',
+        version: '1.0.0',
+      })}\n`
+    );
+    writeFileSync(join(cwd, 'index.js'), 'export const a = 1;\n');
+    symlinkSync(join(outside, 'secret.txt'), join(cwd, 'leak.txt'));
+    symlinkSync(outside, join(cwd, 'leakdir'));
+    const session = open(undefined, { cwd });
+    session.send('q');
+    await session.done;
+    const text = session.text();
+    deepStrictEqual(/index\.js/.test(text), true, text);
+    // Neither the symlinked file nor the symlinked dir shows up at all —
+    // and the footprint walk (already lstat-based) agrees: 2 real files.
+    deepStrictEqual(/leak/.test(text), false, text);
+    deepStrictEqual(/ · files · 2 files, /.test(text), true, text);
+  } finally {
+    rmSync(cwd, { force: true, recursive: true });
+    rmSync(outside, { force: true, recursive: true });
+  }
 });
 
 should('interactive file preview sanitizes tabs and CRLF line endings', async () => {

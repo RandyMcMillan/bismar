@@ -5,22 +5,86 @@ navigator-only — fetched and extracted so the interactive files view can brows
 a package's shipped sources. Nothing here bundles, measures, or executes
 package code; extraction goes through fs-modify.ts. All ecosystems share one
 flow: parse → resolve version (or pin a git ref) → download → extract → cache.
+Also home to the namespace table (aliases, `canonSelector`) and the launcher's
+registry search (`searchRegistry`), all through one rate-limited fetch. Download
+urls read from registry metadata are confined to known-registry origins first
+(`allowUrl`); hardcoded-base fetches (gem/crate/gh/go) need no such check.
 @module
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { progressShow } from './env.ts';
-import { extractArchive, extractTar, promoteTemp, rmTempDir } from './fs-modify.ts';
-import { bad, err, slug } from './public.ts';
-import { PINNED, readVersionTag, refsCacheDir, writeVersionTag } from './refs.ts';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
+import { type FetchFn, ftch, retry } from 'micro-ftch';
+import { cliProcess, envFlag, progressDone, progressShow } from './env.ts';
+import { extractArchive, extractTar, promoteTemp, rmTempDir, write } from './fs-modify.ts';
+import { bad, err, explicitPath, fmtBytes, readJson, slug } from './public.ts';
+import {
+  PINNED,
+  readArchiveBytes,
+  readVersionTag,
+  refsCacheDir,
+  writeArchiveBytes,
+  writeVersionTag,
+} from './refs.ts';
 
-// crates.io's API policy asks tools to identify themselves, github requires a
-// user-agent outright; the header is harmless everywhere else.
-const UA = 'bismar (https://github.com/paulmillr/jsbt)';
+// A mainstream browser user-agent: github requires one outright, and several
+// registries put anonymous bot-looking agents in stricter rate-limit buckets —
+// a stock Chromium string keeps unauthenticated requests in the browser lane.
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
+// Every registry request flows through one wrapped fetch: a concurrency cap and
+// a requests-per-second budget stay polite to anonymous rate limits, and
+// 408/429/5xx GETs retry with backoff, honoring Retry-After (403 — github's
+// rate-limit answer — is not retried; it surfaces through each caller's miss).
+// Built on first use so BISMAR_RPS can tune the budget; 0 drops the spacing
+// entirely — local test stand-ins and trusted proxies, where politeness only
+// buys latency. Unset or garbage keeps the default.
+let lazyNet: FetchFn | undefined;
+const net = (): FetchFn => {
+  if (!lazyNet) {
+    const tuned = Number(process.env.BISMAR_RPS ?? NaN);
+    const rps = Number.isFinite(tuned) ? tuned : 8;
+    lazyNet = retry(
+      ftch(fetch, { concurrencyLimit: 4, ...(rps > 0 ? { rps } : {}), timeout: 30_000 })
+    );
+  }
+  return lazyNet;
+};
+type NetResponse = Awaited<ReturnType<FetchFn>>;
 // Env-overridable bases for offline tests and proxies, like BISMAR_JSR_REGISTRY.
 const base = (envKey: string, fallback: string): string => process.env[envKey] || fallback;
-const fetchOk = async (url: string, miss: () => never, accept?: string): Promise<Response> => {
-  const res = await fetch(url, {
+// The origin (`https://registry.npmjs.org`, or `http://127.0.0.1:PORT` for a
+// test stand-in) of a configured base: a bad override url contributes nothing,
+// matching no target. URL normalizes the port and drops any path.
+const originOf = (baseUrl: string): string => {
+  try {
+    return new URL(baseUrl).origin;
+  } catch {
+    return '';
+  }
+};
+// Registry metadata carries download urls — packagist dist zips, pypi artifact
+// urls, npm/jsr tarballs — that bismar fetches verbatim. Confine each to a
+// known-registry origin so a hostile package can't point a fetch at an
+// arbitrary host. Matching is on origin (scheme + host + port): the default
+// allowlists hold only https origins, so production is https-only, while an
+// http override base (tests, proxies) admits its own http origin and nothing
+// else. Redirects (crates.io → static.crates.io) are fetch's own and stay
+// registry-owned; only the metadata-supplied url is checked here.
+const allowUrl = (url: string, origins: string[]): string => {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return err(`refusing malformed download url: ${bad(url)}`);
+  }
+  // No userinfo, and the origin must be allowlisted ('' entries never match).
+  if (u.username || u.password || !origins.includes(u.origin))
+    err(`refusing download from unexpected host: ${bad(u.host || url)}`);
+  return url;
+};
+const fetchOk = async (url: string, miss: () => never, accept?: string): Promise<NetResponse> => {
+  const res = await net()(url, {
     headers: accept ? { accept, 'user-agent': UA } : { 'user-agent': UA },
   });
   // 410 is the go proxy's "no such module"; 403 doubles as github's rate limit.
@@ -30,8 +94,49 @@ const fetchOk = async (url: string, miss: () => never, accept?: string): Promise
 };
 const jsonOf = async <T>(url: string, miss: () => never): Promise<T> =>
   (await fetchOk(url, miss)).json() as Promise<T>;
-const bytesOf = async (url: string, miss: () => never): Promise<Uint8Array> =>
-  new Uint8Array(await (await fetchOk(url, miss)).arrayBuffer());
+// Archives at or past this size need explicit consent before downloading: a
+// gh: ref can casually name a 200mb monorepo tarball. BISMAR_BIG=1 skips the
+// question (scripts, CI).
+export const BIG_ARCHIVE: number = 100 * 1024 * 1024;
+// The TUI owns stdin in raw mode while it runs: a line prompt would fight its
+// reader, so in-session fetches (the `r` repo hop) refuse oversized archives
+// instead of asking.
+let bigPolicy: 'ask' | 'refuse' = 'ask';
+export const setBigArchivePolicy = (policy: 'ask' | 'refuse'): void => {
+  bigPolicy = policy;
+};
+export const guardBigArchive = async (id: string, bytes: number): Promise<void> => {
+  const proc = cliProcess();
+  if (bytes < BIG_ARCHIVE || envFlag(proc?.env?.BISMAR_BIG)) return;
+  const size = fmtBytes(bytes);
+  const tty = !!proc?.stdin?.isTTY && !!proc?.stderr?.isTTY;
+  if (!proc || bigPolicy === 'refuse' || !tty)
+    return err(
+      `refusing large download: ${bad(id)} is ~${size}; confirm on a terminal or set BISMAR_BIG=1`
+    );
+  // One cooked-mode line on stderr; anything but y/yes cancels.
+  progressDone();
+  proc.stderr.write(`${bad(id)} is ~${size} — download anyway? [y/N] `);
+  const answer: string = await new Promise((res) => {
+    const stdin = proc.stdin;
+    const onData = (chunk: unknown): void => {
+      stdin.off('data', onData);
+      stdin.pause();
+      res(String(chunk));
+    };
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+  if (!/^y(es)?$/i.test(answer.trim())) err(`download cancelled: ${bad(id)}`);
+};
+const bytesOf = async (url: string, miss: () => never, id: string = url): Promise<Uint8Array> => {
+  const res = await fetchOk(url, miss);
+  // Static registry files announce their size up front; codeload streams
+  // without content-length, so the gh fetcher pre-checks via the repo api.
+  const len = Number(res.headers?.get?.('content-length'));
+  if (len) await guardBigArchive(id, len);
+  return new Uint8Array(await res.arrayBuffer());
+};
 const textOf = async (url: string, miss: () => never, accept: string): Promise<string> =>
   (await fetchOk(url, miss, accept)).text();
 const notFound = (reg: Registry, name: string): never =>
@@ -39,13 +144,15 @@ const notFound = (reg: Registry, name: string): never =>
 const noVersion = (reg: Registry, label: string): never =>
   err(`${reg.what} or version not found: ${bad(label)}; check ${reg.site}`);
 
+type Fetched = { bytes: Uint8Array; ext: string };
 type Registry = {
   // Turn typed versions into the registry's own spelling (go: 0.14.0 → v0.14.0).
   canon?: (version: string) => string;
   // Version spelling for error hints.
   example: string;
-  // Download `name@version` and extract it into `dir`.
-  fetch: (name: string, version: string, label: string, dir: string) => Promise<void>;
+  // Download `name@version`, extract it into `dir`, and hand back the verbatim
+  // archive bytes with their proper file extension.
+  fetch: (name: string, version: string, label: string, dir: string) => Promise<Fetched>;
   name: RegExp;
   // Mutable-ref registries (github): canonicalize any ref — or none, meaning
   // HEAD — to an immutable commit id. Replaces `resolve`.
@@ -101,6 +208,24 @@ const p2 = (name: string): Promise<P2Entry[]> => {
   return got;
 };
 const ghApi = (): string => base('BISMAR_GH_API', 'https://api.github.com');
+// Allowed download origins per registry (allowUrl): the constant registry CDNs
+// the metadata should point at, plus — only when the base is overridden — the
+// stand-in/proxy origin, so offline tests and mirrors keep working.
+// Packagist dists are github zipballs (api/codeload); other hosts are refused.
+const composerOrigins = (): string[] => [
+  'https://api.github.com',
+  'https://codeload.github.com',
+  ...(process.env.BISMAR_COMPOSER_API ? [originOf(composer())] : []),
+];
+// PyPI forbids external artifact hosting: everything lives on pythonhosted.
+const pypiOrigins = (): string[] => [
+  'https://files.pythonhosted.org',
+  ...(process.env.BISMAR_PYPI_API ? [originOf(pypi())] : []),
+];
+// Search-only bases: the npm registry search endpoint and jsr's public API
+// (installs go through npm's jsr compat registry instead, fs-modify.ts).
+const npmApi = (): string => base('BISMAR_NPM_API', 'https://registry.npmjs.org');
+const jsrApi = (): string => base('BISMAR_JSR_API', 'https://api.jsr.io');
 const ghCodeload = (): string => base('BISMAR_GH_CODELOAD', 'https://codeload.github.com');
 // Module paths escape uppercase as !lowercase in proxy URLs (github.com/!azure).
 const goProxy = (): string => base('BISMAR_GO_PROXY', 'https://proxy.golang.org');
@@ -117,7 +242,10 @@ export const REGISTRIES: Record<string, Registry> = {
       const bare = (v: string): string => v.replace(/^v/, '');
       const entry = (await p2(name)).find((e) => bare(e.version || '') === bare(version));
       if (!entry?.dist?.url) return noVersion(reg, label);
-      extractArchive(await bytesOf(entry.dist.url, () => noVersion(reg, label)), dir);
+      const url = allowUrl(entry.dist.url, composerOrigins());
+      const bytes = await bytesOf(url, () => noVersion(reg, label), label);
+      extractArchive(bytes, dir);
+      return { bytes, ext: '.zip' };
     },
     name: /^[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*$/i,
     resolve: async (name) => {
@@ -137,7 +265,9 @@ export const REGISTRIES: Record<string, Registry> = {
     example: '1.0.0',
     fetch: async (name, version, label, dir) => {
       const url = `${crates()}/api/v1/crates/${name}/${version}/download`;
-      extractArchive(await bytesOf(url, () => noVersion(REGISTRIES['crate:'], label)), dir);
+      const bytes = await bytesOf(url, () => noVersion(REGISTRIES['crate:'], label), label);
+      extractArchive(bytes, dir);
+      return { bytes, ext: '.crate' };
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/,
     resolve: async (name) => {
@@ -159,7 +289,8 @@ export const REGISTRIES: Record<string, Registry> = {
     fetch: async (name, version, label, dir) => {
       const url = `${gems()}/downloads/${name}-${version}.gem`;
       const shell = join(dir, '.gem-shell');
-      extractTar(await bytesOf(url, () => noVersion(REGISTRIES['gem:'], label)), shell);
+      const bytes = await bytesOf(url, () => noVersion(REGISTRIES['gem:'], label), label);
+      extractTar(bytes, shell);
       let data: Uint8Array;
       try {
         data = readFileSync(join(shell, 'data.tar.gz'));
@@ -168,6 +299,7 @@ export const REGISTRIES: Record<string, Registry> = {
       }
       extractTar(data, dir);
       rmTempDir(shell);
+      return { bytes, ext: '.gem' };
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/,
     resolve: async (name) => {
@@ -186,8 +318,22 @@ export const REGISTRIES: Record<string, Registry> = {
   'gh:': {
     example: 'main',
     fetch: async (name, version, label, dir) => {
+      // Codeload streams its tarballs chunked, without content-length; the
+      // repo api's `size` (kilobytes of the repository) stands in, so a 200mb
+      // monorepo asks before the download starts. The metadata is best-effort:
+      // rate limits and offline stand-ins skip the check, not the fetch.
+      let approx = 0;
+      try {
+        approx =
+          (await jsonOf<{ size?: number }>(`${ghApi()}/repos/${name}`, () => err(''))).size ?? 0;
+      } catch {
+        // Unknown size: proceed; the guard still fires when headers say more.
+      }
+      if (approx) await guardBigArchive(label, approx * 1024);
       const url = `${ghCodeload()}/${name}/tar.gz/${version}`;
-      extractArchive(await bytesOf(url, () => noVersion(REGISTRIES['gh:'], label)), dir);
+      const bytes = await bytesOf(url, () => noVersion(REGISTRIES['gh:'], label), label);
+      extractArchive(bytes, dir);
+      return { bytes, ext: '.tar.gz' };
     },
     name: /^[a-z\d][a-z\d-]*\/[\w.-]+$/i,
     pin: async (name, refspec) => {
@@ -216,7 +362,9 @@ export const REGISTRIES: Record<string, Registry> = {
     example: 'v1.0.0',
     fetch: async (name, version, label, dir) => {
       const url = `${goProxy()}/${goEsc(name)}/@v/${goEsc(version)}.zip`;
-      extractArchive(await bytesOf(url, () => noVersion(REGISTRIES['go:'], label)), dir);
+      const bytes = await bytesOf(url, () => noVersion(REGISTRIES['go:'], label), label);
+      extractArchive(bytes, dir);
+      return { bytes, ext: '.zip' };
     },
     name: /^[a-z0-9][\w.-]*(?:\/[\w.~-]+)*$/i,
     resolve: async (name) => {
@@ -252,7 +400,14 @@ export const REGISTRIES: Record<string, Registry> = {
         urls.find((u) => u.packagetype === 'bdist_wheel');
       if (!pick?.url)
         return err(`no sdist or wheel published for ${bad(label)}; check ${reg.site}`);
-      extractArchive(await bytesOf(pick.url, () => noVersion(reg, label)), dir);
+      const url = allowUrl(pick.url, pypiOrigins());
+      const bytes = await bytesOf(url, () => noVersion(reg, label), label);
+      extractArchive(bytes, dir);
+      // Sdists are tarballs (or zips); wheels keep their own extension.
+      return {
+        bytes,
+        ext: url.endsWith('.whl') ? '.whl' : url.endsWith('.zip') ? '.zip' : '.tar.gz',
+      };
     },
     name: /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/,
     resolve: async (name) => (await pypiMeta(name)).info?.version || '',
@@ -263,17 +418,275 @@ export const REGISTRIES: Record<string, Registry> = {
   },
 };
 
-// Language-name aliases for the same registries: refs normalize to the canonical
-// prefix, so labels, cache dirs, and selectors stay one spelling deep.
+// Language-name and short aliases for the same registries: refs normalize to
+// the canonical prefix, so labels, cache dirs, and selectors stay one spelling deep.
 const ALIASES: Record<string, string> = {
+  'cargo:': 'crate:',
   'github:': 'gh:',
   'golang:': 'go:',
   'php:': 'composer:',
+  'py:': 'pypi:',
   'python:': 'pypi:',
+  'rb:': 'gem:',
+  'rs:': 'crate:',
   'ruby:': 'gem:',
   'rust:': 'crate:',
 };
 const PREFIXES: string[] = [...Object.keys(REGISTRIES), ...Object.keys(ALIASES)];
+// JS refs parse in refs.ts, but the namespace table lives here: `js:` is the
+// alias spelling for npm refs and must expand before parseNpmRef slices its
+// fixed-width prefix.
+const JS_NAMESPACES: Record<string, string> = { 'js:': 'npm:', 'jsr:': 'jsr:', 'npm:': 'npm:' };
+// Every namespace, canonical spelling first with its aliases alongside — the
+// listing an unknown-namespace error prints, one namespace per line.
+const namespaceLines = (): string => {
+  const aliasesOf = (canon: string): string[] =>
+    [...Object.entries(JS_NAMESPACES), ...Object.entries(ALIASES)]
+      .filter(([alias, target]) => target === canon && alias !== canon)
+      .map(([alias]) => alias)
+      .sort();
+  return ['npm:', 'jsr:', ...Object.keys(REGISTRIES)]
+    .map((canon) => {
+      const aliases = aliasesOf(canon);
+      return aliases.length ? `${canon} (or ${aliases.join(' ')})` : canon;
+    })
+    .join('\n');
+};
+// A `ns:` head always reads as a namespace — the filesystem class is spelled
+// `./`, `../`, or absolute, and colons appear nowhere else in selectors — so an
+// unknown one is a typo to correct with the full listing, never a module to
+// look up. JS aliases expand here (`js:x` → `npm:x`); registry aliases keep the
+// typed spelling, which parseRegistryRef normalizes and error hints echo.
+export const canonSelector = (raw: string): string => {
+  if (explicitPath(raw)) return raw;
+  const colon = raw.indexOf(':');
+  if (colon < 0 || raw.slice(0, colon).includes('/')) return raw;
+  const ns = raw.slice(0, colon + 1);
+  const js = JS_NAMESPACES[ns];
+  if (js) return js + raw.slice(ns.length);
+  if (ns in REGISTRIES || ns in ALIASES) return raw;
+  return err(`unknown namespace: ${bad(ns)}; use one of:\n${namespaceLines()}`);
+};
+
+// Launcher search: one request per submitted query, top ten hits, all through
+// the shared rate-limited fetch. Keyed by canonical prefix; pypi is absent —
+// its search api was retired in 2021, so the launcher opens exact names there.
+// deps/tgzBytes start unset and fill in via jsHitStats (JS registries only).
+export type SearchHit = {
+  deps?: number;
+  desc: string;
+  name: string;
+  tgzBytes?: number;
+  version: string;
+};
+const hitOf = (name: string, version: string, desc: string | null | undefined): SearchHit => ({
+  // Descriptions render on one listing row; newlines would break the frame math.
+  desc: (desc ?? '').replace(/\s+/g, ' ').trim(),
+  name,
+  version,
+});
+type NpmFound = {
+  objects?: { package?: { name?: string; version?: string } }[];
+};
+type JsrFound = {
+  items?: {
+    dependencyCount?: number;
+    description?: string;
+    latestVersion?: string | null;
+    name?: string;
+    scope?: string;
+  }[];
+};
+type CrateFound = {
+  crates?: {
+    description?: string | null;
+    max_stable_version?: string | null;
+    max_version?: string | null;
+    name?: string;
+    newest_version?: string | null;
+  }[];
+};
+type GemFound = { info?: string; name?: string; version?: string }[];
+type GhFound = {
+  items?: { description?: string | null; full_name?: string; stargazers_count?: number }[];
+};
+type Searcher = (q: string, miss: () => never) => Promise<SearchHit[]>;
+const SEARCHERS: Record<string, Searcher> = {
+  'crate:': async (q, miss) => {
+    const meta = await jsonOf<CrateFound>(`${crates()}/api/v1/crates?q=${q}&per_page=10`, miss);
+    return (meta.crates ?? []).flatMap((c) =>
+      c.name
+        ? [
+            hitOf(
+              c.name,
+              c.max_stable_version || c.newest_version || c.max_version || '',
+              c.description
+            ),
+          ]
+        : []
+    );
+  },
+  'gem:': async (q, miss) => {
+    const meta = await jsonOf<GemFound>(`${gems()}/api/v1/search.json?query=${q}`, miss);
+    return meta
+      .slice(0, 10)
+      .flatMap((g) => (g.name ? [hitOf(g.name, g.version ?? '', g.info)] : []));
+  },
+  'gh:': async (q, miss) => {
+    const meta = await jsonOf<GhFound>(`${ghApi()}/search/repositories?q=${q}&per_page=10`, miss);
+    return (meta.items ?? []).flatMap((r) =>
+      r.full_name
+        ? [
+            hitOf(
+              r.full_name,
+              r.stargazers_count != null ? `${r.stargazers_count}★` : '',
+              r.description
+            ),
+          ]
+        : []
+    );
+  },
+  'jsr:': async (q, miss) => {
+    const meta = await jsonOf<JsrFound>(`${jsrApi()}/packages?query=${q}&limit=10`, miss);
+    // dependencyCount rides in on the search response itself: deps are free.
+    return (meta.items ?? []).flatMap((p) =>
+      p.scope && p.name
+        ? [
+            {
+              ...hitOf(`@${p.scope}/${p.name}`, p.latestVersion ?? '', p.description),
+              ...(p.dependencyCount != null ? { deps: p.dependencyCount } : {}),
+            },
+          ]
+        : []
+    );
+  },
+  'npm:': async (q, miss) => {
+    const meta = await jsonOf<NpmFound>(`${npmApi()}/-/v1/search?text=${q}&size=10`, miss);
+    // No description on purpose: npm listings stay name · version · garnish.
+    return (meta.objects ?? []).flatMap((o) =>
+      o.package?.name ? [hitOf(o.package.name, o.package.version ?? '', '')] : []
+    );
+  },
+};
+export const canSearch = (prefix: string): boolean => prefix in SEARCHERS;
+export const searchRegistry = async (prefix: string, query: string): Promise<SearchHit[]> => {
+  const search = SEARCHERS[prefix];
+  if (!search) return err(`no search api behind ${bad(prefix)}; open an exact name instead`);
+  const miss = (): never =>
+    prefix === 'gh:'
+      ? // Anonymous github search allows 10 queries a minute; 403 is its answer.
+        err('github search is rate-limited for anonymous use; wait a minute and retry')
+      : err(`search failed for ${bad(query)}; try again shortly`);
+  return search(encodeURIComponent(query), miss);
+};
+
+// JS search hits garnish in the background: packed tarball bytes and direct
+// dependency count, shown after the version. One version doc (npm) or
+// abbreviated packument (jsr — which also fills a missing latest version) per
+// hit finds deps and the tarball url. Failures answer undefined and leave the
+// row bare: garnish, never an error.
+const jsrNpm = (): string => base('BISMAR_JSR_REGISTRY', 'https://npm.jsr.io');
+type DistDoc = { dependencies?: Record<string, unknown>; dist?: { tarball?: string } };
+type JsrPackument = { 'dist-tags'?: { latest?: string }; versions?: Record<string, DistDoc> };
+const jsonQuiet = async <T>(
+  url: string,
+  signal?: AbortSignal,
+  accept?: string
+): Promise<T | undefined> => {
+  const res = await net()(url, {
+    headers: accept ? { accept, 'user-agent': UA } : { 'user-agent': UA },
+    signal,
+  });
+  return res.ok ? ((await res.json()) as T) : undefined;
+};
+// npm's CDN omits content-length on HEAD but honors ranges: a one-byte range
+// GET carries the full size in content-range. jsr's CDN answers HEAD directly.
+// The tarball url comes from the packument, so it goes through allowUrl too — a
+// refused (or missing) url just yields no size garnish, never an error.
+const tarballBytes = async (
+  url: string | undefined,
+  origins: string[],
+  signal?: AbortSignal
+): Promise<number> => {
+  if (!url) return 0;
+  try {
+    allowUrl(url, origins);
+  } catch {
+    return 0;
+  }
+  const head = await net()(url, { headers: { 'user-agent': UA }, method: 'HEAD', signal });
+  const direct = Number(head.headers.get('content-length'));
+  if (head.ok && direct) return direct;
+  const ranged = await net()(url, { headers: { range: 'bytes=0-0', 'user-agent': UA }, signal });
+  const total = /\/(\d+)$/.exec(ranged.headers.get('content-range') ?? '');
+  return ranged.status === 206 && total ? Number(total[1]) : 0;
+};
+export type HitStats = { deps?: number; tgzBytes?: number; version?: string };
+// Garnish caches machine-wide beside the ref installs: deps and packed bytes
+// are immutable per exact version, so repeat searches (and reopened listings)
+// skip the metadata round-trips. One file per pkg@version, like the version
+// tags — no read-modify-write races; --clear wipes it with the rest.
+const statsFile = (label: string): string =>
+  join(tmpdir(), 'bismar-refs', '.stats', `${slug(label)}.json`);
+const readHitStats = (label: string): HitStats | undefined => {
+  try {
+    const got = readJson<HitStats>(statsFile(label));
+    // Older or hand-mangled entries recompute instead of being trusted.
+    if (typeof got?.deps !== 'number') return undefined;
+    return {
+      deps: got.deps,
+      ...(typeof got.tgzBytes === 'number' ? { tgzBytes: got.tgzBytes } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+};
+const writeHitStats = (label: string, stats: HitStats): HitStats => {
+  const { deps, tgzBytes } = stats;
+  write(statsFile(label), `${JSON.stringify({ deps, tgzBytes })}\n`);
+  return stats;
+};
+export const jsHitStats = async (
+  prefix: string,
+  hit: SearchHit,
+  signal?: AbortSignal
+): Promise<HitStats | undefined> => {
+  if (prefix !== 'npm:' && prefix !== 'jsr:') return undefined;
+  const labelOf = (version: string): string => `${prefix}${hit.name}@${version}`;
+  const cached = hit.version ? readHitStats(labelOf(hit.version)) : undefined;
+  if (cached) return cached;
+  if (prefix === 'npm:') {
+    if (!hit.version) return undefined;
+    const doc = await jsonQuiet<DistDoc>(`${npmApi()}/${hit.name}/${hit.version}`, signal);
+    if (!doc) return undefined;
+    const tgzBytes = await tarballBytes(doc.dist?.tarball, [originOf(npmApi())], signal);
+    return writeHitStats(labelOf(hit.version), {
+      deps: Object.keys(doc.dependencies ?? {}).length,
+      ...(tgzBytes ? { tgzBytes } : {}),
+    });
+  }
+  // jsr tarballs live on the npm-compat registry under @jsr/scope__name; the
+  // packument also fills a latest version the search response left blank.
+  const pack = await jsonQuiet<JsrPackument>(
+    `${jsrNpm()}/@jsr/${hit.name.slice(1).replace('/', '__')}`,
+    signal,
+    'application/vnd.npm.install-v1+json'
+  );
+  const version = hit.version || pack?.['dist-tags']?.latest || '';
+  if (!version) return undefined;
+  // A version the search left blank may still be cached from a past query.
+  const known = !hit.version ? readHitStats(labelOf(version)) : undefined;
+  if (known) return { ...known, version };
+  const doc = pack?.versions?.[version];
+  if (!doc) return undefined;
+  // The search response usually carried dependencyCount already; keep it.
+  const deps = hit.deps ?? Object.keys(doc.dependencies ?? {}).length;
+  const tgzBytes = await tarballBytes(doc.dist?.tarball, [originOf(jsrNpm())], signal);
+  return {
+    ...writeHitStats(labelOf(version), { deps, ...(tgzBytes ? { tgzBytes } : {}) }),
+    version,
+  };
+};
 export type RegistryRef = { name: string; prefix: string; version: string };
 export const isRegistrySelector = (raw: string): boolean =>
   PREFIXES.some((prefix) => raw.startsWith(prefix));
@@ -320,7 +733,7 @@ const SHA = /^[0-9a-f]{7,40}$/;
 export const registryContext = async (
   outDir: string,
   ref: RegistryRef
-): Promise<{ label: string; pkgDir: string }> => {
+): Promise<{ archiveBytes?: number; label: string; pkgDir: string }> => {
   const reg = REGISTRIES[ref.prefix];
   let version = ref.version;
   if (reg.pin) {
@@ -354,13 +767,50 @@ export const registryContext = async (
   }
   const label = `${ref.prefix}${ref.name}@${version}`;
   const pinnedDir = refsCacheDir(label);
-  if (hasFiles(pinnedDir)) return { label, pkgDir: rootOf(pinnedDir) };
+  if (hasFiles(pinnedDir))
+    return { archiveBytes: readArchiveBytes(label), label, pkgDir: rootOf(pinnedDir) };
   progressShow(`downloading ${label}`);
   const dir = join(outDir, '.refs', slug(label));
-  await reg.fetch(ref.name, version, label, dir);
+  const got = await reg.fetch(ref.name, version, label, dir);
   if (!hasFiles(dir)) err(`empty archive for ${bad(label)}; check ${reg.site}`);
+  writeArchiveBytes(label, got.bytes.length);
+  saveArchive(label, got);
   // Promote the fresh extract into the machine cache; on a lost race (or any
   // rename failure) the per-run copy serves this session just as well.
-  if (promoteTemp(dir, pinnedDir)) return { label, pkgDir: rootOf(pinnedDir) };
-  return { label, pkgDir: rootOf(dir) };
+  if (promoteTemp(dir, pinnedDir))
+    return { archiveBytes: got.bytes.length, label, pkgDir: rootOf(pinnedDir) };
+  return { archiveBytes: got.bytes.length, label, pkgDir: rootOf(dir) };
+};
+// The verbatim archive keeps its registry extension beside the extract dir
+// (`bismar-refs/crate/serde-1-0-219.crate`), the same way npm keeps tarballs
+// in its own cache: `-b` serves it offline, byte-identical to what the
+// registry shipped.
+const saveArchive = (label: string, got: Fetched): string =>
+  write(`${refsCacheDir(label)}${got.ext}`, got.bytes);
+const findArchive = (label: string): string | undefined => {
+  const dir = refsCacheDir(label);
+  try {
+    for (const ent of readdirSync(dirname(dir)))
+      if (ent.startsWith(`${basename(dir)}.`)) return join(dirname(dir), ent);
+  } catch {
+    // No cache subdir for this registry yet.
+  }
+  return undefined;
+};
+// `-b <registry-ref>`: hand back the saved archive, fetching only when the
+// extract cache predates archive-keeping (the throwaway re-extract stays in
+// the per-run temp dir).
+export const registryArchive = async (
+  outDir: string,
+  ref: RegistryRef
+): Promise<{ file: string; label: string }> => {
+  const got = await registryContext(outDir, ref);
+  const cached = findArchive(got.label);
+  if (cached) return { file: cached, label: got.label };
+  const version = got.label.slice(got.label.lastIndexOf('@') + 1);
+  progressShow(`downloading ${got.label}`);
+  const dir = join(outDir, '.refs', `${slug(got.label)}-rearchive`);
+  const fetched = await REGISTRIES[ref.prefix].fetch(ref.name, version, got.label, dir);
+  writeArchiveBytes(got.label, fetched.bytes.length);
+  return { file: saveArchive(got.label, fetched), label: got.label };
 };

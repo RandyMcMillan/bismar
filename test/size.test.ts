@@ -88,7 +88,7 @@ should('size command prints stats even with JSBT_QUIET and skips the audit', asy
   );
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^module,export,loc,minified_bytes,gzipped_bytes$/m.test(out), true, out);
+  deepStrictEqual(/module,export/.test(out), false, out);
   deepStrictEqual(/@bismar-test\/documented,,/.test(out), true, out);
   deepStrictEqual(/,_internal,/.test(out), false, out);
   deepStrictEqual(/bundle_path|_tree_shaking_|%/.test(res.stdout), false, out);
@@ -102,8 +102,8 @@ should('size command selector rows are in-memory only', async () => {
   const res = await run(cwd, () => runBismar(['--size', 'index'], { color: false, cwd }));
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^module,export,loc,minified_bytes,gzipped_bytes$/m.test(out), true, out);
-  deepStrictEqual(/index,,\d+,/.test(out), true, out);
+  deepStrictEqual(/module,export/.test(out), false, out);
+  deepStrictEqual(/index,,\d+loc,/.test(out), true, out);
   deepStrictEqual(/bundle_path|\/tmp\//.test(out), false, out);
   // Nothing is kept: the flag is gone along with the files.
   const legacy = await run(cwd, () => runBismar(['--size', '--keep'], { color: false, cwd }));
@@ -117,18 +117,11 @@ should('size command works without a test/build template', async () => {
     const res = await run(cwd, () => runBismar(['--size'], { color: false, cwd }));
     const out = plain(res);
     deepStrictEqual(res.ok, true, all(res));
-    deepStrictEqual(/^module,export,loc,minified_bytes,gzipped_bytes$/m.test(out), true, out);
+    deepStrictEqual(/module,export/.test(out), false, out);
     deepStrictEqual(/@bismar-test\/plain,,/.test(out), true, out);
-    // Default output is unsorted: natural order puts the package row first.
+    // Output is unsorted: natural order puts the package row first. Sorting is
+    // the shell's job over the CSV, e.g. `| sort -t, -k5 -rn`.
     deepStrictEqual(out.indexOf('@bismar-test/plain,,') < out.indexOf('index,add,'), true, out);
-    // --size-sorted implies --size and groups module bundles first, then exports,
-    // each group ascending by the key.
-    const sortedRes = await run(cwd, () => runBismar(['--size-sorted'], { color: false, cwd }));
-    const sout = plain(sortedRes);
-    deepStrictEqual(sortedRes.ok, true, all(sortedRes));
-    deepStrictEqual(sout.indexOf('index,,') < sout.indexOf('index,add,'), true, sout);
-    deepStrictEqual(sout.indexOf('@bismar-test/plain,,') < sout.indexOf('index,add,'), true, sout);
-    deepStrictEqual(sout.indexOf('index,add,') < sout.indexOf('index,blob,'), true, sout);
     const badSort = await run(cwd, () =>
       runBismar(['--size', '--sort=gzip'], { color: false, cwd })
     );
@@ -190,8 +183,8 @@ should('size command filters specific module/export paths', async () => {
   const res = await capture(() => runBismar(['--size', 'index/add'], { color: false, cwd }));
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^module,export,loc,minified_bytes,gzipped_bytes$/m.test(out), true, out);
-  deepStrictEqual(/index,add,\d+,/.test(out), true, out);
+  deepStrictEqual(/module,export/.test(out), false, out);
+  deepStrictEqual(/index,add,\d+loc,/.test(out), true, out);
   deepStrictEqual(/index,,|,blob,/.test(out), false, out);
 
   // Selectors accept extensions, package-name prefixes, and bare modules.
@@ -206,7 +199,7 @@ should('size command filters specific module/export paths', async () => {
   const file = await capture(() => runBismar(['--size', './index.js/add'], { color: false, cwd }));
   const fout = plain(file);
   deepStrictEqual(file.ok, true, all(file));
-  deepStrictEqual(/\.\/index\.js,add,\d+,/.test(fout), true, fout);
+  deepStrictEqual(/\.\/index\.js,add,\d+loc,/.test(fout), true, fout);
   const bare = await capture(() => runBismar(['--size', 'index'], { color: false, cwd }));
   const bout = plain(bare);
   deepStrictEqual(bare.ok, true, all(bare));
@@ -217,7 +210,7 @@ should('size command filters specific module/export paths', async () => {
   );
   const mout = plain(multi);
   deepStrictEqual(multi.ok, true, all(multi));
-  deepStrictEqual(/selection,,\d+,/.test(mout), true, mout);
+  deepStrictEqual(/selection,,\d+loc,/.test(mout), true, mout);
   deepStrictEqual(/index,add,/.test(mout), true, mout);
   deepStrictEqual(/index,blob,/.test(mout), true, mout);
 
@@ -411,14 +404,14 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/@bismar-test\/scratch,,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/@bismar-test\/scratch,,\d+loc,/.test(plain(res)), true, plain(res));
     }
   );
   // No entry fields at all: node's legacy ./index.js default (express).
   await withScratchPkg({ 'index.js': cjs, 'package.json': scratchJson({}) }, async (cwd) => {
     const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
     deepStrictEqual(res.ok, true, all(res));
-    deepStrictEqual(/@bismar-test\/scratch,,\d+,/.test(plain(res)), true, plain(res));
+    deepStrictEqual(/@bismar-test\/scratch,,\d+loc,/.test(plain(res)), true, plain(res));
   });
   // Root conditions object (chalk) — and the module must not be named "default".
   await withScratchPkg(
@@ -429,7 +422,7 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/index,add,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/index,add,\d+loc,/.test(plain(res)), true, plain(res));
       deepStrictEqual(/default,/.test(plain(res)), false, plain(res));
     }
   );
@@ -439,7 +432,7 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/index,add,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/index,add,\d+loc,/.test(plain(res)), true, plain(res));
     }
   );
   // .mjs entry (yargs).
@@ -448,7 +441,7 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/index,add,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/index,add,\d+loc,/.test(plain(res)), true, plain(res));
     }
   );
   // Alias keys (`./a` + `./a.js`, classnames/dotenv) list once; a root `./index.js` key
@@ -514,7 +507,7 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/index,thing,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/index,thing,\d+loc,/.test(plain(res)), true, plain(res));
       deepStrictEqual(/note: retrying with node conditions/.test(plain(res)), true, plain(res));
     }
   );
@@ -528,7 +521,7 @@ should('size command handles legacy and modern package entry shapes', async () =
     async (cwd) => {
       const res = await capture(() => runBismar(['--size'], { color: false, cwd }));
       deepStrictEqual(res.ok, true, all(res));
-      deepStrictEqual(/index,use,\d+,/.test(plain(res)), true, plain(res));
+      deepStrictEqual(/index,use,\d+loc,/.test(plain(res)), true, plain(res));
       deepStrictEqual(
         /note: treating unresolvable import bismar-test-not-installed as external/.test(plain(res)),
         true,
@@ -617,7 +610,7 @@ should('size command --list prints import statements without bundling', async ()
   );
   // A lone npm ref lists versionless — import statements name no version.
   const ref = await capture(() =>
-    runBismar(['--size', '--list', '@microsoft/tsdoc@0.16.0'], { color: false, cwd })
+    runBismar(['--size', '--list', 'npm:@microsoft/tsdoc@0.16.0'], { color: false, cwd })
   );
   const rout = plain(ref);
   deepStrictEqual(ref.ok, true, all(ref));
@@ -626,7 +619,7 @@ should('size command --list prints import statements without bundling', async ()
   deepStrictEqual(/from '@bismar-test\/plain'/.test(rout), false, rout);
   // The same package entered at two versions keeps the pinned labels apart.
   const both = await capture(() =>
-    runBismar(['--size', '--list', '@microsoft/tsdoc@0.15.1', '@microsoft/tsdoc@0.16.0'], {
+    runBismar(['--size', '--list', 'npm:@microsoft/tsdoc@0.15.1', 'npm:@microsoft/tsdoc@0.16.0'], {
       color: false,
       cwd,
     })
@@ -640,7 +633,7 @@ should('size command --list prints import statements without bundling', async ()
 
 should('size command --list caches pinned ref enumeration in bismar.db.json', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['--size', '--list', 'npm:@microsoft/tsdoc@0.16.0'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
@@ -662,7 +655,7 @@ should('size command --list caches pinned ref enumeration in bismar.db.json', as
 
 should('size command serves pinned ref sizes from the machine cache', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['--size', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
@@ -677,7 +670,7 @@ should('size command serves pinned ref sizes from the machine cache', async () =
   const second = await capture(() => runBismar(argv, { color: false, cwd }));
   deepStrictEqual(second.ok, true, all(second));
   deepStrictEqual(
-    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,1,11,7$/m.test(plain(second)),
+    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,1loc,11b,7b$/m.test(plain(second)),
     true,
     plain(second)
   );
@@ -692,14 +685,30 @@ should('size command serves pinned ref sizes from the machine cache', async () =
   parsed.sizes.esbuild = rewritten.sizes.esbuild;
   parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7];
   writeFileSync(db, JSON.stringify(parsed));
-  const emitted = await capture(() =>
-    runBismar(['--checksum', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'], {
-      color: false,
-      cwd,
-    })
-  );
-  deepStrictEqual(emitted.ok, true, all(emitted));
-  deepStrictEqual(/^[0-9a-f]{64}$/m.test(plain(emitted)), true, plain(emitted));
+  // -b streams bytes through stdout.write, which capture() does not hook. tty is
+  // pinned off: a terminal refuses the bytes and prints the stat row instead, so
+  // an ambient TTY would decide which branch this asserts.
+  let bytes = '';
+  const prevWrite = process.stdout.write;
+  process.stdout.write = ((chunk: unknown) => {
+    bytes += typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk as Uint8Array);
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const emitted = await capture(() =>
+      runBismar(['-b', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'], {
+        color: false,
+        cwd,
+        tty: false,
+      })
+    );
+    deepStrictEqual(emitted.ok, true, all(emitted));
+  } finally {
+    process.stdout.write = prevWrite;
+  }
+  // Real bundle bytes, not the 11 poisoned ones.
+  deepStrictEqual(/TSDocParser/.test(bytes), true);
+  deepStrictEqual(bytes.length > 1000, true);
 });
 
 should('size command pins floating refs through a fresh tag, re-resolves stale ones', async () => {
@@ -722,7 +731,7 @@ should('size command pins floating refs through a fresh tag, re-resolves stale o
         const fresh = await capture(() => runBismar(argv, { color: false, cwd }));
         deepStrictEqual(fresh.ok, true, all(fresh));
         deepStrictEqual(
-          /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+,\d+,\d+$/m.test(plain(fresh)),
+          /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+loc,\d+b,\d+b$/m.test(plain(fresh)),
           true,
           plain(fresh)
         );
@@ -748,10 +757,10 @@ should('size command measures external npm refs alongside local exports', async 
   );
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/index,add,\d+,/.test(out), true, out);
-  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+,/m.test(out), true, out);
+  deepStrictEqual(/index,add,\d+loc,/.test(out), true, out);
+  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+loc,/m.test(out), true, out);
   // The combined selection row includes both, despite different resolution roots.
-  deepStrictEqual(/selection,,\d+,/.test(out), true, out);
+  deepStrictEqual(/selection,,\d+loc,/.test(out), true, out);
 
   const bad = await capture(() =>
     runBismar(['--size', 'npm:git+ssh://evil/x'], { color: false, cwd })
@@ -768,7 +777,7 @@ should('size command measures external npm refs alongside local exports', async 
   );
   deepStrictEqual(prefixed.ok, true, all(prefixed));
   deepStrictEqual(
-    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+,/m.test(plain(prefixed)),
+    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+loc,/m.test(plain(prefixed)),
     true,
     plain(prefixed)
   );
@@ -794,28 +803,28 @@ should('size command expands a single bare package selector to the full table', 
   // Browse mode: one bare package ref prints the same breakdown a no-arg run prints
   // inside that package — package total plus per-module and per-export rows.
   const res = await capture(() =>
-    runBismar(['--size', '@microsoft/tsdoc@0.16.0'], { color: false, cwd })
+    runBismar(['--size', 'npm:@microsoft/tsdoc@0.16.0'], { color: false, cwd })
   );
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+,/m.test(out), true, out);
-  deepStrictEqual(/^index,TSDocParser,\d+,/m.test(out), true, out);
+  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+loc,/m.test(out), true, out);
+  deepStrictEqual(/^index,TSDocParser,\d+loc,/m.test(out), true, out);
   // `.` and the package's own name alias the local no-arg table the same way.
   for (const sel of ['.', '@bismar-test/plain']) {
     const self = await capture(() => runBismar(['--size', sel], { color: false, cwd }));
     const sout = plain(self);
     deepStrictEqual(self.ok, true, `${sel}\n${all(self)}`);
-    deepStrictEqual(/^@bismar-test\/plain,,\d+,/m.test(sout), true, `${sel}\n${sout}`);
-    deepStrictEqual(/^index,add,\d+,/m.test(sout), true, `${sel}\n${sout}`);
+    deepStrictEqual(/^@bismar-test\/plain,,\d+loc,/m.test(sout), true, `${sel}\n${sout}`);
+    deepStrictEqual(/^index,add,\d+loc,/m.test(sout), true, `${sel}\n${sout}`);
   }
   // In a multi-selector run the same bare package stays a single total row.
   const multi = await capture(() =>
-    runBismar(['--size', '.', '@microsoft/tsdoc@0.16.0'], { color: false, cwd })
+    runBismar(['--size', '.', 'npm:@microsoft/tsdoc@0.16.0'], { color: false, cwd })
   );
   const mout = plain(multi);
   deepStrictEqual(multi.ok, true, all(multi));
-  deepStrictEqual(/^@bismar-test\/plain,,\d+,/m.test(mout), true, mout);
-  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+,/m.test(mout), true, mout);
+  deepStrictEqual(/^@bismar-test\/plain,,\d+loc,/m.test(mout), true, mout);
+  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,\d+loc,/m.test(mout), true, mout);
   deepStrictEqual(/^index,add,/m.test(mout), false, mout);
 });
 
@@ -825,24 +834,24 @@ should('size command expands a single module selector to its exports', async () 
   const res = await capture(() => runBismar(['--size', 'index.js'], { color: false, cwd }));
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^index,,\d+,/m.test(out), true, out);
-  deepStrictEqual(/^index,add,\d+,/m.test(out), true, out);
-  deepStrictEqual(/^index,blob,\d+,/m.test(out), true, out);
+  deepStrictEqual(/^index,,\d+loc,/m.test(out), true, out);
+  deepStrictEqual(/^index,add,\d+loc,/m.test(out), true, out);
+  deepStrictEqual(/^index,blob,\d+loc,/m.test(out), true, out);
   deepStrictEqual(/@bismar-test\/plain,,/.test(out), false, out);
   // Ref module browse brands rows with the pinned label; no package row either.
   const ref = await capture(() =>
-    runBismar(['--size', '@microsoft/tsdoc@0.16.0/index'], { color: false, cwd })
+    runBismar(['--size', 'npm:@microsoft/tsdoc@0.16.0/index'], { color: false, cwd })
   );
   const rout = plain(ref);
   deepStrictEqual(ref.ok, true, all(ref));
-  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0\/index,,\d+,/m.test(rout), true, rout);
-  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0\/index,TSDocParser,\d+,/m.test(rout), true, rout);
+  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0\/index,,\d+loc,/m.test(rout), true, rout);
+  deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0\/index,TSDocParser,\d+loc,/m.test(rout), true, rout);
   deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,,/m.test(rout), false, rout);
   // Selectors with an export part stay comparison mode: one row only.
   const exp = await capture(() => runBismar(['--size', 'index/add'], { color: false, cwd }));
   const eout = plain(exp);
   deepStrictEqual(exp.ok, true, all(exp));
-  deepStrictEqual(/^index,add,\d+,/m.test(eout), true, eout);
+  deepStrictEqual(/^index,add,\d+loc,/m.test(eout), true, eout);
   deepStrictEqual(/^index,,/m.test(eout), false, eout);
 });
 
@@ -851,11 +860,11 @@ should('size command measures npm refs without a local package.json', async () =
   const cwd = mkdtempSync(join(tmpdir(), 'bismar-size-nopkg-'));
   try {
     const res = await capture(() =>
-      runBismar(['--size', '@microsoft/tsdoc@0.16.0/TSDocParser'], { color: false, cwd })
+      runBismar(['--size', 'npm:@microsoft/tsdoc@0.16.0/TSDocParser'], { color: false, cwd })
     );
     const out = plain(res);
     deepStrictEqual(res.ok, true, all(res));
-    deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+,/m.test(out), true, out);
+    deepStrictEqual(/^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+loc,/m.test(out), true, out);
     // `./` means the filesystem now; a missing file fails as exactly that.
     const local = await capture(() =>
       runBismar(['--size', './index.js/add'], { color: false, cwd })
@@ -887,7 +896,7 @@ should('size command measures a single file via the ./ selector', async () => {
   const res = await capture(() => runBismar(['--size', './index.js'], { color: false, cwd }));
   const out = plain(res);
   deepStrictEqual(res.ok, true, all(res));
-  deepStrictEqual(/^module,export,loc,minified_bytes,gzipped_bytes$/m.test(out), true, out);
+  deepStrictEqual(/module,export/.test(out), false, out);
   // The file is the module: per-export rows plus ALL, but no package-level row.
   deepStrictEqual(/index,,\d/.test(out), true, out);
   deepStrictEqual(/index,add,/.test(out), true, out);

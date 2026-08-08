@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 process.env.NO_COLOR = '1';
 
 import {
+  csvEnabled,
   progressDone,
   progressOff,
   progressReset,
@@ -13,6 +14,18 @@ import {
 } from '../src/env.ts';
 import { dtsPath, exportPath, jsPath, publicEntries, readPkg } from '../src/public.ts';
 import { test as should } from 'node:test';
+
+should('csvEnabled keys off stdout alone, not the still-attached stderr tty', () => {
+  // `bismar -s pkg | sort` pipes stdout while stderr stays on the terminal:
+  // the rows land on stdout, so stdout decides. Explicit env objects bypass
+  // the ambient NO_COLOR pin above.
+  deepStrictEqual(csvEnabled({}, false), true);
+  deepStrictEqual(csvEnabled({}, true), false);
+  deepStrictEqual(csvEnabled({ BISMAR_CSV: '1' }, true), true);
+  deepStrictEqual(csvEnabled({ NO_COLOR: '1' }, true), true);
+  // FORCE_COLOR is the escape hatch that keeps the table even through a pipe.
+  deepStrictEqual(csvEnabled({ FORCE_COLOR: '1' }, false), false);
+});
 
 should('public path helpers walk nested export condition objects', () => {
   const value = {
@@ -99,7 +112,14 @@ should('progress line appears after a silent second, updates in place, clears', 
   const prevWrite = stderr.write;
   const prevTty = stderr.isTTY;
   let out = '';
-  stderr.write = (text: string) => ((out += text), true);
+  // The test reporter writes to this same stream and may drain a batch of its own
+  // lines mid-test (node 22 flushes later than 24+ does), so keep only the progress
+  // writes — every one of them starts by clearing the line — and let the rest through
+  // to the real stream instead of swallowing the reporter's output.
+  stderr.write = (text: string) =>
+    String(text).startsWith('\r\x1b[K')
+      ? ((out += text), true)
+      : prevWrite.call(process.stderr, text);
   stderr.isTTY = true;
   const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
   try {

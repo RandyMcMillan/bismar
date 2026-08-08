@@ -17,7 +17,8 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
 
-const EXTS = ['.cjs', '.js', '.json', '.mjs', '.ts'];
+// Source/manifest writes, plus the verbatim registry archives kept for `-b`.
+const EXTS = ['.cjs', '.js', '.json', '.mjs', '.ts', '.crate', '.gem', '.gz', '.zip', '.whl'];
 // Never lifecycle scripts or lockfiles: installs land in throwaway bismar temp dirs.
 // Audit and funding checks are extra registry roundtrips with no reader here.
 const NPM_INSTALL_ARGS = [
@@ -48,7 +49,14 @@ export const assertTemp = (path: string, checkExt = false): string => {
   return path;
 };
 
-export type TempKind = 'bundle' | 'check' | 'size';
+// Every directory bismar creates is keeper-private: 0700 keeps other users on
+// shared machines out of the persistent caches (bismar-refs, bismar-esbuild-*),
+// which would otherwise inherit umask-default modes. The mode caps at 0700 —
+// umask can only clear bits further. mkdtemp'd run dirs get 0700 from
+// mkdtemp(3) already; this makes the recursive mkdir paths match.
+const mkdir = (dir: string): string => (mkdirSync(dir, { mode: 0o700, recursive: true }), dir);
+
+export type TempKind = 'bundle' | 'check' | 'diff' | 'size';
 export const tempDir = (kind: TempKind): string => mkdtempSync(join(tmpdir(), `bismar-${kind}-`));
 export const rmTempDir = (dir: string): boolean => (
   rmSync(assertTemp(dir), { force: true, recursive: true }),
@@ -56,13 +64,13 @@ export const rmTempDir = (dir: string): boolean => (
 );
 
 export const write = (file: string, data: string | Uint8Array): string => (
-  mkdirSync(dirname(assertTemp(file, true)), { recursive: true }),
+  mkdir(dirname(assertTemp(file, true))),
   writeFileSync(file, data),
   file
 );
 export const writePkg = (file: string, data: string | Uint8Array): string => {
   if (basename(file) !== 'package.json') err(`expected package.json path: ${file}`);
-  mkdirSync(dirname(assertTemp(file)), { recursive: true });
+  mkdir(dirname(assertTemp(file)));
   writeFileSync(file, data);
   return file;
 };
@@ -78,7 +86,7 @@ export const rm = (file: string): boolean => (
 export const writeJsrNpmrc = (dir: string): string => {
   const registry = process.env.BISMAR_JSR_REGISTRY || 'https://npm.jsr.io';
   const file = join(assertTemp(dir), '.npmrc');
-  mkdirSync(dir, { recursive: true });
+  mkdir(dir);
   writeFileSync(file, `@jsr:registry=${registry}\n`);
   return file;
 };
@@ -90,7 +98,7 @@ export const promoteTemp = (from: string, to: string): boolean => {
   assertTemp(from);
   assertTemp(to);
   try {
-    mkdirSync(dirname(to), { recursive: true });
+    mkdir(dirname(to));
     renameSync(from, to);
     return true;
   } catch {
@@ -134,7 +142,7 @@ export const clearTempCaches = (): { bytes: number; dirs: number } => {
 // stdin, so it never lands on disk; gzip is flagged by content, not filename —
 // stdin auto-detection varies across tar implementations.
 export const extractTar = (bytes: Uint8Array, dir: string): void => {
-  mkdirSync(assertTemp(dir), { recursive: true });
+  mkdir(assertTemp(dir));
   const gz = bytes.length > 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
   try {
     execFileSync('tar', [gz ? '-xzf' : '-xf', '-', '-C', dir], {
@@ -153,7 +161,7 @@ export const extractTar = (bytes: Uint8Array, dir: string): void => {
 // walks the central directory, inflates stored/deflated members, and confines
 // every member path to `dir`. No zip64 — wheels never get near 4gb.
 export const extractZip = (bytes: Uint8Array, dir: string): void => {
-  mkdirSync(assertTemp(dir), { recursive: true });
+  mkdir(assertTemp(dir));
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   // End-of-central-directory: scan back over the (usually absent) archive comment.
   let eocd = -1;
@@ -197,7 +205,7 @@ export const extractZip = (bytes: Uint8Array, dir: string): void => {
     const file = join(dir, name);
     const parent = dirname(file);
     if (!madeDirs.has(parent)) {
-      mkdirSync(parent, { recursive: true });
+      mkdir(parent);
       madeDirs.add(parent);
     }
     writeFileSync(file, data);
@@ -229,7 +237,7 @@ export const npmInstall = (dir: string): void => {
 const linkDir = (target: string, linkPath: string): void => {
   assertTemp(linkPath);
   if (existsSync(linkPath)) return;
-  mkdirSync(dirname(linkPath), { recursive: true });
+  mkdir(dirname(linkPath));
   try {
     symlinkSync(target, linkPath, 'junction');
   } catch (error) {

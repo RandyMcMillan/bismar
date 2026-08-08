@@ -41,21 +41,20 @@ const capture = async (fn: () => Promise<void>) => {
 };
 
 should('bundle parses flags and rejects removed ones', () => {
-  const args = parseArgs(['--minify', '--checksum', 'index/add']);
+  const args = parseArgs(['--minify', 'index/add']);
   deepStrictEqual(args, {
     bundle: false,
-    checksum: true,
     clear: false,
+    diff: false,
     help: false,
     interactive: false,
     list: false,
     minify: true,
     paths: ['index/add'],
     size: false,
-    sort: false,
   });
   // Short aliases resolve to the same canonical flags as the long spellings.
-  deepStrictEqual(parseArgs(['-m', '-c', 'index/add']), args);
+  deepStrictEqual(parseArgs(['-m', 'index/add']), args);
   deepStrictEqual(parseArgs(['-s']), parseArgs(['--size']));
   deepStrictEqual(parseArgs(['-l']), parseArgs(['--list']));
   deepStrictEqual(parseArgs(['-b']), parseArgs(['--bundle']));
@@ -73,9 +72,55 @@ should('bundle parses flags and rejects removed ones', () => {
   // The old flag names died in the renames; they must not silently no-op.
   throws(() => parseArgs(['--sort']), /unknown option: --sort/);
   throws(() => parseArgs(['--list-sorted']), /unknown option: --list-sorted/);
-  // --size-sorted needs no explicit --size: it implies the mode.
-  const sorted = parseArgs(['--size-sorted']);
-  deepStrictEqual([sorted.size, sorted.sort], [true, true]);
+  // Deleted flags read as unknown options too.
+  throws(() => parseArgs(['--size-sorted']), /unknown option: --size-sorted/);
+  throws(() => parseArgs(['--checksum']), /unknown option: --checksum/);
+  throws(() => parseArgs(['-c']), /unknown option: -c/);
+});
+
+should('bundle combines short flags: -bm == -b -m', () => {
+  deepStrictEqual(parseArgs(['-bm']), parseArgs(['-b', '-m']));
+  deepStrictEqual(
+    parseArgs(['-bm', 'index/add']),
+    parseArgs(['--bundle', '--minify', 'index/add'])
+  );
+  // Cross-mode contradictions surface exactly as if the flags were spelled apart…
+  throws(() => parseArgs(['-bs']), /--size replaces the bundle output; drop --bundle/);
+  throws(() => parseArgs(['-sm']), /--minify shapes the emitted bundle; drop --size/);
+  // …and a cluster with any unknown letter is one unknown option, whole.
+  throws(() => parseArgs(['-bx']), /unknown option: -bx/);
+  throws(() => parseArgs(['-ib']), /unknown option: -ib/);
+});
+
+should('bundle treats any colon head as a namespace and lists the known ones', () => {
+  const msg = (() => {
+    try {
+      parseArgs(['foo:bar']);
+      return '';
+    } catch (error) {
+      return (error as Error).message;
+    }
+  })();
+  deepStrictEqual(/^unknown namespace: foo:; use one of:\n/.test(msg), true, msg);
+  // The listing groups alias spellings with their canonical prefix.
+  for (const line of [
+    'npm: (or js:)',
+    'jsr:',
+    'crate: (or cargo: rs: rust:)',
+    'gem: (or rb: ruby:)',
+    'pypi: (or py: python:)',
+    'composer: (or php:)',
+    'gh: (or github:)',
+    'go: (or golang:)',
+  ])
+    deepStrictEqual(msg.includes(line), true, `${line}\n${msg}`);
+  // js: is the alias spelling for npm refs; it expands before anything parses.
+  deepStrictEqual(parseArgs(['js:preact', '-b']).paths, ['npm:preact']);
+  deepStrictEqual(parseArgs(['-b', 'npm:preact']).paths, ['npm:preact']);
+  // Explicit paths keep colons as filename bytes — ./ is the escape hatch —
+  // and a colon after a slash is not a namespace head.
+  deepStrictEqual(parseArgs(['-b', './a:b.js']).paths, ['./a:b.js']);
+  deepStrictEqual(parseArgs(['-b', 'index/a:b']).paths, ['index/a:b']);
 });
 
 should('bundle prints size stats instead of bytes on a terminal', async () => {
@@ -95,15 +140,15 @@ should('bundle prints size stats instead of bytes on a terminal', async () => {
     res.stderr
   );
   const rows = res.stdout.trim().split('\n');
-  deepStrictEqual(rows[0], 'module,export,loc,minified_bytes,gzipped_bytes');
-  deepStrictEqual(/^index,add,\d+,\d+,\d+$/.test(rows[1] ?? ''), true, res.stdout);
+  // Headerless machine rows, each value unit-tagged.
+  deepStrictEqual(/^index,add,\d+loc,\d+b,\d+b$/.test(rows[0] ?? ''), true, res.stdout);
   // One row for the one refused artifact; and never the bundle bytes themselves.
-  deepStrictEqual(rows.length, 2, res.stdout);
+  deepStrictEqual(rows.length, 1, res.stdout);
   deepStrictEqual(/var bismarTestPlainIndexAdd/.test(res.stdout), false, res.stdout);
-  // --checksum and --list print short text, not bundle bytes: fine on a TTY.
-  const sum = await capture(() => runCli(['--checksum', 'index/add'], { cwd: FIXTURE, tty: true }));
-  deepStrictEqual(sum.ok, true, sum.stderr);
-  deepStrictEqual(/^[0-9a-f]{64}\n$/.test(sum.stdout), true, sum.stdout);
+  // --list prints short text, not bundle bytes: fine on a TTY.
+  const listed = await capture(() => runCli(['--list', 'index/add'], { cwd: FIXTURE, tty: true }));
+  deepStrictEqual(listed.ok, true, listed.stderr);
+  deepStrictEqual(/\{add\} from/.test(listed.stdout), true, listed.stdout);
 });
 
 should('bundle writes the unminified bundle to stdout and nothing else', async () => {
@@ -119,7 +164,7 @@ should('bundle writes the unminified bundle to stdout and nothing else', async (
   deepStrictEqual(/LOC|gzip|sha256|module,export|bismar-bundle-/.test(res.stdout), false);
 });
 
-should('bundle --minify and --checksum emit variants of the same artifact', async () => {
+should('bundle --minify emits the minified variant of the same artifact', async () => {
   const min = await capture(() => runCli(['--minify', 'index/add'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(min.ok, true, min.stderr);
   deepStrictEqual(
@@ -127,16 +172,9 @@ should('bundle --minify and --checksum emit variants of the same artifact', asyn
     true,
     min.stdout.slice(0, 120)
   );
-  const sum = await capture(() =>
-    runCli(['--checksum', 'index/add'], { cwd: FIXTURE, tty: false })
-  );
-  deepStrictEqual(sum.ok, true, sum.stderr);
-  deepStrictEqual(/^[0-9a-f]{64}\n$/.test(sum.stdout), true, sum.stdout);
-  const minSum = await capture(() =>
-    runCli(['--checksum', '--minify', 'index/add'], { cwd: FIXTURE, tty: false })
-  );
-  deepStrictEqual(/^[0-9a-f]{64}\n$/.test(minSum.stdout), true, minSum.stdout);
-  deepStrictEqual(sum.stdout !== minSum.stdout, true);
+  const plain = await capture(() => runCli(['-b', 'index/add'], { cwd: FIXTURE, tty: false }));
+  deepStrictEqual(plain.stdout !== min.stdout, true);
+  deepStrictEqual(min.stdout.length < plain.stdout.length, true);
 });
 
 should('bundle defaults to the whole package and supports --list', async () => {
@@ -220,6 +258,28 @@ should('fs-modify recognizes only bismar-owned temp dirs', () => {
   deepStrictEqual(FS_TEST.inBismarTmp('relative/bismar-x'), false);
 });
 
+should('fs-modify creates cache dirs keeper-private (0700)', async (t) => {
+  // Persistent caches (bismar-refs, bismar-esbuild-*) live at predictable
+  // tmpdir paths on shared machines: every dir bismar makes must be 0700
+  // rather than umask-default, all the way down the recursive mkdirs.
+  if (process.platform === 'win32') return t.skip('posix modes');
+  const { statSync } = await import('node:fs');
+  const { tempDir, write, rmTempDir } = await import('../src/fs-modify.ts');
+  const root = join(tmpdir(), 'bismar-permcheck');
+  rmSync(root, { force: true, recursive: true });
+  write(join(root, '.tags', 'entry.json'), '{}\n');
+  try {
+    for (const dir of [root, join(root, '.tags')])
+      deepStrictEqual((statSync(dir).mode & 0o777).toString(8), '700', dir);
+    // mkdtemp'd run dirs carry 0700 from mkdtemp(3) itself.
+    const run = tempDir('check');
+    deepStrictEqual((statSync(run).mode & 0o777).toString(8), '700', run);
+    rmTempDir(run);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 should('fs-modify promotes run installs into the machine cache, bismar dirs only', () => {
   const from = join(tmpdir(), 'bismar-promote-test-from');
   const to = join(tmpdir(), 'bismar-promote-test-to');
@@ -242,7 +302,7 @@ should('fs-modify promotes run installs into the machine cache, bismar dirs only
   rmSync(to, { force: true, recursive: true });
 });
 
-should('bundle --clear wipes bismar tmp caches, reports stats, stays hidden', async () => {
+should('bundle --clear wipes bismar tmp caches, reports stats, runs alone', async () => {
   // A private TMPDIR keeps the sweep away from the real machine caches; the
   // non-bismar neighbor must survive it.
   const scratch = mkdtempSync(join(tmpdir(), 'clear-fixture-'));
@@ -265,12 +325,12 @@ should('bundle --clear wipes bismar tmp caches, reports stats, stays hidden', as
   deepStrictEqual(existsSync(join(scratch, 'bismar-esbuild-0281')), false);
   deepStrictEqual(existsSync(join(scratch, 'other-keep')), true);
   rmSync(scratch, { force: true, recursive: true });
-  // Hidden: absent from usage, and it refuses company.
+  // Documented in usage, but it refuses company.
   const help = await capture(() => runCli(['--help'], {}));
-  deepStrictEqual(/--clear/.test(help.stdout), false, help.stdout);
+  deepStrictEqual(/--clear {3}remove every bismar cache/.test(help.stdout), true, help.stdout);
   throws(() => parseArgs(['--clear', '--size']), /--clear runs alone/);
   throws(() => parseArgs(['--clear', 'index/add']), /--clear runs alone/);
-  // --clean is the same hatch under its other common spelling.
+  // --clean is the same hatch under its other, undocumented spelling.
   deepStrictEqual(parseArgs(['--clean']).clear, true);
   deepStrictEqual(/--clean/.test(help.stdout), false, help.stdout);
   throws(() => parseArgs(['--clean', '--size']), /--clear runs alone/);

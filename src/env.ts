@@ -32,11 +32,16 @@ export function colorEnabled(env?: Env): boolean {
   if (!proc) return false;
   return wantColor(env, !!proc.stderr?.isTTY || !!proc.stdout?.isTTY);
 }
-/** CSV over tables: BISMAR_CSV=1, or a non-interactive terminal (LLM agents, pipes, CI logs). */
-export function csvEnabled(env?: Env): boolean {
+/** CSV over tables: BISMAR_CSV=1, or a non-interactive stdout (LLM agents, pipes, CI logs).
+ * Keyed to stdout alone — the stream the rows land on — so `bismar -s pkg | sort` gets
+ * CSV even while stderr still points at the terminal (colorEnabled, which also feeds
+ * stderr progress lines, considers both streams and would call that interactive). */
+export function csvEnabled(env?: Env, stdoutTty?: boolean): boolean {
   const proc = cliProcess();
   if (!proc) return false;
-  return envFlag((env ?? proc.env)?.BISMAR_CSV) || !colorEnabled(env);
+  return (
+    envFlag((env ?? proc.env)?.BISMAR_CSV) || !wantColor(env, stdoutTty ?? !!proc.stdout?.isTTY)
+  );
 }
 export const stripAnsi = (str: string): string => str.replace(/\x1b\[\d+(;\d+)*m/g, '');
 /** Shared ANSI palette. */

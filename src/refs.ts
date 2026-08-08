@@ -72,8 +72,15 @@ const installedAt = (base: string, ref: ExternalRef): string =>
 export const realSpec = (ref: ExternalRef, spec: string, pkgName: string): string =>
   spec.startsWith(pkgName) ? spec : `${installName(ref)}/${spec.replace(/^\.\//, '')}`;
 // The machine-wide ref cache root: one label-keyed dir per pinned install,
-// shared by npm/jsr refs here and every registry ecosystem (registries.ts).
-export const refsCacheDir = (label: string): string => join(tmpdir(), 'bismar-refs', slug(label));
+// shared by npm/jsr refs here and every registry ecosystem (registries.ts),
+// filed one subdirectory per registry — bismar-refs/gem/, bismar-refs/crate/…
+// — with bare npm labels (`qr@0.6.0`) under npm/.
+export const refsCacheDir = (label: string): string => {
+  const colon = label.indexOf(':');
+  const prefix = colon > 0 ? label.slice(0, colon) : 'npm';
+  const rest = colon > 0 ? label.slice(colon + 1) : label;
+  return join(tmpdir(), 'bismar-refs', prefix, slug(rest));
+};
 // For originally-pinned refs this reproduces ref.label, so both spellings of one
 // version (`qr@0.6.0` and a fresh-tagged `qr`) share a single cache dir.
 const pinnedDirOf = (ref: ExternalRef, version: string): string =>
@@ -98,6 +105,22 @@ export const readVersionTag = (label: string): string | undefined => {
 };
 export const writeVersionTag = (label: string, version: string): void =>
   void write(tagFile(label), `${JSON.stringify({ at: Date.now(), version })}\n`);
+// Pinned archives are immutable, so their downloaded byte size persists beside
+// the tag cache (never inside the extract dir, whose sole-dir descent and file
+// listings must stay pristine). Extracts predating the meta file simply omit
+// the stat.
+const metaFile = (label: string): string =>
+  join(tmpdir(), 'bismar-refs', '.meta', `${slug(label)}.json`);
+export const readArchiveBytes = (label: string): number | undefined => {
+  try {
+    const bytes = readJson<{ archiveBytes?: unknown }>(metaFile(label)).archiveBytes;
+    return typeof bytes === 'number' && bytes > 0 ? bytes : undefined;
+  } catch {
+    return undefined;
+  }
+};
+export const writeArchiveBytes = (label: string, bytes: number): void =>
+  void write(metaFile(label), `${JSON.stringify({ archiveBytes: bytes })}\n`);
 const installRef = (outDir: string, ref: ExternalRef): string => {
   const version = PINNED.test(ref.version)
     ? ref.version
@@ -143,20 +166,14 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
   }
   return dir;
 };
-// Registry access is explicit: `npm:`/`jsr:` prefixes reach the registry, and so
-// do bare @scoped names — no local module or file can spell one. Every other
-// bare selector stays local; `npm:` is the only route to unscoped registry
-// packages. The package's own (possibly scoped) name keeps selecting itself.
+// Registry access is explicit: only the `npm:`/`jsr:` prefixes reach the
+// registry (explicitRef); every bare name — scoped or not — stays local.
 const NPM_BARE = /^[a-z0-9][\w.-]*$/i;
-export const isNpmSelector = (raw: string, pkgName: string): boolean => {
-  if (explicitRef(raw)) return true;
-  if (raw === '.' || raw.startsWith('./')) return false;
-  if (pkgName && (raw === pkgName || raw.startsWith(`${pkgName}/`))) return false;
-  return raw.startsWith('@');
-};
-// Bare unscoped names never imply npm anymore; when one could exist on the
-// registry, errors point at the prefixed spelling ('' when it could not).
+// Bare names never imply npm; when one could exist on the registry, errors
+// point at the prefixed spelling ('' when it could not).
 export const npmHintOf = (raw: string): string => {
+  // A scoped name needs its scope and a name segment to exist on the registry.
+  if (raw.startsWith('@')) return raw.includes('/') ? `npm:${raw}` : '';
   const seg = raw.split('/')[0];
   const at = seg.lastIndexOf('@');
   return NPM_BARE.test(at > 0 ? seg.slice(0, at) : seg) ? `npm:${raw}` : '';

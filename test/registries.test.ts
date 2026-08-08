@@ -14,9 +14,20 @@ import { deflateRawSync } from 'node:zlib';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
+// The requests-per-second politeness budget only buys latency against the
+// local stand-in servers here; 0 drops the spacing timers entirely.
+process.env.BISMAR_RPS = '0';
 
-const { parseRegistryRef } = await import('../src/registries.ts');
-const { parseArgs } = await import('../src/bismar.ts');
+const {
+  BIG_ARCHIVE,
+  guardBigArchive,
+  jsHitStats,
+  parseRegistryRef,
+  searchRegistry,
+  setBigArchivePolicy,
+} = await import('../src/registries.ts');
+const { parseArgs, runCli } = await import('../src/bismar.ts');
+const { refsCacheDir } = await import('../src/refs.ts');
 const { extractZip, tempDir } = await import('../src/fs-modify.ts');
 const { runInteractive } = await import('../src/interactive.ts');
 
@@ -145,6 +156,11 @@ should('registry refs parse names and exact versions only', () => {
   });
   deepStrictEqual(parseRegistryRef('ruby:rails').prefix, 'gem:');
   deepStrictEqual(parseRegistryRef('python:requests').prefix, 'pypi:');
+  // …short aliases too: cargo/rs → crate, rb → gem, py → pypi.
+  deepStrictEqual(parseRegistryRef('cargo:serde').prefix, 'crate:');
+  deepStrictEqual(parseRegistryRef('rs:serde@1.0.219').prefix, 'crate:');
+  deepStrictEqual(parseRegistryRef('rb:rails').prefix, 'gem:');
+  deepStrictEqual(parseRegistryRef('py:requests').prefix, 'pypi:');
   // …while error hints echo the spelling the user typed.
   throws(() => parseRegistryRef('ruby:rails@>=7'), /pin an exact version like ruby:rails@1\.0\.0/);
   throws(() => parseRegistryRef('python:-x'), /invalid package ref.*use python:name@version/);
@@ -186,19 +202,275 @@ should('registry refs parse names and exact versions only', () => {
   throws(() => parseRegistryRef('pypi:requests@latest'), /pin an exact version/);
 });
 
-should('registry refs are refused outside interactive mode', () => {
-  throws(() => parseArgs(['crate:serde', '-b']), /crate refs browse only.*run bismar crate:serde/);
-  throws(() => parseArgs(['gem:rails', '--size']), /gem refs browse only/);
-  throws(() => parseArgs(['pypi:requests', '--list']), /pypi refs browse only/);
-  throws(() => parseArgs(['ruby:rails', '-b']), /ruby refs browse only.*run bismar ruby:rails/);
-  throws(() => parseArgs(['gh:octo/mini', '--minify']), /gh refs browse only/);
-  throws(() => parseArgs(['composer:monolog/monolog', '--size']), /composer refs browse only/);
-  throws(() => parseArgs(['go:golang.org/x/text', '-b']), /go refs browse only/);
+should('archives at or past 100mb need consent before downloading', async () => {
+  // The prompt branch keys off the ambient streams, so pin them off-terminal:
+  // run from a real terminal this would stop for a y/N answer nobody types.
+  const stdin = process.stdin as unknown as { isTTY?: boolean };
+  const stderr = process.stderr as unknown as { isTTY?: boolean };
+  const prevIn = stdin.isTTY;
+  const prevErr = stderr.isTTY;
+  stdin.isTTY = false;
+  stderr.isTTY = false;
+  try {
+    // Small downloads never ask, in any mode.
+    await guardBigArchive('gh:small/repo', BIG_ARCHIVE - 1);
+    // Off a terminal (as pinned here) there is nobody to ask: refuse with the override.
+    await rejects(
+      () => guardBigArchive('gh:paulmillr/qr-code-vectors', BIG_ARCHIVE * 2),
+      /refusing large download: gh:paulmillr\/qr-code-vectors is ~200\.00mb; confirm on a terminal or set BISMAR_BIG=1/
+    );
+    // The TUI policy (raw-mode stdin) refuses instead of prompting into the screen.
+    setBigArchivePolicy('refuse');
+    try {
+      await rejects(() => guardBigArchive('gh:big/repo', BIG_ARCHIVE), /refusing large download/);
+    } finally {
+      setBigArchivePolicy('ask');
+    }
+    // BISMAR_BIG=1 waves everything through (scripts, CI).
+    process.env.BISMAR_BIG = '1';
+    try {
+      await guardBigArchive('gh:big/repo', BIG_ARCHIVE * 10);
+    } finally {
+      delete process.env.BISMAR_BIG;
+    }
+  } finally {
+    stdin.isTTY = prevIn;
+    stderr.isTTY = prevErr;
+  }
+});
+
+should('ref cache files one subdirectory per registry', () => {
+  deepStrictEqual(
+    refsCacheDir('crate:serde@1.0.219'),
+    join(tmpdir(), 'bismar-refs', 'crate', 'serde-1-0-219')
+  );
+  deepStrictEqual(
+    refsCacheDir('gem:rails@7.1.3'),
+    join(tmpdir(), 'bismar-refs', 'gem', 'rails-7-1-3')
+  );
+  // Bare npm labels file under npm/; jsr labels keep their own shelf.
+  deepStrictEqual(refsCacheDir('qr@0.6.0'), join(tmpdir(), 'bismar-refs', 'npm', 'qr-0-6-0'));
+  deepStrictEqual(
+    refsCacheDir('jsr:@std/bytes@1.0.5'),
+    join(tmpdir(), 'bismar-refs', 'jsr', 'std-bytes-1-0-5')
+  );
+});
+
+should('registry refs take every output mode except minify', () => {
+  // -b emits the saved registry archive; only minify-shaped output is refused.
+  deepStrictEqual(parseArgs(['crate:serde', '-b']).bundle, true);
+  deepStrictEqual(parseArgs(['composer:monolog/monolog', '-b']).paths, [
+    'composer:monolog/monolog',
+  ]);
+  throws(
+    () => parseArgs(['gem:rails', '--minify']),
+    /gem refs have no JS to minify.*drop --minify/
+  );
+  throws(() => parseArgs(['pypi:requests', '--minify']), /pypi refs have no JS to minify/);
+  throws(() => parseArgs(['gh:octo/mini', '--minify']), /gh refs have no JS to minify/);
+  throws(() => parseArgs(['go:golang.org/x/text', '-bm']), /go refs have no JS to minify/);
+  // Short aliases speak the rule in the spelling the user typed.
+  throws(() => parseArgs(['cargo:serde', '-m']), /cargo refs have no JS to minify/);
+  // Stdout holds exactly one artifact.
+  throws(
+    () => parseArgs(['-b', 'crate:serde', 'crate:tokio']),
+    /registry archives emit one at a time/
+  );
   // Interactive is the default mode, so bare registry refs just work.
   deepStrictEqual(parseArgs(['crate:serde']).interactive, true);
   deepStrictEqual(parseArgs(['gem:rails']).interactive, true);
   deepStrictEqual(parseArgs(['python:requests']).interactive, true);
+  deepStrictEqual(parseArgs(['rb:rails']).interactive, true);
+  deepStrictEqual(parseArgs(['py:requests']).interactive, true);
   deepStrictEqual(parseArgs(['gh:octo/mini@dev']).interactive, true);
+});
+
+should('search parses hits from every registry api behind a browser agent', async () => {
+  const agents: (string | undefined)[] = [];
+  const routes: Record<string, string> = {
+    '/-/v1/search?text=pre&size=10': JSON.stringify({
+      objects: [
+        { package: { description: 'Fast 3kB alternative', name: 'preact', version: '10.20.0' } },
+        { package: { name: 'preact-render-to-string', version: '6.0.0' } },
+      ],
+    }),
+    '/packages?query=bytes&limit=10': JSON.stringify({
+      items: [{ description: 'Byte helpers', latestVersion: '1.0.6', name: 'bytes', scope: 'std' }],
+    }),
+    '/api/v1/crates?q=serde&per_page=10': JSON.stringify({
+      crates: [
+        {
+          description: 'A serialization\nframework',
+          max_stable_version: '1.0.219',
+          name: 'serde',
+        },
+        { description: null, max_version: '1.0.140', name: 'serde_json' },
+      ],
+    }),
+    '/api/v1/search.json?query=rail': JSON.stringify([
+      { info: 'Ruby on Rails', name: 'railties', version: '7.1.3' },
+    ]),
+    '/search/repositories?q=qr&per_page=10': JSON.stringify({
+      items: [
+        { description: 'QR code generator', full_name: 'paulmillr/qr', stargazers_count: 123 },
+      ],
+    }),
+  };
+  const server = createServer((req, res) => {
+    agents.push(req.headers['user-agent']);
+    const body = routes[req.url ?? ''];
+    if (!body) {
+      res.statusCode = 404;
+      return void res.end('{}');
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(body);
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  const bases = [
+    'BISMAR_NPM_API',
+    'BISMAR_JSR_API',
+    'BISMAR_CRATES_API',
+    'BISMAR_GEMS_API',
+    'BISMAR_GH_API',
+  ];
+  for (const key of bases)
+    process.env[key] = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    // npm hits carry no description by design; the jsr/crate/gem/gh ones do.
+    deepStrictEqual(await searchRegistry('npm:', 'pre'), [
+      { desc: '', name: 'preact', version: '10.20.0' },
+      { desc: '', name: 'preact-render-to-string', version: '6.0.0' },
+    ]);
+    deepStrictEqual(await searchRegistry('jsr:', 'bytes'), [
+      { desc: 'Byte helpers', name: '@std/bytes', version: '1.0.6' },
+    ]);
+    // Multi-line descriptions collapse onto one row; stable versions win.
+    deepStrictEqual(await searchRegistry('crate:', 'serde'), [
+      { desc: 'A serialization framework', name: 'serde', version: '1.0.219' },
+      { desc: '', name: 'serde_json', version: '1.0.140' },
+    ]);
+    deepStrictEqual(await searchRegistry('gem:', 'rail'), [
+      { desc: 'Ruby on Rails', name: 'railties', version: '7.1.3' },
+    ]);
+    deepStrictEqual(await searchRegistry('gh:', 'qr'), [
+      { desc: 'QR code generator', name: 'paulmillr/qr', version: '123★' },
+    ]);
+    // pypi retired its search api in 2021; the launcher opens exact names there.
+    await rejects(() => searchRegistry('pypi:', 'requests'), /no search api behind pypi:/);
+    // Every request went out as a mainstream browser, never as a bot.
+    deepStrictEqual(agents.length, 5, String(agents.length));
+    for (const ua of agents) {
+      deepStrictEqual(ua?.startsWith('Mozilla/5.0 '), true, ua);
+      deepStrictEqual(/ Chrome\/\d+/.test(ua ?? ''), true, ua);
+      deepStrictEqual(/bismar|bot|curl|node/i.test(ua ?? ''), false, ua);
+    }
+  } finally {
+    for (const key of bases) delete process.env[key];
+    await closeServer(server);
+  }
+});
+
+should('js hit stats find packed tarball bytes and dep counts, then cache', async () => {
+  // Versions are deliberately unpublishable: the stats cache is machine-wide,
+  // and a real pkg@version must never be seeded with stand-in numbers.
+  rmSync(join(tmpdir(), 'bismar-refs', '.stats'), { force: true, recursive: true });
+  let base = '';
+  const server = createServer((req, res) => {
+    const url = req.url ?? '';
+    if (url === '/preact/0.0.0-bismar') {
+      res.setHeader('content-type', 'application/json');
+      return void res.end(
+        JSON.stringify({ dependencies: { a: '1' }, dist: { tarball: `${base}/preact.tgz` } })
+      );
+    }
+    if (url === '/preact.tgz') {
+      // npm-style CDN: HEAD says nothing useful; a range GET carries the total.
+      if (req.method === 'HEAD') return void res.end();
+      if (req.headers.range === 'bytes=0-0') {
+        res.statusCode = 206;
+        res.setHeader('content-range', 'bytes 0-0/407547');
+        return void res.end('x');
+      }
+    }
+    if (url === '/@jsr/std__bytes') {
+      res.setHeader('content-type', 'application/json');
+      return void res.end(
+        JSON.stringify({
+          'dist-tags': { latest: '0.0.0-bismar' },
+          versions: { '0.0.0-bismar': { dist: { tarball: `${base}/bytes.tgz` } } },
+        })
+      );
+    }
+    if (url === '/bytes.tgz' && req.method === 'HEAD') {
+      // jsr-style CDN answers HEAD with the size directly.
+      res.setHeader('content-length', '11881');
+      return void res.end();
+    }
+    res.statusCode = 404;
+    res.end('{}');
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  process.env.BISMAR_NPM_API = base;
+  process.env.BISMAR_JSR_REGISTRY = base;
+  try {
+    deepStrictEqual(
+      await jsHitStats('npm:', { desc: '', name: 'preact', version: '0.0.0-bismar' }),
+      { deps: 1, tgzBytes: 407547 }
+    );
+    // jsr: search already carried deps; the packument fills the missing latest
+    // version and its tarball answers HEAD.
+    deepStrictEqual(
+      await jsHitStats('jsr:', { deps: 0, desc: '', name: '@std/bytes', version: '' }),
+      { deps: 0, tgzBytes: 11881, version: '0.0.0-bismar' }
+    );
+    // Non-JS registries have no garnish — and no requests are made for them.
+    deepStrictEqual(
+      await jsHitStats('crate:', { desc: '', name: 'serde', version: '1.0.0' }),
+      undefined
+    );
+    // Stats cache per pkg@version: with the registries unreachable, versioned
+    // lookups still answer from disk (a blank jsr version needs the packument
+    // to resolve, so only the pinned spelling is offline-safe).
+    process.env.BISMAR_NPM_API = 'http://127.0.0.1:9';
+    process.env.BISMAR_JSR_REGISTRY = 'http://127.0.0.1:9';
+    deepStrictEqual(
+      await jsHitStats('npm:', { desc: '', name: 'preact', version: '0.0.0-bismar' }),
+      { deps: 1, tgzBytes: 407547 }
+    );
+    deepStrictEqual(
+      await jsHitStats('jsr:', { desc: '', name: '@std/bytes', version: '0.0.0-bismar' }),
+      { deps: 0, tgzBytes: 11881 }
+    );
+  } finally {
+    delete process.env.BISMAR_NPM_API;
+    delete process.env.BISMAR_JSR_REGISTRY;
+    await closeServer(server);
+  }
+});
+
+should('github search rate limits surface as a one-line hint, not a retry storm', async () => {
+  // Anonymous github search allows 10 queries a minute and answers 403; that
+  // must map to a friendly message after exactly one request (403 never retries).
+  let asked = 0;
+  const server = createServer((_req, res) => {
+    asked += 1;
+    res.statusCode = 403;
+    res.end('{}');
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  process.env.BISMAR_GH_API = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    await rejects(
+      () => searchRegistry('gh:', 'qr'),
+      /github search is rate-limited for anonymous use; wait a minute and retry/
+    );
+    deepStrictEqual(asked, 1);
+  } finally {
+    delete process.env.BISMAR_GH_API;
+    await closeServer(server);
+  }
 });
 
 should('zip reader extracts members and refuses traversal', () => {
@@ -239,7 +511,7 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
   });
   try {
     process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
-    coldCache('crate-mini-0-1-0', join('.tags', 'crate-mini.json'));
+    coldCache(join('crate', 'mini-0-1-0'), join('.tags', 'crate-mini.json'));
 
     // Pinned ref: enter src/, preview lib.rs, climb back, f is a no-op, esc exits.
     const session = open('crate:mini@0.1.0');
@@ -274,6 +546,47 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
     await alias.done;
     deepStrictEqual(/crate:mini@0\.1\.0 · files/.test(alias.text()), true, alias.text());
 
+    // -b emits the saved archive verbatim, byte-identical to the served .crate.
+    let out = Buffer.alloc(0);
+    const prevWrite = process.stdout.write;
+    process.stdout.write = ((chunk: unknown) => {
+      out = Buffer.concat([out, Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))]);
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await runCli(['-b', 'crate:mini@0.1.0'], { tty: false });
+    } finally {
+      process.stdout.write = prevWrite;
+    }
+    deepStrictEqual(out.equals(readFileSync(join(fix, 'mini.crate'))), true);
+    // A terminal refuses the bytes and hints the redirect with a real filename,
+    // plus a stat row with the archive's size, like the JS bundle fallback.
+    const prevExit = process.exitCode;
+    const prevErr = console.error;
+    const prevLog = console.log;
+    let hint = '';
+    let stat = '';
+    console.error = (...args: unknown[]) => {
+      hint += args.join(' ');
+    };
+    console.log = (...args: unknown[]) => {
+      stat += args.join(' ');
+    };
+    try {
+      await runCli(['-b', 'crate:mini@0.1.0'], { tty: true });
+    } finally {
+      console.error = prevErr;
+      console.log = prevLog;
+    }
+    deepStrictEqual(process.exitCode, 1, hint);
+    process.exitCode = prevExit;
+    deepStrictEqual(
+      /use redirect: bismar -b crate:mini@0\.1\.0 > mini-0\.1\.0\.crate/.test(hint),
+      true,
+      hint
+    );
+    deepStrictEqual(/^mini-0\.1\.0\.crate {2}[\d.]+kb$/.test(stat), true, stat);
+
     // Unknown crates fail with the registry story, before any screen is taken.
     await rejects(() => runInteractive('crate:nope', { cwd: tmpdir() }), /crate not found: nope/);
   } finally {
@@ -299,7 +612,7 @@ should('interactive gem ref unwraps the data layer of the gem shell', async () =
   });
   try {
     process.env.BISMAR_GEMS_API = `http://127.0.0.1:${port}`;
-    coldCache('gem-minigem-0-2-0', join('.tags', 'gem-minigem.json'));
+    coldCache(join('gem', 'minigem-0-2-0'), join('.tags', 'gem-minigem.json'));
     // Versionless: resolve latest, download, unwrap; then browse lib/mini.rb.
     const session = open('gem:minigem');
     session.send('\r\rq\x1b\x1b');
@@ -342,7 +655,7 @@ should('interactive composer ref resolves via p2 and extracts the dist zip', asy
   });
   try {
     process.env.BISMAR_COMPOSER_API = `http://127.0.0.1:${port}`;
-    coldCache('composer-mini-pkg-1-1-0', join('.tags', 'composer-mini-pkg.json'));
+    coldCache(join('composer', 'mini-pkg-1-1-0'), join('.tags', 'composer-mini-pkg.json'));
     // php: alias in, canonical composer: label out; newest version wins.
     const session = open('php:mini/pkg');
     session.send('\r\rq\x1b\x1b');
@@ -359,6 +672,86 @@ should('interactive composer ref resolves via p2 and extracts the dist zip', asy
     );
   } finally {
     delete process.env.BISMAR_COMPOSER_API;
+    await closeServer(server);
+  }
+});
+
+should('registry dist urls are confined to allowlisted hosts', async () => {
+  // A hostile package points its dist at an off-registry host: the fetch is
+  // refused by host before any bytes are read. With BISMAR_COMPOSER_API set,
+  // the stand-in's own origin is allowed, so a same-origin dist still works —
+  // but a cross-origin one (evil.example, or plain http elsewhere) is not.
+  const dist = zipOf([['ok-1a2b3c/composer.json', '{\n  "name": "ok/pkg"\n}\n']]);
+  const { port, server } = await serve({
+    '/dist/ok.zip': () => ({ body: dist }),
+    '/p2/evil/pkg.json': () => ({
+      body: JSON.stringify({
+        packages: {
+          'evil/pkg': [{ dist: { url: 'https://evil.example/pkg.zip' }, version: '1.0.0' }],
+        },
+      }),
+      json: true,
+    }),
+    '/p2/ok/pkg.json': () => ({
+      body: JSON.stringify({
+        packages: {
+          'ok/pkg': [{ dist: { url: `http://127.0.0.1:${port}/dist/ok.zip` }, version: '1.0.0' }],
+        },
+      }),
+      json: true,
+    }),
+  });
+  try {
+    process.env.BISMAR_COMPOSER_API = `http://127.0.0.1:${port}`;
+    coldCache(
+      join('composer', 'evil-pkg-1-0-0'),
+      join('composer', 'ok-pkg-1-0-0'),
+      join('.tags', 'composer-evil-pkg.json'),
+      join('.tags', 'composer-ok-pkg.json')
+    );
+    await rejects(
+      () => runInteractive('composer:evil/pkg', { cwd: tmpdir() }),
+      /refusing download from unexpected host: evil\.example/
+    );
+    // The same-origin dist (via the override) still opens fine.
+    const ok = open('composer:ok/pkg');
+    ok.send('q\x1b');
+    await ok.done;
+    deepStrictEqual(/composer:ok\/pkg@1\.0\.0 · files/.test(ok.text()), true, ok.text());
+  } finally {
+    delete process.env.BISMAR_COMPOSER_API;
+    await closeServer(server);
+  }
+});
+
+should('js garnish ignores a tarball url on an unexpected host', async () => {
+  // A packument whose tarball points off-registry: the size garnish is dropped
+  // (deps still count from the doc), never surfacing as an error. The version
+  // is unpublishable so the machine stats cache is never seeded for a real one.
+  rmSync(join(tmpdir(), 'bismar-refs', '.stats'), { force: true, recursive: true });
+  const server = createServer((req, res) => {
+    if (req.url === '/preact/0.0.0-bismarhost') {
+      res.setHeader('content-type', 'application/json');
+      return void res.end(
+        JSON.stringify({
+          dependencies: { a: '1' },
+          dist: { tarball: 'https://evil.example/x.tgz' },
+        })
+      );
+    }
+    res.statusCode = 404;
+    res.end('{}');
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  process.env.BISMAR_NPM_API = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    // Deps come through; the off-host tarball contributes no tgzBytes, no throw.
+    deepStrictEqual(
+      await jsHitStats('npm:', { desc: '', name: 'preact', version: '0.0.0-bismarhost' }),
+      { deps: 1 }
+    );
+  } finally {
+    delete process.env.BISMAR_NPM_API;
     await closeServer(server);
   }
 });
@@ -444,7 +837,7 @@ should('files view jumps to the github repo named by package.json and back', asy
   try {
     process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
     process.env.BISMAR_GH_CODELOAD = `http://127.0.0.1:${port}`;
-    coldCache(`gh-octo-mini-${short}`, join('.tags', 'gh-octo-mini.json'));
+    coldCache(join('gh', `octo-mini-${short}`), join('.tags', 'gh-octo-mini.json'));
     const session = open(undefined, pkgDir);
     session.send('r\x1bq');
     await session.done;
@@ -482,7 +875,7 @@ should('interactive go ref unwinds the nested import path of module zips', async
   });
   try {
     process.env.BISMAR_GO_PROXY = `http://127.0.0.1:${port}`;
-    coldCache('go-golang-org-x-mini-v0-5-0', join('.tags', 'go-golang-org-x-mini.json'));
+    coldCache(join('go', 'golang-org-x-mini-v0-5-0'), join('.tags', 'go-golang-org-x-mini.json'));
     const session = open('go:golang.org/x/mini');
     session.send('\rq\x1b');
     await session.done;
@@ -563,7 +956,11 @@ should('interactive pypi ref prefers sdists and falls back to wheel zips', async
   });
   try {
     process.env.BISMAR_PYPI_API = `http://127.0.0.1:${port}`;
-    coldCache('pypi-mini-py-0-3-0', 'pypi-mini-py-0-4-0', join('.tags', 'pypi-mini-py.json'));
+    coldCache(
+      join('pypi', 'mini-py-0-3-0'),
+      join('pypi', 'mini-py-0-4-0'),
+      join('.tags', 'pypi-mini-py.json')
+    );
 
     // Versionless resolves to 0.3.0 and lands in the sdist tree (PKG-INFO at root).
     const sdist = open('pypi:mini-py');
