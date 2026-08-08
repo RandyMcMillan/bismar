@@ -60,7 +60,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/paulmillr/jsbt.git"
+    "url": "git+https://github.com/paulmillr/bismar.git"
   },
   "type": "module",
   "main": "public.js",
