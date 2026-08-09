@@ -38,8 +38,8 @@ should('bismar --help documents the single command, every flag and its alias', a
   deepStrictEqual(/bismar (bundle|size) |jsbt-check|<command>/.test(out), false, out);
   // Combined shorts and the namespace table are documented too.
   deepStrictEqual(out.includes('short flags combine: bismar -bm == bismar -b -m'), true, out);
-  deepStrictEqual(out.includes('npm: (or js:)'), true, out);
-  deepStrictEqual(out.includes('crate: (or rust: rs: cargo:)'), true, out);
+  deepStrictEqual(out.includes('namespaces (long aliases like npm: crate: work too):'), true, out);
+  deepStrictEqual(out.includes('rs:   crates.io   gh:   github'), true, out);
 });
 
 should('bismar refuses unknown selector namespaces with the full listing', async () => {
@@ -54,7 +54,7 @@ should('bare bismar off a terminal errs with the mode hints', async () => {
   // it cannot — the error points at the flags that do produce pipe output.
   await rejects(
     () => runCli([], { tty: false }),
-    /interactive mode needs a terminal; add -b to bundle or -s for size stats/
+    /interactive mode needs a terminal; add -b to bundle or -s for shipped sizes/
   );
 });
 
@@ -66,16 +66,12 @@ should('bismar rejects unknown options and cross-mode flag combos', async () => 
   await rejects(() => runCli(['size', '--keep'], { tty: false }), /unknown option: --keep/);
   await rejects(
     () => runCli(['--size', '--minify'], { tty: false }),
-    /--minify shapes the emitted bundle; drop --size/
+    /--minify shapes the emitted bundle; use -bms or drop -m/
   );
   // Deleted flags read as unknown options, not silent no-ops.
   await rejects(() => runCli(['--checksum'], { tty: false }), /unknown option: --checksum/);
   await rejects(() => runCli(['-c'], { tty: false }), /unknown option: -c/);
   await rejects(() => runCli(['--size-sorted'], { tty: false }), /unknown option: --size-sorted/);
-  await rejects(
-    () => runCli(['-b', '-s'], { tty: false }),
-    /--size replaces the bundle output; drop --bundle/
-  );
   await rejects(
     () => runCli(['-b', '--list'], { tty: false }),
     /--list replaces the bundle output; drop --bundle/

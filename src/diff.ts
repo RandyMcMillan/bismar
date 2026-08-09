@@ -1,9 +1,10 @@
 /**
 Recursive package diff (`-d`): resolves two selectors to package trees on disk
 (installs and downloads delegate to refs.ts/registries.ts, which own the
-caches), walks both trees, classifies shipped files as added/removed/modified,
-and renders Myers line diffs as unified hunks or a stat table. The diffing
-itself is pure reads; nothing here writes.
+caches; tarball extraction, `npm pack`, and the measured-side tarball installs
+to fs-modify.ts), walks both trees,
+classifies shipped files as added/removed/modified, and renders Myers line
+diffs as unified hunks or a stat table. The diffing itself is pure reads.
 
 Output is unified-diff shaped for reading, not patching: `\ No newline at end
 of file` markers are not emitted.
@@ -11,8 +12,9 @@ of file` markers are not emitted.
  */
 import { lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { color, csvRow, paint } from './env.ts';
-import { bad, err, explicitPath, kb } from './public.ts';
+import { color, csvRow, paint, progressShow } from './env.ts';
+import { extractArchive, npmInstall, npmPack, writePkg } from './fs-modify.ts';
+import { bad, err, explicitPath, kb, readPkg, slug } from './public.ts';
 import { asRef, explicitRef, installedRef, npmHintUse, parseNpmRef } from './refs.ts';
 import { isRegistrySelector, jsHitStats, parseRegistryRef, registryContext } from './registries.ts';
 
@@ -21,25 +23,65 @@ export type DiffEntry = { aBytes: number; bBytes: number; path: string; status: 
 // aTotal/bTotal are whole-tree shipped bytes, unchanged files included, so the
 // footer can say what each side weighs — not just the delta.
 export type TreeDiff = { aTotal: number; bTotal: number; entries: DiffEntry[]; same: number };
-export type DiffSide = { archiveBytes?: number; dir: string; label: string };
+export type DiffSide = {
+  archiveBytes?: number;
+  // Pinned npm/jsr refs keep their measurement cache beside the install.
+  cacheDir?: string;
+  dir: string;
+  label: string;
+  localDir?: boolean;
+  // Bundle modes only: the `/module/export` tail of a ref selector, scoping
+  // what that side measures/builds. Tree modes reject paths outright.
+  sel?: string;
+  // The archive an extracted side came from; measuredSide installs from it.
+  tarball?: string;
+};
+
+// `.tgz`/`.tar.gz` always means a tarball on disk, even bare — no package name
+// ends that way, and `npm pack` output is what people hold in their hands.
+const TGZ = /\.(?:tgz|tar\.gz)$/i;
+// npm tarballs (registry downloads, `npm pack` output) wrap the package in a
+// single root directory — usually `package/`, but the name is not guaranteed.
+const extractedTgz = (outDir: string, file: string, label: string): DiffSide => {
+  const bytes = readFileSync(file);
+  const dir = join(outDir, `tgz-${slug(label)}`);
+  extractArchive(bytes, dir);
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const root = entries.length === 1 && entries[0].isDirectory() ? join(dir, entries[0].name) : dir;
+  return { archiveBytes: bytes.length, dir: root, label, tarball: file };
+};
 
 // Resolve one diff selector to a directory: registry refs fetch + extract,
-// npm/jsr refs install, explicit paths mean the disk. Bare names never imply
-// npm, same as everywhere else in the selector grammar.
-export const diffTarget = async (outDir: string, raw: string, cwd: string): Promise<DiffSide> => {
+// npm/jsr refs install, tarballs extract, explicit paths mean the disk. Bare
+// names never imply npm, same as everywhere else in the selector grammar.
+// `bundle` marks the measured modes (-db/-dbm/-dbs): only they accept a
+// `/module/export` tail on a ref — a file-tree diff of one export means
+// nothing, but a bundle diff of one is as real as `bismar -b ref/mod/exp`.
+export const diffTarget = async (
+  outDir: string,
+  raw: string,
+  cwd: string,
+  bundle = false
+): Promise<DiffSide> => {
   if (isRegistrySelector(raw)) {
     const got = await registryContext(outDir, parseRegistryRef(raw));
     return { archiveBytes: got.archiveBytes, dir: got.pkgDir, label: got.label };
+  }
+  if (TGZ.test(raw)) {
+    const file = resolve(cwd, raw);
+    if (!statSync(file, { throwIfNoEntry: false })?.isFile()) err(`missing tarball: ${bad(raw)}`);
+    return extractedTgz(outDir, file, raw);
   }
   if (raw === '.' || explicitPath(raw)) {
     const dir = resolve(cwd, raw);
     if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory())
       err(`missing diff directory: ${bad(raw)}`);
-    return { dir, label: raw };
+    return { dir, label: raw, localDir: true };
   }
   if (explicitRef(raw)) {
     const ref = parseNpmRef(asRef(raw));
-    if (ref.path) err(`--diff compares whole packages; drop /${ref.path} from ${bad(raw)}`);
+    if (ref.path && !bundle)
+      err(`--diff compares whole packages; drop /${ref.path} from ${bad(raw)}`);
     const got = installedRef(outDir, ref);
     // Packed-tarball garnish for the footer: one cached metadata + HEAD
     // round-trip per pinned version, quiet on any failure — never an error.
@@ -50,33 +92,63 @@ export const diffTarget = async (outDir: string, raw: string, cwd: string): Prom
     })
       .then((stats) => stats?.tgzBytes)
       .catch(() => undefined);
-    return { archiveBytes, dir: got.pkgDir, label: got.label };
+    return {
+      archiveBytes,
+      cacheDir: got.refDir,
+      dir: got.pkgDir,
+      // The selection rides in the label too, so headers and the no-change
+      // message name what was actually built.
+      label: ref.path ? `${got.label}/${ref.path}` : got.label,
+      sel: ref.path || undefined,
+    };
   }
   const use = npmHintUse(raw);
   return err(`--diff expects package refs or directories, not ${bad(raw)}${use ? `; ${use}` : ''}`);
 };
 
-// The two accepted argument shapes, normalized to two selectors: `-d <a> <b>`
-// diffs two packages, `-d <pkg> <v1> <v2>` diffs two versions of one package.
-// There is deliberately no `pkg@v1..v2` range grammar — versions are plain
-// arguments, never parsed out of the selector.
-export const diffPair = (paths: string[]): [string, string] => {
-  if (paths.length === 2) return [paths[0], paths[1]];
-  const [pkg, v1, v2] = paths;
-  if (pkg === '.' || explicitPath(pkg))
-    err(`directories have no versions: ${bad(pkg)}; pass two directories instead`);
-  for (const version of [v1, v2])
-    if (explicitPath(version) || version.includes(':'))
-      err(`expected a version, not ${bad(version)}; use bismar -d <pkg> <v1> <v2>`);
-  // A pinned package plus two more versions contradicts itself; the version
-  // grammar of the constructed selectors is checked downstream per ecosystem.
-  const pinned = isRegistrySelector(pkg)
-    ? parseRegistryRef(pkg).version
-    : explicitRef(pkg)
-      ? parseNpmRef(asRef(pkg)).version
-      : '';
-  if (pinned) err(`already pinned: ${bad(pkg)}; drop @${pinned} — the two versions follow`);
-  return [`${pkg}@${v1}`, `${pkg}@${v2}`];
+// A local directory diffed against a shipped package would drown the compare in
+// files npm never publishes — tests, sources, CI config. When exactly one side
+// is a local directory with a manifest, pack it the way `npm publish` selects
+// files (`npm pack`, scripts ignored) and diff the packed tree instead; the
+// tarball also gives that side its packed footer bytes. Dir-vs-dir compares
+// stay whole-tree: there both sides mean "what's on disk".
+const packable = (side: DiffSide): boolean =>
+  !!side.localDir &&
+  !!statSync(join(side.dir, 'package.json'), { throwIfNoEntry: false })?.isFile();
+// Standalone shipped-size listings always mean the publishable package tree.
+// Diff keeps its historical dir-vs-dir behavior below and only packs the local
+// side when it faces an already-shipped package.
+export const packLocalSide = (outDir: string, side: DiffSide): DiffSide => {
+  if (!packable(side)) return side;
+  const label = `${side.label} (npm pack)`;
+  return extractedTgz(outDir, npmPack(side.dir, join(outDir, `pack-${slug(side.label)}`)), label);
+};
+export const packLocalSides = (outDir: string, a: DiffSide, b: DiffSide): [DiffSide, DiffSide] => {
+  if (packable(a) === packable(b)) return [a, b];
+  return [packLocalSide(outDir, a), packLocalSide(outDir, b)];
+};
+
+// Measured diff sides (-db/-dbm/-dbs) bundle each side's code, so every side
+// must resolve its declared dependencies: a bare tarball extract has no
+// node_modules, esbuild then reports the deps unresolvable, and the measuring
+// engine's external fallback would silently exclude their bytes from that side
+// only — asymmetric against a ref side, which installs. Refs stay as installed
+// (cacheDir marks them); local dirs measure in place, where their own
+// node_modules answers, same as `bismar -bs` run inside them; tarball extracts
+// install their archive into the run dir first (fs-modify owns the mutation).
+export const measuredSide = (outDir: string, side: DiffSide): DiffSide => {
+  if (side.cacheDir || !side.tarball) return side;
+  // A tarball without a manifest declares no deps; its extract measures as-is.
+  if (!statSync(join(side.dir, 'package.json'), { throwIfNoEntry: false })?.isFile()) return side;
+  const name = readPkg(join(side.dir, 'package.json')).name;
+  progressShow(`installing ${side.label}`);
+  const dir = join(outDir, `install-${slug(side.label)}`);
+  writePkg(
+    join(dir, 'package.json'),
+    `${JSON.stringify({ dependencies: { [name]: `file:${side.tarball}` }, private: true }, null, 2)}\n`
+  );
+  npmInstall(dir);
+  return { ...side, dir: join(dir, 'node_modules', name) };
 };
 
 // Shipped files only, like the navigator's files view: dev-only trees are
@@ -253,6 +325,27 @@ const opLine = (op: DiffOp, on: boolean): string =>
     : op.kind === '-'
       ? paint(`-${op.text}`, color.red, on)
       : ` ${op.text}`;
+const textHunks = (aText: string, bText: string, on: boolean): string[] => {
+  const lines: string[] = [];
+  for (const hunk of hunksOf(diffLines(aText, bText))) {
+    lines.push(paint(hunkHeader(hunk), color.cyan, on));
+    for (const op of hunk.ops) lines.push(opLine(op, on));
+  }
+  return lines;
+};
+// Unified diff for two in-memory artifacts (`-db`): unlike a tree diff there is
+// one named text on each side, so only the standard file headers and hunks apply.
+export const renderTextUnified = (
+  aText: string,
+  bText: string,
+  aLabel: string,
+  bLabel: string,
+  on: boolean
+): string[] => [
+  paint(`--- ${aLabel}`, color.bold, on),
+  paint(`+++ ${bLabel}`, color.bold, on),
+  ...textHunks(aText, bText, on),
+];
 const looksBinary = (buf: Uint8Array): boolean => buf.subarray(0, 8192).includes(0);
 export const fileDiffLines = (
   aDir: string,
@@ -274,10 +367,7 @@ export const fileDiffLines = (
     paint(`--- ${entry.status === 'added' ? '/dev/null' : `a/${p}`}`, color.bold, on),
     paint(`+++ ${entry.status === 'removed' ? '/dev/null' : `b/${p}`}`, color.bold, on)
   );
-  for (const hunk of hunksOf(diffLines(aBuf.toString('utf8'), bBuf.toString('utf8')))) {
-    lines.push(paint(hunkHeader(hunk), color.cyan, on));
-    for (const op of hunk.ops) lines.push(opLine(op, on));
-  }
+  lines.push(...textHunks(aBuf.toString('utf8'), bBuf.toString('utf8'), on));
   return lines;
 };
 export const renderUnified = (aDir: string, bDir: string, tree: TreeDiff, on: boolean): string[] =>
@@ -334,6 +424,95 @@ export const statCsv = (tree: TreeDiff): string[] =>
       entry.path,
       `${entry.aBytes}b`,
       `${entry.bBytes}b`,
+      `${delta < 0 ? '' : '+'}${delta}b`,
+    ]);
+  });
+
+// Bundle measurement diffs are keyed by the public identity a consumer selects,
+// independent of where either package was installed for this run. Gzipped size
+// is the one number reported: it is what a consumer actually ships.
+export type BundleRow = {
+  export: string;
+  gzBytes: number;
+  module: string;
+};
+export type BundleStatEntry = {
+  a?: BundleRow;
+  b?: BundleRow;
+  export: string;
+  module: string;
+  status: DiffStatus;
+};
+export type BundleStat = { entries: BundleStatEntry[]; same: number };
+const bundleKey = (row: BundleRow): string => JSON.stringify([row.module, row.export]);
+export const diffBundleRows = (aRows: BundleRow[], bRows: BundleRow[]): BundleStat => {
+  const a = new Map(aRows.map((row) => [bundleKey(row), row]));
+  const b = new Map(bRows.map((row) => [bundleKey(row), row]));
+  const entries: BundleStatEntry[] = [];
+  let same = 0;
+  for (const [key, left] of a) {
+    const right = b.get(key);
+    if (!right)
+      entries.push({ a: left, export: left.export, module: left.module, status: 'removed' });
+    else if (left.gzBytes !== right.gzBytes)
+      entries.push({
+        a: left,
+        b: right,
+        export: left.export,
+        module: left.module,
+        status: 'modified',
+      });
+    else same++;
+  }
+  for (const [key, right] of b)
+    if (!a.has(key))
+      entries.push({ b: right, export: right.export, module: right.module, status: 'added' });
+  entries.sort((x, y) => x.module.localeCompare(y.module) || x.export.localeCompare(y.export));
+  return { entries, same };
+};
+
+const bundleLabel = (entry: BundleStatEntry): string =>
+  entry.export && entry.export !== 'all' ? `${entry.module}/${entry.export}` : entry.module;
+const bundleDelta = (entry: BundleStatEntry): number =>
+  (entry.b?.gzBytes ?? 0) - (entry.a?.gzBytes ?? 0);
+// statTail's exact spelling, gzip-flavored: modified rows show the a → b pair
+// with the parenthesized delta, single-sided rows sign their whole size.
+const bundleTail = (entry: BundleStatEntry): string =>
+  `${
+    entry.status === 'modified'
+      ? fmtPair(entry.a!.gzBytes, entry.b!.gzBytes)
+      : fmtDelta(bundleDelta(entry))
+  } gzip`;
+// Same dress as -ds stat rows: A/M/D marks in the same colors, dim size tail.
+export const bundleStatHuman = (stat: BundleStat, on: boolean): string[] => {
+  const count = (status: DiffStatus): number =>
+    stat.entries.filter((entry) => entry.status === status).length;
+  return [
+    ...stat.entries.map(
+      (entry) =>
+        `${paint(MARK[entry.status], MARK_COLOR[entry.status], on)} ${bundleLabel(entry)}` +
+        paint(`  ${bundleTail(entry)}`, color.dim, on)
+    ),
+    '',
+    paint(
+      `${stat.entries.length} exports changed: ${count('added')} added, ` +
+        `${count('removed')} removed, ${count('modified')} modified · ${stat.same} unchanged`,
+      color.dim,
+      on
+    ),
+  ];
+};
+// Headerless machine rows, statCsv's shape: status, id, a bytes, b bytes,
+// signed delta — all gzipped.
+export const bundleStatCsv = (stat: BundleStat): string[] =>
+  stat.entries.map((entry) => {
+    const delta = bundleDelta(entry);
+    return csvRow([
+      MARK[entry.status],
+      entry.module,
+      entry.export,
+      `${entry.a?.gzBytes ?? 0}b`,
+      `${entry.b?.gzBytes ?? 0}b`,
       `${delta < 0 ? '' : '+'}${delta}b`,
     ]);
   });

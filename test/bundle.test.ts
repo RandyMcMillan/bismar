@@ -78,15 +78,18 @@ should('bundle parses flags and rejects removed ones', () => {
   throws(() => parseArgs(['-c']), /unknown option: -c/);
 });
 
-should('bundle combines short flags: -bm == -b -m', () => {
+should('bundle combines short flags into artifact and report modes', () => {
   deepStrictEqual(parseArgs(['-bm']), parseArgs(['-b', '-m']));
   deepStrictEqual(
     parseArgs(['-bm', 'index/add']),
     parseArgs(['--bundle', '--minify', 'index/add'])
   );
-  // Cross-mode contradictions surface exactly as if the flags were spelled apart…
-  throws(() => parseArgs(['-bs']), /--size replaces the bundle output; drop --bundle/);
-  throws(() => parseArgs(['-sm']), /--minify shapes the emitted bundle; drop --size/);
+  // -s modifies the bundle into a measurement report, and -m is redundant there.
+  deepStrictEqual(parseArgs(['-bs']), parseArgs(['-b', '-s']));
+  deepStrictEqual(parseArgs(['-bms']), parseArgs(['-b', '-m', '-s']));
+  throws(() => parseArgs(['-sm']), /--minify shapes the emitted bundle; use -bms or drop -m/);
+  throws(() => parseArgs(['-bl']), /--list replaces the bundle output; drop --bundle/);
+  throws(() => parseArgs(['-bsl']), /--list replaces the bundle output; drop --bundle/);
   // …and a cluster with any unknown letter is one unknown option, whole.
   throws(() => parseArgs(['-bx']), /unknown option: -bx/);
   throws(() => parseArgs(['-ib']), /unknown option: -ib/);
@@ -177,6 +180,15 @@ should('bundle --minify emits the minified variant of the same artifact', async 
   deepStrictEqual(min.stdout.length < plain.stdout.length, true);
 });
 
+should('-bs measures bundles and accepts redundant -m byte-for-byte', async () => {
+  const size = await capture(() => runCli(['-bs', 'index/add'], { cwd: FIXTURE, tty: false }));
+  const min = await capture(() => runCli(['-bms', 'index/add'], { cwd: FIXTURE, tty: false }));
+  deepStrictEqual(size.ok, true, size.stderr);
+  deepStrictEqual(min.ok, true, min.stderr);
+  deepStrictEqual(min.stdout, size.stdout);
+  deepStrictEqual(/^index,add,\d+loc,\d+b,\d+b\n$/.test(size.stdout), true, size.stdout);
+});
+
 should('bundle defaults to the whole package and supports --list', async () => {
   const res = await capture(() => runCli(['-b'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(res.ok, true, res.stderr);
@@ -201,9 +213,14 @@ should('bundle treats a sole existing JS file selector as --input', async () => 
     const explicit = await capture(() => runCli(['-b', './src/util.js'], { cwd: dir, tty: false }));
     deepStrictEqual(res.stdout, explicit.stdout);
     // The size table works the same way and enumerates the file's exports.
-    const size = await capture(() => runCli(['-s', 'src/util.js'], { cwd: dir, tty: false }));
+    const size = await capture(() => runCli(['-bs', 'src/util.js'], { cwd: dir, tty: false }));
     deepStrictEqual(size.ok, true, size.stderr);
     deepStrictEqual(/twice/.test(size.stdout), true, size.stdout);
+    // Bare -s never loads the bundle engine: a file is a one-row shipped tree.
+    const shipped = await capture(() => runCli(['-s', './src/util.js'], { cwd: dir, tty: false }));
+    deepStrictEqual(shipped.ok, true, shipped.stderr);
+    deepStrictEqual(/^util\.js,\d+b\n$/.test(shipped.stdout), true, shipped.stdout);
+    deepStrictEqual(/loc|gzip|twice/.test(shipped.stdout), false, shipped.stdout);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

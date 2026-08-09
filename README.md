@@ -7,7 +7,8 @@ A bismar is the old Norse hand balance for weighing goods. This one:
 - `bismar <selector>` opens an fs-style package navigator — npm, jsr,
   crates.io, rubygems, pypi, packagist, github, and the go proxy
 - `bismar <selector> --bundle` packs the selection into a single-file IIFE
-- `bismar <selector> --size` prints min+gzip size stats: it weighs the bundle
+- `bismar <selector> --size` lists the files and bytes that ship
+- `bismar <selector> -bs` prints per-export min+gzip bundle measurements
 - `bismar --diff <a> <b>` compares two packages recursively
 
 Non-JS ecosystems are browse/diff/download-only: their code is never executed
@@ -17,7 +18,7 @@ Used by [noble cryptography](https://paulmillr.com/noble/) to ensure bundles sta
 
 ## Usage
 
-> `npm install bismar` — or, without installing, `npx bismar npm:preact --size` from
+> `npm install bismar` — or, without installing, `npx bismar js:preact -bs` from
 > any directory
 
 ```
@@ -25,10 +26,13 @@ flags:
   -b, --bundle  emit a single-file IIFE bundle on stdout; non-JS refs emit
                 the saved registry archive verbatim
   -m, --minify  emit the minified bundle (JS only)
-  -s, --size    min+gzip stats per export; non-JS refs list shipped file sizes
+  -s, --size    shipped file sizes for every ecosystem; never bundles
+      -bs       min+gzip stats per export (JS); archive stat row (non-JS)
   -l, --list    every public export as an import statement; non-JS refs list
-                their import surface (crate:/gh: their files)
-  -d, --diff    compare two packages recursively (-ds adds size deltas, -dl names only)
+                their import surface (rs:/gh: their files)
+  -d, --diff    compare two packages recursively — refs, dirs, .tgz tarballs
+                (-ds file-size deltas, -dl names, -db bundle text,
+                -dbs per-export bundle-size deltas)
       --clear   remove every bismar cache (ref installs, extracts, archives)
 
 short flags combine: bismar -bm == bismar -b -m
@@ -36,57 +40,69 @@ short flags combine: bismar -bm == bismar -b -m
 
 ```sh
 $ bismar                                           # navigator: browse cwd, or search a registry
-$ bismar npm:@noble/curves                         # …or open a package directly
-$ bismar gh:paulmillr/qr                           # any ecosystem: crate: gem: pypi: composer: go:
+$ bismar js:@noble/curves                          # …or open a package directly
+$ bismar gh:paulmillr/qr                           # any ecosystem: rs: rb: py: php: go:
 
-$ bismar npm:@scure/base -b > scure-base.js        # bundle (-m: minified)
+$ bismar js:@scure/base -b > scure-base.js         # bundle (-m: minified)
 $ bismar -b src/util.js > util.js                  # any JS file, even a private one
-$ bismar -b crate:serde > serde.crate              # non-JS: the registry archive, verbatim
+$ bismar -b rs:serde > serde.crate                 # non-JS: the registry archive, verbatim
 
-$ bismar npm:preact --size                         # min+gzip stats per export
-$ bismar -s jsr:@std/bytes | sort -t, -k5 -rn      # heaviest by gzip, via shell
-$ bismar crate:serde --size                        # non-JS: shipped file sizes + total
+$ bismar js:preact --size                          # shipped file sizes + total
+$ bismar rs:serde --size                           # the same meaning in every ecosystem
+$ bismar -bs jsr:@std/bytes | sort -t, -k5 -rn     # heaviest bundle by gzip
+$ bismar -bs rs:serde                              # the archive artifact's size
 
-$ bismar npm:@scure/base --list                    # {base58} from '@scure/base'
+$ bismar js:@scure/base --list                     # {base58} from '@scure/base'
 $ bismar go:golang.org/x/time -l                   # import "golang.org/x/time/rate"
 
-$ bismar -d npm:qr 0.5.0 0.6.0                     # diff: navigator on a tty, unified diff piped
-$ bismar -ds crate:serde 1.0.218 1.0.219           # changed files with size deltas
+$ bismar -d js:qr@0.5.0 js:qr@0.6.0                # diff: navigator on a tty, unified diff piped
+$ bismar -ds rs:serde@1.0.218 rs:serde@1.0.219     # changed files with size deltas
+$ bismar -db js:qr@0.5.0 js:qr@0.6.0               # unified diff of consumer bundle text
+$ bismar -dbs js:qr@0.5.0 js:qr@0.6.0              # per-export gzip size deltas
 ```
 
-Selectors: `npm:x` / `jsr:@scope/x` / `crate:x` / … reach a registry — the
+Selectors: `js:x` / `jsr:@scope/x` / `rs:x` / … reach a registry — the
 prefix is always required; `./x`, `../x`, and absolute paths mean the
 filesystem; any bare name, scoped or not, means the local package's public
-surface. Prefixes have aliases: `js:` for npm:, `rust:`/`rs:`/`cargo:` for
-crate:, `ruby:`/`rb:` for gem:, `python:`/`py:` for pypi:, `php:` for
-composer:, `github:` for gh:, `golang:` for go:. File
+surface. Prefixes have aliases: `npm:` for js:, `crate:`/`rust:`/`cargo:` for
+rs:, `gem:`/`ruby:` for rb:, `pypi:`/`python:` for py:, `composer:` for
+php:, `github:` for gh:, `golang:` for go:. File
 selectors take an optional trailing export (`./src/util.js/twice`) and mix
 freely with modules and refs; several selectors bundle together.
 
 Bundling (`-b`, or `--minify`) writes a single-file IIFE declaring a global
 variable to stdout; on a terminal it refuses to dump bytes and prints the size
-stats instead. A non-JS registry ref emits the archive the registry served,
+stats instead (use `-bs` to ask for those stats directly). A non-JS registry
+ref emits the archive the registry served,
 byte-identical (cached beside the extract, like npm keeps tarballs in its own
 cache), so the output is checksummable against the registry's digests.
 
-`--size` measures every public export fully in-memory: nothing is installed
+`--size` lists the publishable files and their byte sizes without loading the
+bundler. Local packages are `npm pack`ed first, so ignored and unpublished files
+stay out; tarballs are extracted, and registry refs use their shipped extract.
+Pipes and CI get headerless `path,bytes` CSV rows. Human output closes with the
+total unpacked size and the archive size when known.
+
+`-bs` measures every public JS export fully in-memory: nothing is installed
 into the project. Pipes and CI get headerless CSV rows, each value unit-tagged
 so it survives filtering — `dom,frontalCamera,121loc,2464b,1268b` (module,
 export, lines, minified bytes, gzipped bytes; force with `BISMAR_CSV=1`).
 `sort`/`awk` parse the digits right through the tags: `-k5` sorts by gzip
-bytes. Non-JS registry refs have no bundles to weigh — they list shipped file
-sizes instead, closed by a total like `33 files, 548.39kb, 81.71kb archive`
-(the archive figure is the downloaded package size).
+bytes. For a non-JS ref, `-bs` reports the saved archive's filename and size.
 
 `--list` prints import statements. Non-JS refs derive their static surface
 from files and manifests — go import paths, composer PSR-4 classes, pypi
 top-level modules, gem require paths — never parsing or executing package
-code; `crate:` and `gh:` list shipped files instead.
+code; `rs:` and `gh:` list shipped files instead.
 
-`--diff` compares shipped files recursively (any ecosystem, or local dirs;
-`bismar -d pkg v1 v2` pins one package twice). A terminal gets a navigator —
+`--diff` compares shipped files recursively (any ecosystem, local dirs, or
+`.tgz` tarballs). A local dir
+compared against a package is `npm pack`ed first — scripts ignored — so files
+npm never publishes stay out. A terminal gets a navigator —
 changed files with size deltas, enter pages the line diff; piped, a unified
-diff. `-ds` prints stat rows, `-dl` just the names.
+diff. `-ds` prints stat rows, `-dl` just the names. For JS packages, `-db`
+diffs the generated bundle text (`-dbm` uses minified bundles), while `-dbs`
+joins public exports and reports their gzip size deltas, `-ds`-style.
 
 The navigator starts in the package's shipped files: browse and preview with
 syntax highlighting, `r` hops to the github repo the manifest names and back —

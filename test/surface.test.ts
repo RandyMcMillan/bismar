@@ -106,12 +106,12 @@ should('registry sizes list every shipped file and close with a total', () => {
     'Cargo.toml  0.01kb',
     'src/lib.rs  0.00kb',
     '',
-    '2 files, 0.01kb',
+    '0.01kb unpacked · 2 files',
   ]);
   // A known download size joins the total; extracts predating the meta omit it.
   deepStrictEqual(
     sizesHuman(join(base, 'sz'), false, 125553).at(-1),
-    '2 files, 0.01kb, 123kb archive'
+    '0.01kb unpacked · 123kb packed · 2 files'
   );
   deepStrictEqual(sizesCsv(join(base, 'sz')), ['Cargo.toml,9b', 'src/lib.rs,5b']);
 });
@@ -192,11 +192,12 @@ should('every ecosystem manifest yields the github repo it advertises', () => {
   deepStrictEqual(ghRepoOf(at('r-crate')), { eco: 'crate', repo: 'rusty/mini' });
 });
 
-should('--list and --size let registry refs through; bundle modes stay guarded', () => {
+should('--list, shipped sizes, and archive stats let registry refs through', () => {
   deepStrictEqual(parseArgs(['pypi:requests', '--list']).list, true);
   deepStrictEqual(parseArgs(['go:golang.org/x/time', '-l']).paths, ['go:golang.org/x/time']);
   deepStrictEqual(parseArgs(['gem:rails', '--size']).size, true);
   deepStrictEqual(parseArgs(['crate:serde', '-sl']).size, true);
+  deepStrictEqual(parseArgs(['crate:serde', '-bs']).bundle, true);
   deepStrictEqual(parseArgs(['gh:octo/mini', '-b']).bundle, true);
   throws(() => parseArgs(['crate:serde', '-m']), /crate refs have no JS to minify/);
 });

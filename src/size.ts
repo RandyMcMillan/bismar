@@ -28,6 +28,7 @@ import {
   err,
   explicitPath,
   firstModule,
+  fmtBytes,
   type IdLeaf,
   ident,
   importLine,
@@ -166,7 +167,7 @@ const isPkgAll = (item: Pick<Item, 'dir' | 'out'>) => !item.dir && item.out === 
 const itemId = (pkg: Pkg, item: Pick<Item, 'dir' | 'export' | 'module' | 'out'>): string =>
   isPkgAll(item) ? pkg.name : `${item.module}/${item.export || ALL}`;
 // The `_tree_shaking_` prefix marks files as bismar-owned so sweeps of in-repo out dirs
-// (jsbt-check) can never delete user files. `bismar size` writes into its own temp dir,
+// (jsbt-check) can never delete user files. `bismar -bs` writes into its own temp dir,
 // so it drops the prefix for readable bundle names.
 const outPath = (pkg: Pkg, item: Pick<Item, 'dir' | 'out'>, ext: string, prefix = ''): string =>
   isPkgAll(item) ? `${prefix}${slug(pkg.name)}.${ext}` : `${item.dir}/${prefix}${item.out}.${ext}`;
@@ -612,7 +613,7 @@ const exportLabel = (name: string): string => (name === ALL ? '' : name);
 // One spelling for the measured triple, shared by size lines and interactive rows.
 export const sizeTail = (loc: number, minBytes: number, gzBytes: number): string =>
   `${loc} LOC, ${kb(minBytes)}kb min, ${kb(gzBytes)}kb gzip`;
-// Table-less human mode (bismar --size on a TTY): one line per bundle, e.g.
+// Table-less human mode (bismar -bs on a TTY): one line per bundle, e.g.
 // `ml-kem.js/ml_kem1024 - 120 LOC, 5.61kb, 3.30kb`
 const LINE_LABEL_MAX = 40;
 // Wrap an installed ref (refs.ts owns the install/locate details) into a measurement Ctx.
@@ -654,7 +655,8 @@ const sizeLine = (
   // Pad by the uncolored width so colored labels still line up.
   const label = painted + ' '.repeat(Math.max(0, width - plain.length));
   const tag = dataHeavy(data) ? ` ${paint(DATA_HEAVY_TAG, color.dim, on)}` : '';
-  return `${label} ${sizeTail(data.loc, data.minBytes, data.gzBytes)}${tag}`;
+  // The measured triple dims like every other size tail (-s rows, -ds stats).
+  return `${label} ${paint(sizeTail(data.loc, data.minBytes, data.gzBytes), color.dim, on)}${tag}`;
 };
 // Headerless machine rows, each value tagged with its unit: sort/awk still
 // parse the leading digits, and a row stays self-describing after filtering.
@@ -785,6 +787,9 @@ const runList = async (
   progressDone();
 };
 export type SizeOpts = {
+  // Resolved pinned refs may supply their machine cache directly (bundle-size
+  // diff resolves both sides before measurement, rather than parsing refs here).
+  cacheDir?: string;
   cwd?: string;
   input?: string;
   listOnly?: boolean;
@@ -1011,6 +1016,12 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
       cacheDir: dir,
       cacheKey: rowKey(stripLabel(item.module, label), item.export),
     }));
+  } else if (opts.cacheDir) {
+    items = items.map((item) => ({
+      ...item,
+      cacheDir: opts.cacheDir,
+      cacheKey: rowKey(item.module, item.export),
+    }));
   }
   if (opts.listOnly) return runList(ctx, mods, items, only, input ?? '', loadBuild);
   // Enumerates a module's export ids on demand (error paths only; extra metafile pass).
@@ -1198,11 +1209,11 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     items =
       picked.length > 1 ? [selection(picked, hasRefs ? ctx.cwd : undefined), ...picked] : picked;
   }
-  // Bundle emission (`bismar` without --size) emits one artifact: the first item is
+  // Bundle emission (`bismar -b`) emits one artifact: the first item is
   // always the widest bundle —
   // package row, selection row, the --input file's ALL row, or the single pick.
   if (opts.single) items = items.slice(0, 1);
-  // `--size` always shows its table — only opts.silent mutes it; non-interactive
+  // `-bs` always shows its table — only opts.silent mutes it; non-interactive
   // environments (LLM agents, pipes, CI logs) get CSV instead of a table.
   const show = !opts.silent;
   const csv = csvEnabled();
@@ -1325,10 +1336,28 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     if (!csv && pkgSizes) {
       const unpacked = [...walkFiles(pkgSizes.pkgDir).values()].reduce((sum, b) => sum + b, 0);
       const packed = await pkgSizes.packed;
-      const tail = packed ? ` · ${kb(packed)}kb packed` : '';
-      console.log(`\n${paint(`${kb(unpacked)}kb unpacked${tail}`, color.dim, colorOn)}`);
+      const tail = packed ? ` · ${fmtBytes(packed)} packed` : '';
+      // Same grammar as the -s footer: unpacked · packed · count.
+      const count = ` · ${results.length} bundle${results.length === 1 ? '' : 's'}`;
+      console.log(
+        `\n${paint(`${fmtBytes(unpacked)} unpacked${tail}${count}`, color.dim, colorOn)}`
+      );
     }
   }
+};
+// Collect the existing measurement engine's rows without printing them. Diff
+// modes use this wrapper so enumeration, bundling, gzip, and pinned-ref caching
+// remain one implementation.
+export const measureRows = async (
+  opts: Pick<SizeOpts, 'cacheDir' | 'cwd' | 'only' | 'outDir'>
+): Promise<RowData[]> => {
+  const rows: RowData[] = [];
+  await runSize({
+    ...opts,
+    onRow: (row) => rows.push(row),
+    silent: true,
+  });
+  return rows;
 };
 // Build exactly one artifact — the widest bundle of the selection — and return it.
 export const buildFirst = async (

@@ -208,7 +208,7 @@ export const explicitRef = (raw: string): boolean =>
 export const asRef = (raw: string): string => (explicitRef(raw) ? raw : `npm:${raw}`);
 // Pinned ref installs are immutable, so both their export enumeration and their
 // measured sizes cache alongside them (`bismar.db.json`): a warm `--list` skips
-// enumeration, and a warm `--size` skips esbuild entirely. Sizes are keyed by the
+// enumeration, and a warm `-bs` skips esbuild entirely. Sizes are keyed by the
 // esbuild version that produced them; a different esbuild discards them. Unversioned
 // or invalid dbs are recomputed and rewritten, never trusted.
 const REF_DB = 'bismar.db.json';

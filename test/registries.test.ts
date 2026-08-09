@@ -259,6 +259,8 @@ should('ref cache files one subdirectory per registry', () => {
 should('registry refs take every output mode except minify', () => {
   // -b emits the saved registry archive; only minify-shaped output is refused.
   deepStrictEqual(parseArgs(['crate:serde', '-b']).bundle, true);
+  deepStrictEqual(parseArgs(['crate:serde', '-bs']).size, true);
+  deepStrictEqual(parseArgs(['-bs', 'crate:serde', 'crate:tokio']).paths.length, 2);
   deepStrictEqual(parseArgs(['composer:monolog/monolog', '-b']).paths, [
     'composer:monolog/monolog',
   ]);
@@ -562,6 +564,21 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
       process.stdout.write = prevWrite;
     }
     deepStrictEqual(out.equals(readFileSync(join(fix, 'mini.crate'))), true);
+    // -bs asks for that same artifact's stat instead of its bytes or a refusal.
+    const prevStatLog = console.log;
+    let askedStat = '';
+    console.log = (...args: unknown[]) => {
+      askedStat += `${args.join(' ')}\n`;
+    };
+    try {
+      await runCli(['-bs', 'crate:mini@0.1.0'], { tty: false });
+    } finally {
+      console.log = prevStatLog;
+    }
+    deepStrictEqual(
+      askedStat,
+      `mini-0.1.0.crate,${readFileSync(join(fix, 'mini.crate')).length}b\n`
+    );
     // A terminal refuses the bytes and hints the redirect with a real filename,
     // plus a stat row with the archive's size, like the JS bundle fallback.
     const prevExit = process.exitCode;

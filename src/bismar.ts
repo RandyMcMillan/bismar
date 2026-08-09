@@ -4,9 +4,15 @@
  * @module
  */
 import {
-  diffPair,
+  bundleStatCsv,
+  bundleStatHuman,
+  diffBundleRows,
   diffTarget,
   diffTrees,
+  measuredSide,
+  packLocalSide,
+  packLocalSides,
+  renderTextUnified,
   renderUnified,
   statCsv,
   statHuman,
@@ -15,6 +21,7 @@ import {
 import {
   color,
   csvEnabled,
+  csvRow,
   paint,
   progressDone,
   progressUpdate,
@@ -22,17 +29,17 @@ import {
   wantColor,
 } from './env.ts';
 import { clearTempCaches, rmTempDir, tempDir } from './fs-modify.ts';
-import { bad, err, fmtBytes, runSelf } from './public.ts';
+import { bad, err, explicitPath, fmtBytes, runSelf } from './public.ts';
 import { readFileSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import {
   canonSelector,
   isRegistrySelector,
   parseRegistryRef,
   registryArchive,
 } from './registries.ts';
-import { buildFirst, runSize } from './size.ts';
-import { registrySizes, registrySurface } from './surface.ts';
+import { buildFirst, measureRows, runSize } from './size.ts';
+import { fileSizesCsv, fileSizesHuman, registrySurface, sizesCsv, sizesHuman } from './surface.ts';
 
 export type CliArgs = {
   bundle: boolean;
@@ -47,7 +54,7 @@ export type CliArgs = {
 };
 const usage = `usage:
   bismar [<selector>] [--bundle] [--size] [--minify] [--list]
-  bismar --diff <a> <b>   (or: --diff <pkg> <v1> <v2>)
+  bismar --diff <a> <b>
 
 opens the interactive package navigator by default; without a selector it asks
 what to open — the current directory, or a registry search.
@@ -56,26 +63,33 @@ flags:
   -b, --bundle  emit a single-file IIFE bundle on stdout; non-JS refs emit
                 the saved registry archive verbatim
   -m, --minify  emit the minified bundle (JS only)
-  -s, --size    min+gzip stats per export; non-JS refs list shipped file sizes
+  -s, --size    list shipped file sizes for every ecosystem; never bundles
+      -bs       min+gzip bundle stats per export (JS); archive stat (non-JS)
   -l, --list    every public export as an import statement; non-JS refs list
-                their import surface (crate:/gh: their files)
-  -d, --diff    compare two packages recursively: navigator on a terminal,
-                unified diff piped; -ds adds size deltas, -dl names only
+                their import surface (rs:/gh: their files)
+  -d, --diff    compare two packages recursively (refs, dirs, .tgz tarballs;
+                a dir vs a package is npm-packed first): navigator on a
+                terminal, unified diff piped; -ds file sizes, -dl names,
+                -db bundle text, -dbs bundle-size deltas (JS only; refs
+                may pick one module/export: -db npm:qr@0.6.0/index)
       --clear   remove every bismar cache (ref installs, extracts, archives)
 
 short flags combine: bismar -bm == bismar -b -m
 
-namespaces:
-  npm: (or js:)  jsr:  crate: (or rust: rs: cargo:)  gem: (or ruby: rb:)
-  pypi: (or python: py:)  composer: (or php:)  gh: (or github:)  go: (or golang:)
+namespaces (long aliases like npm: crate: work too):
+  js:   npm         py:   pypi
+  jsr:  jsr         php:  packagist
+  rs:   crates.io   gh:   github
+  rb:   rubygems    go:   go proxy
 
 examples:
-  bismar npm:@noble/curves
-  bismar crate:serde
-  bismar npm:@scure/base -b > scure-base.js
+  bismar js:@noble/curves
+  bismar rs:serde
+  bismar js:@scure/base -b > scure-base.js
   bismar go:golang.org/x/time --list
-  bismar -s npm:preact | sort -t, -k5 -rn
-  bismar -d npm:qr 0.5.0 0.6.0`;
+  bismar -s js:preact
+  bismar -bs js:preact | sort -t, -k5 -rn
+  bismar -d js:qr@0.5.0 js:qr@0.6.0`;
 
 // Short aliases resolve to the canonical long flag before anything looks at them.
 // --clean is --clear's undocumented second spelling.
@@ -136,35 +150,37 @@ export const parseArgs = (argv: string[]): CliArgs => {
   };
   // Cross-mode combos are contradictions, not no-ops; refuse instead of guessing.
   if (args.clear && argv.length > 1) err('--clear runs alone; drop other arguments');
-  if (args.bundle && (args.size || args.list))
-    err(`${args.size ? '--size' : '--list'} replaces the bundle output; drop --bundle`);
-  if (args.size && args.minify) err('--minify shapes the emitted bundle; drop --size');
-  if (args.diff) {
-    // --diff compares file trees; the bundle-shaping flags have nothing to shape.
-    const off = args.bundle ? '--bundle' : args.minify ? '--minify' : '';
-    if (off) err(`${off} shapes the bundle output, not a diff; drop ${off} or --diff`);
-    if (args.paths.length !== 2 && args.paths.length !== 3)
-      err(
-        '--diff takes two packages, or a package and two versions: bismar -d <a> <b> or bismar -d <pkg> <v1> <v2>'
-      );
-  }
+  const reg = args.paths.find(isRegistrySelector);
+  // Minification can only name a JS bundle, in every base/diff combination.
+  if (reg && args.minify)
+    err(`${reg.slice(0, reg.indexOf(':'))} refs have no JS to minify: ${bad(reg)}; drop --minify`);
+  if (args.list && (args.bundle || args.minify))
+    err('--list replaces the bundle output; drop --bundle');
+  if (args.size && args.minify && !args.bundle)
+    err(`--minify shapes the emitted bundle; use ${args.diff ? '-dbs' : '-bms'} or drop -m`);
+  if (args.diff && args.paths.length !== 2)
+    err('--diff takes exactly two packages: bismar -d <a> <b>');
   // crate:/gem:/pypi: refs have no JS to bundle or minify. Diff browses their
   // files, --list prints their static import surface, --size their shipped
   // file sizes, and -b emits the saved registry archive verbatim.
-  const reg = args.paths.find(isRegistrySelector);
-  if (reg && !args.interactive && !args.diff && !args.list && !args.size) {
-    if (args.minify)
-      err(
-        `${reg.slice(0, reg.indexOf(':'))} refs have no JS to minify: ${bad(reg)}; drop --minify`
-      );
-    if (args.bundle && args.paths.length > 1)
-      err(`registry archives emit one at a time: bismar -b ${reg} > out`);
-  }
+  if (reg && !args.diff && args.bundle && !args.size && args.paths.length > 1)
+    err(`registry archives emit one at a time: bismar -b ${reg} > out`);
   return args;
 };
 
 // `tty` is injectable for tests; real runs read the ambient stdout.
 type Opts = { cwd?: string; tty?: boolean };
+const archiveName = (file: string, label: string): string => {
+  const base = basename(file);
+  return label.slice(label.indexOf(':') + 1).replace(/[/@]/g, '-') + base.slice(base.indexOf('.'));
+};
+const noBundle = (selector: string, hint: '-d' | '-ds'): never => {
+  const ns = selector.slice(0, selector.indexOf(':'));
+  const use = hint === '-ds' ? 'use -ds for shipped file sizes' : 'use -d to diff shipped files';
+  return err(`${ns} refs have no JS to bundle: ${bad(selector)}; ${use}`);
+};
+const decoder = new TextDecoder();
+const tarballSelector = /\.(?:tgz|tar\.gz)$/i;
 
 export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => {
   const args = parseArgs(argv);
@@ -179,13 +195,64 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
   progressUpdate('');
   if (args.diff) {
     const cwd = opts.cwd ?? process.cwd();
-    const [aSel, bSel] = diffPair(args.paths);
+    const [aSel, bSel] = args.paths;
+    const bundleDiff = args.bundle || args.minify;
+    const nonJs = [aSel, bSel].find(isRegistrySelector);
+    if (bundleDiff && nonJs) noBundle(nonJs, args.size ? '-ds' : '-d');
     // The temp dir hosts installs/extracts of unpinned refs; pinned ones come
     // from the machine cache, same as browse mode.
     const tmp = tempDir('diff');
     try {
-      const a = await diffTarget(tmp, aSel, cwd);
-      const b = await diffTarget(tmp, bSel, cwd);
+      const ta = await diffTarget(tmp, aSel, cwd, bundleDiff);
+      const tb = await diffTarget(tmp, bSel, cwd, bundleDiff);
+      // Bundle modes measure the pre-pack targets: measuredSide keeps every
+      // side an installed context (deps resolvable), where the packed extract
+      // below would drop declared deps as external on that side only.
+      const [a, b] = bundleDiff
+        ? [measuredSide(tmp, ta), measuredSide(tmp, tb)]
+        : packLocalSides(tmp, ta, tb);
+      if (bundleDiff && args.size) {
+        const [aRows, bRows] = await Promise.all([
+          measureRows({
+            cacheDir: a.cacheDir,
+            cwd: a.dir,
+            only: a.sel ? [a.sel] : [],
+            outDir: tmp,
+          }),
+          measureRows({
+            cacheDir: b.cacheDir,
+            cwd: b.dir,
+            only: b.sel ? [b.sel] : [],
+            outDir: tmp,
+          }),
+        ]);
+        const stat = diffBundleRows(aRows, bRows);
+        progressDone();
+        if (!stat.entries.length)
+          return console.log(`no bundle size changes: ${a.label} and ${b.label} measure identical`);
+        const lines = csvEnabled() ? bundleStatCsv(stat) : bundleStatHuman(stat, stdoutColor());
+        return console.log(lines.join('\n'));
+      }
+      if (bundleDiff) {
+        const [aBundle, bBundle] = await Promise.all([
+          buildFirst({ cacheDir: a.cacheDir, cwd: a.dir, only: a.sel ? [a.sel] : [], outDir: tmp }),
+          buildFirst({ cacheDir: b.cacheDir, cwd: b.dir, only: b.sel ? [b.sel] : [], outDir: tmp }),
+        ]);
+        if (!aBundle || !bBundle) return err('no bundles found');
+        const aBytes = args.minify ? aBundle.min : aBundle.plain;
+        const bBytes = args.minify ? bBundle.min : bBundle.plain;
+        progressDone();
+        if (Buffer.from(aBytes).equals(Buffer.from(bBytes)))
+          return console.log(`no bundle changes: ${a.label} and ${b.label} bundle identical`);
+        const lines = renderTextUnified(
+          decoder.decode(aBytes),
+          decoder.decode(bBytes),
+          a.label,
+          b.label,
+          stdoutColor()
+        );
+        return console.log(lines.join('\n'));
+      }
       const tree = diffTrees(a.dir, b.dir);
       progressDone();
       if (!tree.entries.length)
@@ -214,18 +281,100 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     if (args.paths.length > 1)
       err('interactive mode takes at most one package selector; add -b to bundle several');
     if (!(opts.tty ?? !!process.stdout.isTTY))
-      err('interactive mode needs a terminal; add -b to bundle or -s for size stats');
+      err('interactive mode needs a terminal; add -b to bundle or -s for shipped sizes');
     // Loaded on demand: normal runs never pay for the TUI or its syntax highlighter.
     const { runInteractive } = await import('./interactive.ts');
     // A bare `bismar` opens the launcher menu first: browse the current
     // directory, or search a registry by exact package name.
     return runInteractive(args.paths[0], { cwd: opts.cwd, menu: !args.paths.length });
   }
-  const bundling = !args.size && !args.list;
+
+  // Bare -s is one operation in every ecosystem: list the exact tree that
+  // ships. Local packages are npm-packed first; a lone file is a one-row tree.
+  if (args.size && !args.bundle) {
+    const tmp = tempDir('size');
+    const cwd = opts.cwd ?? process.cwd();
+    const selectors = args.paths.length ? args.paths : ['.'];
+    const csv = csvEnabled();
+    try {
+      for (const [i, sel] of selectors.entries()) {
+        const file = explicitPath(sel) ? resolve(cwd, sel) : '';
+        const fileStat = file ? statSync(file, { throwIfNoEntry: false }) : undefined;
+        const lines =
+          fileStat?.isFile() && !tarballSelector.test(sel)
+            ? csv
+              ? fileSizesCsv(file)
+              : fileSizesHuman(file, stdoutColor())
+            : await (async (): Promise<string[]> => {
+                const sideDir = join(tmp, `listing-${i}`);
+                const side = packLocalSide(sideDir, await diffTarget(sideDir, sel, cwd));
+                return csv
+                  ? sizesCsv(side.dir)
+                  : sizesHuman(side.dir, stdoutColor(), side.archiveBytes);
+              })();
+        progressDone();
+        if (i && !csv) console.log('');
+        console.log(lines.join('\n'));
+      }
+      return;
+    } finally {
+      rmTempDir(tmp);
+    }
+  }
+
+  // Adding -s to -b asks about the artifact instead of emitting it. JS keeps
+  // the established per-export measurement format; other registries report
+  // the one archive that -b would write.
+  if (args.bundle && args.size) {
+    const tmp = tempDir('size');
+    try {
+      const js: string[] = [];
+      for (const sel of args.paths) {
+        if (!isRegistrySelector(sel)) {
+          js.push(sel);
+          continue;
+        }
+        const got = await registryArchive(tmp, parseRegistryRef(sel));
+        const name = archiveName(got.file, got.label);
+        const bytes = statSync(got.file).size;
+        progressDone();
+        console.log(
+          csvEnabled()
+            ? csvRow([name, `${bytes}b`])
+            : paint(name, color.green, stdoutColor()) +
+                paint(`  ${fmtBytes(bytes)}`, color.dim, stdoutColor())
+        );
+      }
+      if (js.length || !args.paths.length) await runSize({ cwd: opts.cwd, only: js, outDir: tmp });
+      return;
+    } finally {
+      rmTempDir(tmp);
+    }
+  }
+
+  if (args.list) {
+    const tmp = tempDir('bundle');
+    try {
+      const js: string[] = [];
+      for (const sel of args.paths) {
+        if (isRegistrySelector(sel)) {
+          const lines = await registrySurface(tmp, sel);
+          progressDone();
+          console.log(lines.join('\n'));
+        } else js.push(sel);
+      }
+      if (js.length || !args.paths.length)
+        await runSize({ cwd: opts.cwd, listOnly: true, only: js, outDir: tmp });
+      return;
+    } finally {
+      rmTempDir(tmp);
+    }
+  }
+
   // A registry ref under -b emits the saved archive verbatim — byte-identical
   // to the registry's, so the output is checksummable against its digests. A
   // terminal refuses the bytes with a redirect hint, like JS bundles.
-  const regSel = bundling ? args.paths.find(isRegistrySelector) : undefined;
+  const regSel = args.paths.find(isRegistrySelector);
   if (regSel) {
     const tmp = tempDir('bundle');
     try {
@@ -233,17 +382,14 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       progressDone();
       if (opts.tty ?? !!process.stdout.isTTY) {
         process.exitCode = 1;
-        const base = basename(got.file);
-        const name =
-          got.label.slice(got.label.indexOf(':') + 1).replace(/[/@]/g, '-') +
-          base.slice(base.indexOf('.'));
+        const name = archiveName(got.file, got.label);
         const on = wantColor();
         console.error(
           paint(
             'warn: refusing to output the archive to the terminal, use redirect: ',
             color.gray,
             on
-          ) + paint(`bismar -b ${regSel} > ${name}`, color.white, on)
+          ) + paint(`bismar -b ${regSel} > ${name} — or -bs for size stats`, color.white, on)
         );
         // Like the JS fallback's stat row: the refused artifact and its size.
         console.log(
@@ -259,7 +405,7 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     }
   }
   let statsFallback = false;
-  if (bundling && (opts.tty ?? !!process.stdout.isTTY)) {
+  if (opts.tty ?? !!process.stdout.isTTY) {
     // Terminals get the bundle's size stats instead of its bytes: the single stat
     // row builds exactly the bundle that was refused (plain+min, in memory), so
     // the fallback costs one gzip pass over erroring out. Still an error exit:
@@ -271,33 +417,16 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     const on = wantColor();
     console.error(
       paint('warn: refusing to output to the terminal, use redirect: ', color.gray, on) +
-        paint(`${cmd} > out.js`, color.white, on)
+        paint(`${cmd} > out.js — or -bs for size stats`, color.white, on)
     );
   }
-  const size = args.size || statsFallback;
   // The temp dir only hosts npm ref installs; bundling and measurement are in-memory.
-  const tmp = tempDir(size ? 'size' : 'bundle');
+  const tmp = tempDir(statsFallback ? 'size' : 'bundle');
   try {
-    // Registry refs print their static listings here — --size: shipped file
-    // sizes with a total; --list: each ecosystem's import surface (crate:/gh:
-    // fall back to the file listing). Remaining JS selectors continue through
-    // the usual enumeration below.
-    let only = args.paths;
-    if (args.list || args.size) {
-      const regs = args.paths.filter(isRegistrySelector);
-      for (const sel of regs) {
-        const lines = args.size ? await registrySizes(tmp, sel) : await registrySurface(tmp, sel);
-        progressDone();
-        console.log(lines.join('\n'));
-      }
-      only = args.paths.filter((sel) => !isRegistrySelector(sel));
-      if (regs.length && !only.length) return;
-    }
-    if (size)
+    if (statsFallback)
       return await runSize({
         cwd: opts.cwd,
-        listOnly: args.list,
-        only,
+        only: args.paths,
         outDir: tmp,
         // The fallback mirrors what bundling would have emitted: one artifact, one
         // row — never the full browse table, which would measure every export.
@@ -305,11 +434,9 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       });
     const bundle = await buildFirst({
       cwd: opts.cwd,
-      listOnly: args.list,
-      only,
+      only: args.paths,
       outDir: tmp,
     });
-    if (args.list) return;
     if (!bundle) return err('no bundles found');
     process.stdout.write(args.minify ? bundle.min : bundle.plain);
   } finally {

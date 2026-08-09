@@ -13,8 +13,8 @@ jump — every ecosystem here plus package.json. Fetching delegates to
 registries.ts; everything here is reads.
 @module
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { walkFiles } from './diff.ts';
 import { color, csvEnabled, csvRow, paint, stdoutColor } from './env.ts';
 import { fmtBytes, kb, readJson, sorted } from './public.ts';
@@ -300,25 +300,48 @@ export const registrySurface = async (outDir: string, selector: string): Promise
 // like every other machine listing (sums are one awk away).
 const sizeEntries = (pkgDir: string): [string, number][] =>
   [...walkFiles(pkgDir).entries()].sort(([a], [b]) => a.localeCompare(b));
+const sizeCsv = (entries: [string, number][]): string[] =>
+  entries.map(([path, bytes]) => csvRow([path, `${bytes}b`]));
+// The navigator's files-view palette (interactive.ts): directories cyan,
+// files unpainted. Rows here are whole relative paths, so the dir prefix
+// takes the cyan. No red entry-point pop — a flat listing has no cursor to
+// guide toward it.
+const paintPath = (path: string, on: boolean): string => {
+  const slash = path.lastIndexOf('/');
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : '';
+  return (dir && paint(dir, color.cyan, on)) + path.slice(slash + 1);
+};
+const sizeHuman = (entries: [string, number][], on: boolean, archiveBytes?: number): string[] => {
+  const total = entries.reduce((sum, [, bytes]) => sum + bytes, 0);
+  return [
+    ...entries.map(
+      ([path, bytes]) => paintPath(path, on) + paint(`  ${kb(bytes)}kb`, color.dim, on)
+    ),
+    '',
+    // Dim like every other summary footer, worded like the -bs one: unpacked ·
+    // packed · count.
+    paint(
+      `${fmtBytes(total)} unpacked` +
+        (archiveBytes ? ` · ${fmtBytes(archiveBytes)} packed` : '') +
+        ` · ${entries.length} file${entries.length === 1 ? '' : 's'}`,
+      color.dim,
+      on
+    ),
+  ];
+};
 // Headerless like every machine listing; the unit tag keeps rows self-describing.
-export const sizesCsv = (pkgDir: string): string[] =>
-  sizeEntries(pkgDir).map(([path, bytes]) => csvRow([path, `${bytes}b`]));
+export const sizesCsv = (pkgDir: string): string[] => sizeCsv(sizeEntries(pkgDir));
 export const sizesHuman = (
   pkgDir: string,
   on: boolean = stdoutColor(),
   archiveBytes?: number
-): string[] => {
-  const entries = sizeEntries(pkgDir);
-  const total = entries.reduce((sum, [, bytes]) => sum + bytes, 0);
-  return [
-    ...entries.map(
-      ([path, bytes]) => paint(path, color.green, on) + paint(`  ${kb(bytes)}kb`, color.dim, on)
-    ),
-    '',
-    `${entries.length} file${entries.length === 1 ? '' : 's'}, ${fmtBytes(total)}` +
-      (archiveBytes ? `, ${fmtBytes(archiveBytes)} archive` : ''),
-  ];
-};
+): string[] => sizeHuman(sizeEntries(pkgDir), on, archiveBytes);
+// Degenerate shipped tree for `-s ./input.js`: keep the same row and footer
+// grammar without staging a read-only input in a temp directory.
+export const fileSizesCsv = (file: string): string[] =>
+  sizeCsv([[basename(file), statSync(file).size]]);
+export const fileSizesHuman = (file: string, on: boolean = stdoutColor()): string[] =>
+  sizeHuman([[basename(file), statSync(file).size]], on);
 export const registrySizes = async (outDir: string, selector: string): Promise<string[]> => {
   const ref = parseRegistryRef(selector);
   const got = await registryContext(outDir, ref);

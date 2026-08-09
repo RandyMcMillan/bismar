@@ -239,6 +239,30 @@ export const npmInstall = (dir: string, refresh = false): void => {
   }
 };
 
+// `npm pack` into a bismar temp dir — the one faithful implementation of npm's
+// publish file selection (files field, .npmignore/.gitignore, the always/never
+// lists). Reads the source dir, writes only the destination tarball;
+// --ignore-scripts keeps prepack/prepare from running, so the tree is packed
+// as it sits on disk. Returns the tarball path.
+export const npmPack = (srcDir: string, destDir: string): string => {
+  mkdir(assertTemp(destDir));
+  try {
+    execFileSync(
+      'npm',
+      ['pack', '--ignore-scripts', '--pack-destination', destDir, '--loglevel=error'],
+      { cwd: srcDir, stdio: ['ignore', 'ignore', 'pipe'] }
+    );
+  } catch (error) {
+    const stderr = String((error as { stderr?: unknown }).stderr || '').trim();
+    err(`npm pack failed${stderr ? `:\n${stderr}` : ''}`);
+  }
+  // npm prints the tarball name, but scoped names came out wrong in some npm
+  // versions — the fresh destination dir holding exactly one tarball is surer.
+  const made = readdirSync(destDir).filter((ent) => ent.endsWith('.tgz'));
+  if (made.length !== 1) err(`npm pack left ${made.length} tarballs in ${destDir}`);
+  return join(destDir, made[0]);
+};
+
 // Creates a directory symlink inside a bismar temp dir; existing links are left alone.
 const linkDir = (target: string, linkPath: string): void => {
   assertTemp(linkPath);
