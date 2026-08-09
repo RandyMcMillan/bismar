@@ -2,7 +2,7 @@
 
 > Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with min+gzip stats per export
 
-A bismar is the old Norse hand balance for weighing goods. This one:
+A bismar is the old Viking hand balance for weighing goods. This one:
 
 - `bismar <selector>` opens an fs-style package navigator — npm, jsr,
   crates.io, rubygems, pypi, packagist, github, and the go proxy
