@@ -89,9 +89,11 @@ changed files with size deltas, enter pages the line diff; piped, a unified
 diff. `-ds` prints stat rows, `-dl` just the names.
 
 The navigator starts in the package's shipped files: browse and preview with
-syntax highlighting, `r` hops to the github repo the manifest names, `m`
-switches JS packages to the modules view, where every row measures itself and
-enter pages through its bundled source. Arrows/`hjkl`/mouse move, `q` quits;
+syntax highlighting, `r` hops to the github repo the manifest names and back —
+package.json, Cargo.toml, composer.json, python core metadata, a gemspec, or a
+github-hosted go import path — and `m` toggles JS packages into the modules
+view, where every row measures itself and enter pages through its bundled
+source. Arrows/`hjkl`/mouse move, `q` quits;
 nothing is ever written to the filesystem.
 
 ## Security

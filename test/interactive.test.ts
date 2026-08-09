@@ -203,7 +203,7 @@ should('launcher searches a registry and opens the picked hit', async () => {
     // description on purpose).
     const js = openMenu('x');
     js.send('j\rpreact\r');
-    await waitFor(js, /preact {2}0\.0\.0-bismarui · 2 deps · 398\.00kb tgz(?! ·)/);
+    await waitFor(js, /preact {2}0\.0\.0-bismarui · 2 deps · 398kb tgz(?! ·)/);
     js.send('\r');
     deepStrictEqual((await js.done)?.selector, 'npm:preact');
     // No matches keeps the prompt open with a note instead of a dead end.
@@ -304,7 +304,7 @@ should('launcher browses a package-less directory as plain files', async () => {
     // modules view on offer.
     deepStrictEqual(/bismar-i-dir-[^ ]* · files · 1 file, [\d.]+kb/.test(text), true, text);
     deepStrictEqual(/notes\.txt/.test(text), true, text);
-    deepStrictEqual(/m modules/.test(text), false, text);
+    deepStrictEqual(/m mode/.test(text), false, text);
   } finally {
     rmSync(cwd, { force: true, recursive: true });
   }
@@ -457,27 +457,35 @@ should('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', as
   }
 });
 
-should('interactive mode syntax-highlights Python file previews', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-python-'));
+should('interactive mode syntax-highlights Python and Rakefile previews', async () => {
   process.env.FORCE_COLOR = '1';
   try {
-    writeFileSync(join(cwd, 'greet.py'), 'def greet(name):\n    return f"Hello, {name}"\n');
-    const session = open(undefined, { cwd, menu: true });
-    session.send('\r\rqq');
-    await session.done;
-    deepStrictEqual(session.raw().includes('\x1b[31mdef\x1b[0m'), true, session.raw());
-    deepStrictEqual(/def greet\(name\):/.test(session.text()), true, session.text());
+    for (const [name, source] of [
+      ['greet.py', 'def greet(name):\n    return f"Hello, {name}"\n'],
+      ['Rakefile', 'def build\n  puts "building"\nend\n'],
+    ] as const) {
+      const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-highlight-'));
+      try {
+        writeFileSync(join(cwd, name), source);
+        const session = open(undefined, { cwd, menu: true });
+        session.send('\r\rqq');
+        await session.done;
+        deepStrictEqual(session.raw().includes('\x1b[31mdef\x1b[0m'), true, session.raw());
+        deepStrictEqual(session.text().includes(source.split('\n')[0]), true, session.text());
+      } finally {
+        rmSync(cwd, { force: true, recursive: true });
+      }
+    }
   } finally {
     delete process.env.FORCE_COLOR;
-    rmSync(cwd, { force: true, recursive: true });
   }
 });
 
 should('interactive mode starts in the package-files view with text previews', async () => {
   const res = await drive(undefined, '\rqmq');
-  // The home view lists the shipped files with sizes: dirs first, then meta
-  // files (changelogs, licenses, readmes, manifests), then the rest; the
-  // header carries the package's total footprint.
+  // The home view lists the shipped files with sizes: dirs first, then the
+  // readme and package.json, then the rest; the header carries the package's
+  // total footprint.
   deepStrictEqual(
     /@bismar-test\/plain · files · \d+ files, [\d.]+kb/.test(res.text),
     true,
@@ -485,7 +493,7 @@ should('interactive mode starts in the package-files view with text previews', a
   );
   deepStrictEqual(/▸ package\.json {2}[\d.]+kb/.test(res.text), true, res.text);
   deepStrictEqual(/package\.json {2}[\d.]+kb\r?\n {2}_priv\.js/.test(res.text), true, res.text);
-  deepStrictEqual(/enter preview · ← up · m modules/.test(res.text), true, res.text);
+  deepStrictEqual(/enter preview · ← up · m mode \(bundles\)/.test(res.text), true, res.text);
   // Enter previews the file's own text — no bundling, no global wrapper.
   deepStrictEqual(/package\.json · \d+ lines/.test(res.text), true, res.text);
   deepStrictEqual(/"name": "@bismar-test\/plain"/.test(res.text), true, res.text);

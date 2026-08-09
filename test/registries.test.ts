@@ -217,7 +217,7 @@ should('archives at or past 100mb need consent before downloading', async () => 
     // Off a terminal (as pinned here) there is nobody to ask: refuse with the override.
     await rejects(
       () => guardBigArchive('gh:paulmillr/qr-code-vectors', BIG_ARCHIVE * 2),
-      /refusing large download: gh:paulmillr\/qr-code-vectors is ~200\.00mb; confirm on a terminal or set BISMAR_BIG=1/
+      /refusing large download: gh:paulmillr\/qr-code-vectors is ~200mb; confirm on a terminal or set BISMAR_BIG=1/
     );
     // The TUI policy (raw-mode stdin) refuses instead of prompting into the screen.
     setBigArchivePolicy('refuse');
@@ -493,7 +493,7 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
   mkdirSync(join(fix, 'mini-0.1.0', 'src'), { recursive: true });
   writeFileSync(
     join(fix, 'mini-0.1.0', 'Cargo.toml'),
-    '[package]\nname = "mini"\nversion = "0.1.0"\n'
+    '[package]\nname = "mini"\nversion = "0.1.0"\nrepository = "https://github.com/rusty/mini"\n'
   );
   writeFileSync(
     join(fix, 'mini-0.1.0', 'src', 'lib.rs'),
@@ -513,9 +513,9 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
     process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
     coldCache(join('crate', 'mini-0-1-0'), join('.tags', 'crate-mini.json'));
 
-    // Pinned ref: enter src/, preview lib.rs, climb back, f is a no-op, esc exits.
+    // Pinned ref: enter src/, preview lib.rs, climb back, m is a no-op, esc exits.
     const session = open('crate:mini@0.1.0');
-    session.send('\r\rqhf\x1b');
+    session.send('\r\rqhm\x1b');
     await session.done;
     const text = session.text();
     // The session opens straight into the files view under the pinned label,
@@ -524,13 +524,16 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
     deepStrictEqual(/▸ src\/ {2}1 file, [\d.]+kb/.test(text), true, text);
     deepStrictEqual(/Cargo\.toml {2}[\d.]+kb/.test(text), true, text);
     // …with no modules view on offer, and no size stats anywhere.
-    deepStrictEqual(/m modules/.test(text), false, text);
+    deepStrictEqual(/m mode/.test(text), false, text);
     deepStrictEqual(/measuring|LOC/.test(text), false, text);
+    // A crate naming its repository in Cargo.toml offers the same `r` jump JS
+    // packages get; the extract has no package.json to read it from.
+    deepStrictEqual(/← up · r repo \(gh\) · q quit/.test(text), true, text);
     // Enter descends into src/ and previews the Rust source as plain text.
     deepStrictEqual(/crate:mini@0\.1\.0\/src · files/.test(text), true, text);
     deepStrictEqual(/src\/lib\.rs · 4 lines/.test(text), true, text);
     deepStrictEqual(/pub fn add\(a: u64, b: u64\) -> u64 \{/.test(text), true, text);
-    // The trailing f must not leave the files view: the last frame is still it.
+    // The trailing m must not leave the files view: the last frame is still it.
     const last = strip(session.raw().split('\x1b[H').pop() ?? '');
     deepStrictEqual(/crate:mini@0\.1\.0 · files/.test(last), true, last);
 
@@ -842,16 +845,83 @@ should('files view jumps to the github repo named by package.json and back', asy
     session.send('r\x1bq');
     await session.done;
     const text = session.text();
-    // The home files view advertises the jump…
-    deepStrictEqual(/· r repo · m modules/.test(text), true, text);
+    // The home files view advertises the jump, naming where it lands…
+    deepStrictEqual(/· m mode \(bundles\) · r repo \(gh\)/.test(text), true, text);
     // …r lands in the pinned repo tree, with repo-only files on show…
     deepStrictEqual(new RegExp(`gh:octo/mini@${short} · files`).test(text), true, text);
     deepStrictEqual(/▸ docs\//.test(text), true, text);
-    deepStrictEqual(/· r package · m modules/.test(text), true, text);
+    // …where the hint names the way back by the package's own ecosystem.
+    const repoFrame =
+      session
+        .raw()
+        .split('\x1b[H')
+        .map(strip)
+        .find((f) => /▸ docs\//.test(f)) ?? '';
+    deepStrictEqual(/· m mode \(bundles\) · r repo \(npm\)/.test(repoFrame), true, repoFrame);
     // …and esc at the repo root returns to the package side, not out of the app.
     const last = strip(session.raw().split('\x1b[H').pop() ?? '');
     deepStrictEqual(/@bismar-test\/repo-jump · files/.test(last), true, last);
   } finally {
+    delete process.env.BISMAR_GH_API;
+    delete process.env.BISMAR_GH_CODELOAD;
+    await closeServer(server);
+    rmSync(fix, { force: true, recursive: true });
+  }
+});
+
+should('files view jumps from a registry extract to the repo its manifest names', async () => {
+  // The same hop, with no package.json anywhere: a crate extract names its
+  // repository in Cargo.toml, and the gh: side carries what the archive strips.
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  const short = sha.slice(0, 12);
+  const fix = mkdtempSync(join(tmpdir(), 'bismar-crate-repo-'));
+  mkdirSync(join(fix, 'mini-0.2.0', 'src'), { recursive: true });
+  writeFileSync(
+    join(fix, 'mini-0.2.0', 'Cargo.toml'),
+    '[package]\nname = "mini"\nversion = "0.2.0"\nrepository = "https://github.com/rusty/mini.git"\n'
+  );
+  writeFileSync(join(fix, 'mini-0.2.0', 'src', 'lib.rs'), 'pub fn x() {}\n');
+  execFileSync('tar', ['-czf', join(fix, 'mini.crate'), '-C', fix, 'mini-0.2.0']);
+  mkdirSync(join(fix, `mini-${short}`, 'benches'), { recursive: true });
+  writeFileSync(join(fix, `mini-${short}`, 'benches', 'bench.rs'), 'fn main() {}\n');
+  writeFileSync(join(fix, `mini-${short}`, 'README.md'), '# mini\n');
+  execFileSync('tar', ['-czf', join(fix, 'repo.tar.gz'), '-C', fix, `mini-${short}`]);
+  const { port, server } = await serve({
+    '/api/v1/crates/mini/0.2.0/download': () => ({ body: readFileSync(join(fix, 'mini.crate')) }),
+    '/repos/rusty/mini/commits/HEAD': () => ({ body: sha }),
+    [`/rusty/mini/tar.gz/${short}`]: () => ({ body: readFileSync(join(fix, 'repo.tar.gz')) }),
+  });
+  try {
+    process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
+    process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
+    process.env.BISMAR_GH_CODELOAD = `http://127.0.0.1:${port}`;
+    coldCache(
+      join('crate', 'mini-0-2-0'),
+      join('gh', `rusty-mini-${short}`),
+      join('.tags', 'gh-rusty-mini.json')
+    );
+    const session = open('crate:mini@0.2.0');
+    session.send('r\x1bq');
+    await session.done;
+    const text = session.text();
+    // Files-only sessions have no mode toggle, so the jump stands alone…
+    deepStrictEqual(/← up · r repo \(gh\) · q quit/.test(text), true, text);
+    // …r lands in the pinned repo tree, with repo-only files on show…
+    deepStrictEqual(new RegExp(`gh:rusty/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(/▸ benches\//.test(text), true, text);
+    // …where the way back is labelled by the ecosystem that named the repo.
+    const repoFrame =
+      session
+        .raw()
+        .split('\x1b[H')
+        .map(strip)
+        .find((f) => /▸ benches\//.test(f)) ?? '';
+    deepStrictEqual(/← up · r repo \(crate\) · q quit/.test(repoFrame), true, repoFrame);
+    // …and esc at the repo root returns to the crate side, not out of the app.
+    const last = strip(session.raw().split('\x1b[H').pop() ?? '');
+    deepStrictEqual(/crate:mini@0\.2\.0 · files/.test(last), true, last);
+  } finally {
+    delete process.env.BISMAR_CRATES_API;
     delete process.env.BISMAR_GH_API;
     delete process.env.BISMAR_GH_CODELOAD;
     await closeServer(server);

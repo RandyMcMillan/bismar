@@ -43,6 +43,17 @@ export function csvEnabled(env?: Env, stdoutTty?: boolean): boolean {
     envFlag((env ?? proc.env)?.BISMAR_CSV) || !wantColor(env, stdoutTty ?? !!proc.stdout?.isTTY)
   );
 }
+/** Color for text printed to stdout — diffs, listings, tables. Keyed to stdout
+ * alone for the same reason csvEnabled is: it is the stream the text lands on, so
+ * `bismar -d pkg v1 v2 | less` gets plain text while stderr, still on the terminal,
+ * keeps its colored progress lines and warnings (wantColor/colorEnabled consider
+ * both streams, which is what those need). Force flags win either way, so
+ * `FORCE_COLOR=1 bismar -d … | less -R` still paints. */
+export function stdoutColor(env?: Env, stdoutTty?: boolean): boolean {
+  const proc = cliProcess();
+  if (!proc) return false;
+  return wantColor(env, stdoutTty ?? !!proc.stdout?.isTTY);
+}
 export const stripAnsi = (str: string): string => str.replace(/\x1b\[\d+(;\d+)*m/g, '');
 /** Shared ANSI palette. */
 const esc = String.fromCharCode(27); // \x1b — a shared prefix minifies better than escapes

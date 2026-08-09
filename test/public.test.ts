@@ -11,6 +11,7 @@ import {
   progressReset,
   progressShow,
   progressUpdate,
+  stdoutColor,
 } from '../src/env.ts';
 import { dtsPath, exportPath, jsPath, publicEntries, readPkg } from '../src/public.ts';
 import { test as should } from 'node:test';
@@ -25,6 +26,17 @@ should('csvEnabled keys off stdout alone, not the still-attached stderr tty', ()
   deepStrictEqual(csvEnabled({ NO_COLOR: '1' }, true), true);
   // FORCE_COLOR is the escape hatch that keeps the table even through a pipe.
   deepStrictEqual(csvEnabled({ FORCE_COLOR: '1' }, false), false);
+});
+
+should('stdoutColor keys off stdout alone, not the still-attached stderr tty', () => {
+  // `bismar -d pkg v1 v2 | less` pipes the diff while stderr keeps the terminal
+  // for progress lines: the text lands on stdout, so stdout decides.
+  deepStrictEqual(stdoutColor({}, false), false);
+  deepStrictEqual(stdoutColor({}, true), true);
+  deepStrictEqual(stdoutColor({ NO_COLOR: '1' }, true), false);
+  // Force flags win either way — this is how `| less -R` gets its color back.
+  deepStrictEqual(stdoutColor({ FORCE_COLOR: '1' }, false), true);
+  deepStrictEqual(stdoutColor({ CLICOLOR_FORCE: '1' }, false), true);
 });
 
 should('public path helpers walk nested export condition objects', () => {

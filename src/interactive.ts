@@ -4,8 +4,9 @@ Interactive mode (`-i`): ranger-style package navigation. A bare `bismar`
 search a registry — top hits to pick from; pypi, searchless, opens exact
 names. Sessions open in the
 files view — shipped files browse like a filesystem and preview as text; `r`
-jumps to the github repository the manifest names. `m` switches JS packages to
-the modules view (`f` returns), where modules are directories, exports are files, and every
+jumps to the github repository the manifest names, and back — every ecosystem
+that advertises one, not just JS. `m` toggles JS
+packages into the modules view, where modules are directories, exports are files, and every
 row measures itself in the background (same in-memory engine as --size);
 `enter` there bundles and pages through the source. Listings take the mouse too
 — click to select, click again to open, wheel to scroll; the pager keeps it
@@ -26,23 +27,14 @@ import {
 } from './diff.ts';
 import { color, paint, progressOff, stripAnsi, wantColor } from './env.ts';
 import { rmTempDir, tempDir } from './fs-modify.ts';
-import {
-  bad,
-  err,
-  explicitPath,
-  firstModule,
-  fmtBytes,
-  kb,
-  ONLY_EXT,
-  paintId,
-  readJson,
-} from './public.ts';
+import { bad, err, explicitPath, firstModule, fmtBytes, kb, ONLY_EXT, paintId } from './public.ts';
 import {
   canSearch,
   isRegistrySelector,
   jsHitStats,
   parseRegistryRef,
   registryContext,
+  type RegistryRef,
   type SearchHit,
   searchRegistry,
   setBigArchivePolicy,
@@ -76,6 +68,7 @@ import {
   sizeTail,
   toDbModules,
 } from './size.ts';
+import { ghRepoOf } from './surface.ts';
 
 const decoder = new TextDecoder();
 export type InteractiveIo = {
@@ -132,13 +125,12 @@ const KEYMAP: Record<string, string> = {
   G: 'bottom',
   b: 'pgup',
   d: 'halfdn', // less: half window forward…
-  f: 'files', // modules view: back to the files home view
-  m: 'modules', // files view: switch to the modules/size view
   g: 'top',
   h: 'back',
   j: 'down',
   k: 'up',
   l: 'enter',
+  m: 'mode', // toggle between the files view and the modules/size view
   n: 'next', // repeat the last pager search…
   N: 'prev', // …and backwards
   q: 'quit',
@@ -171,27 +163,6 @@ const tokenize = (raw: string): string[] => {
 // math counts, and a stray \r rewinds the cursor into the previous text
 // (vscode-jsonrpc ships tab-indented, CRLF-ish files inside typescript).
 const displayText = (text: string): string => text.replace(/\t/g, '  ').replace(/\r/g, '');
-// repository spellings seen in the wild: "github:u/r", bare "u/r" shorthand,
-// "git+https://github.com/u/r.git", "git://github.com/u/r.git",
-// {url: "https://github.com/u/r"}, monorepo urls with /tree/... tails.
-const GH_REPO = /(?:^github:|github\.com[/:])([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:[/#].*)?$/;
-const ghRepoOf = (pkgFile: string): string => {
-  try {
-    const raw = readJson<{ repository?: unknown }>(pkgFile).repository;
-    const url =
-      typeof raw === 'string'
-        ? raw
-        : raw && typeof raw === 'object' && typeof (raw as { url?: unknown }).url === 'string'
-          ? (raw as { url: string }).url
-          : '';
-    const m = GH_REPO.exec(url);
-    if (m) return `${m[1]}/${m[2]}`;
-    return /^[\w.-]+\/[\w.-]+$/.test(url) ? url : '';
-  } catch {
-    // No manifest (registry extracts) or an unparseable one: no repo jump on offer.
-    return '';
-  }
-};
 const ALT_ON = '\x1b[?1049h\x1b[?25l';
 const ALT_OFF = '\x1b[?25h\x1b[?1049l';
 // Click + wheel reporting in SGR encoding (1006: coordinates past column 223
@@ -577,7 +548,7 @@ export const runDiff = async (
       paintId(a.label, colorOn, 'module') +
         paint(' → ', color.dim, colorOn) +
         paintId(b.label, colorOn, 'module') +
-        paint(` · diff · ${statSummary(tree)}`, color.dim, colorOn),
+        paint(` · diff · ${statSummary(tree, a, b).join(' · ')}`, color.dim, colorOn),
       '',
     ];
     for (const [i, entry] of tree.entries.slice(offset, offset + visible).entries()) {
@@ -791,8 +762,12 @@ export const runInteractive = async (
       // stay off; the session lives in the files view.
       const regSel = chosen && isRegistrySelector(chosen) ? chosen : '';
       const filesOnly = !!regSel || dirOnly;
+      // The extract's ecosystem, for manifest reads that spell differently per
+      // registry; unset for JS packages and plain directories.
+      let regRef: RegistryRef | undefined;
       if (regSel) {
-        const got = await registryContext(tmp, parseRegistryRef(regSel));
+        regRef = parseRegistryRef(regSel);
+        const got = await registryContext(tmp, regRef);
         label = got.label;
         pkgRoot = got.pkgDir;
       } else if (dirOnly) {
@@ -881,9 +856,12 @@ export const runInteractive = async (
           await fillExports(build, mods);
         }
       }
-      // `r` target: the github repo advertised by the browsed package's manifest.
-      // Registry extracts have no package.json worth trusting; gh: is the repo.
-      const ghRepo = filesOnly ? '' : ghRepoOf(join(pkgRoot, 'package.json'));
+      // `r` target: the github repo the browsed package's own manifest advertises
+      // — package.json for JS, Cargo.toml/composer.json/core metadata/gemspec or
+      // the import path itself for registry extracts. gh: is already the repo.
+      // The ecosystem that named it labels the way back.
+      const home = ghRepoOf(pkgRoot, regRef?.prefix, regRef?.name);
+      const ghRepo = home.repo;
       const colorOn = wantColor();
       const stats = new Map<string, Cell>();
       const sources = new Map<string, string[]>();
@@ -962,9 +940,9 @@ export const runInteractive = async (
       };
       // Shipped files under one directory, dirs first; never the dev-only trees.
       const FILE_SKIP = new Set(['.git', 'node_modules']);
-      // The files people open first — changelogs, licenses, readmes, manifests —
+      // The two files people open first — the readme and the package manifest —
       // lead the file group, right after the directories.
-      const FILE_META = /^(changelog|license|readme)|^(jsr|package)\.json$/i;
+      const FILE_META = /^readme|^package\.json$/i;
       const fileRank = (ent: FEntry): number => (ent.dir ? 0 : FILE_META.test(ent.name) ? 1 : 2);
       // Footprint: recursive bytes + file count per directory — honest size
       // information for every ecosystem (unlike bundle stats, which are JS-only).
@@ -1061,11 +1039,15 @@ export const runInteractive = async (
         const lines = [crumb, ''];
         for (const [i, ent] of fileList.slice(fileOffset, fileOffset + visible).entries()) {
           const active = fileOffset + i === fileCursor;
-          const name = paint(
-            ent.dir && ent.name !== '..' ? `${ent.name}/` : ent.name,
-            ent.dir ? (ent.name === '..' ? color.dim : color.cyan) : color.green,
-            colorOn
-          );
+          const text = ent.dir && ent.name !== '..' ? `${ent.name}/` : ent.name;
+          // Dirs keep their cyan; plain files stay unpainted so the two entry
+          // points a package always has — its README and manifest — pop in red.
+          const hot = !ent.dir && (ent.name === 'package.json' || /^readme(\.|$)/i.test(ent.name));
+          const name = ent.dir
+            ? paint(text, ent.name === '..' ? color.dim : color.cyan, colorOn)
+            : hot
+              ? paint(text, color.red, colorOn)
+              : text;
           // Directories carry their footprint, files their own size; `..` stays bare.
           const tail =
             ent.dir && ent.name !== '..'
@@ -1075,13 +1057,15 @@ export const runInteractive = async (
                 : paint(`  ${kb(ent.size)}kb`, color.dim, colorOn);
           lines.push(`${active ? paint('▸ ', color.bold, colorOn) : '  '}${name}${tail}`);
         }
-        const hop = ghRepo ? (repoMode ? ' · r package' : ' · r repo') : '';
+        // Both hints name where the key lands: the repo side of the jump is
+        // github, the way back is the package's own ecosystem.
+        const hop = ghRepo ? ` · r repo (${repoMode ? home.eco : 'gh'})` : '';
         lines.push(
           '',
           paint(
             filesOnly
-              ? '↑↓ move · enter preview · ← up · q quit'
-              : `↑↓ move · enter preview · ← up${hop} · m modules · q quit`,
+              ? `↑↓ move · enter preview · ← up${hop} · q quit`
+              : `↑↓ move · enter preview · ← up · m mode (bundles)${hop} · q quit`,
             color.dim,
             colorOn
           )
@@ -1113,8 +1097,8 @@ export const runInteractive = async (
           '',
           paint(
             current
-              ? '↑↓ move · enter source · ← back · f files · q quit'
-              : '↑↓ move · enter open · f files · q quit',
+              ? '↑↓ move · enter source · ← back · m mode (files) · q quit'
+              : '↑↓ move · enter open · m mode (files) · q quit',
             color.dim,
             colorOn
           )
@@ -1304,6 +1288,7 @@ export const runInteractive = async (
         [/\.(md|markdown)$/i, 'md'],
         [/\.html?$/i, 'html'],
         [/\.py$/i, 'py'],
+        [/^Rakefile$/, 'rb'],
         [/\.rb$/i, 'rb'],
         [/\.rs$/i, 'rs'],
         [/\.go$/i, 'go'],
@@ -1457,7 +1442,7 @@ export const runInteractive = async (
             switch (key) {
               case 'quit':
                 break loop;
-              case 'modules':
+              case 'mode':
                 // Files-only sessions have no modules view to switch to.
                 if (!filesOnly) filesMode = false;
                 break;
@@ -1610,8 +1595,8 @@ export const runInteractive = async (
             case 'size':
               if (entry) await measureOne(entry);
               break;
-            case 'files':
-              // Toggle into the files view; its position survives round trips.
+            case 'mode':
+              // Toggle back into the files view; its position survives round trips.
               filesMode = true;
               fileList = filesOf(fileRel);
               fileCursor = Math.min(fileCursor, Math.max(0, fileList.length - 1));

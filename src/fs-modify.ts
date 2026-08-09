@@ -219,11 +219,17 @@ export const extractArchive = (bytes: Uint8Array, dir: string): void =>
     ? extractZip(bytes, dir)
     : extractTar(bytes, dir);
 
-export const npmInstall = (dir: string): void => {
+export const npmInstall = (dir: string, refresh = false): void => {
   assertTemp(dir);
   try {
+    // `refresh` swaps offline-first for a revalidating fetch: npm's cached
+    // packument can predate a just-published version, and --prefer-offline
+    // would keep answering ETARGET for it forever.
+    const args = refresh
+      ? NPM_INSTALL_ARGS.map((arg) => (arg === '--prefer-offline' ? '--prefer-online' : arg))
+      : [...NPM_INSTALL_ARGS];
     // --loglevel=error beats the quiet npm_config_loglevel env, so failures stay explained.
-    execFileSync('npm', [...NPM_INSTALL_ARGS, '--loglevel=error'], {
+    execFileSync('npm', [...args, '--loglevel=error'], {
       cwd: dir,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

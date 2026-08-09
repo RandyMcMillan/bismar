@@ -10,7 +10,9 @@ import { after, test as should } from 'node:test';
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
 
-const { diffLines, diffPair, diffTrees, hunksOf, statHuman } = await import('../src/diff.ts');
+const { diffLines, diffPair, diffTrees, hunksOf, statHuman, statSummary } = await import(
+  '../src/diff.ts'
+);
 const { runCli } = await import('../src/bismar.ts');
 const { runDiff } = await import('../src/interactive.ts');
 
@@ -108,12 +110,25 @@ should('bismar -ds prints stat rows: CSV piped, painted table for humans', async
   match(csv, /M,mod\.txt,14b,12b,-2b/);
   match(csv, /D,gone\.txt,4b,0b,-4b/);
   match(csv, /A,new\.txt,0b,6b,\+6b/);
-  // The human table shares rows and adds the summary line.
-  const human = statHuman(diffTrees(join(base, 'a'), join(base, 'b')), false);
+  // The human table shares rows and adds a two-line summary: counts, then
+  // whole-tree sizes in the same a → b (±delta) shape as the modified rows.
+  const tree = diffTrees(join(base, 'a'), join(base, 'b'));
+  const human = statHuman(tree, false);
   match(human.join('\n'), /M mod\.txt {2}0\.01kb → 0\.01kb \(-0\.00kb\)/);
   match(
     human.join('\n'),
-    /4 files changed: 1 added, 1 removed, 2 modified · 2 unchanged · \+0\.00kb/
+    /4 files changed: 1 added, 1 removed, 2 modified · 2 unchanged\n0\.03kb → 0\.03kb \(\+0\.00kb\) unpacked$/
+  );
+  // Registry sides carry packed archive bytes; both known appends the packed
+  // tail, either missing (a local directory) leaves it off.
+  const [a, b] = [
+    { archiveBytes: 1024, dir: '', label: '' },
+    { archiveBytes: 2048, dir: '', label: '' },
+  ];
+  match(statSummary(tree, a, b)[1], / unpacked · 1\.00kb → 2\.00kb \(\+1\.00kb\) packed$/);
+  match(
+    statSummary(tree, { dir: '', label: '' }, b)[1],
+    /^0\.03kb → 0\.03kb \(\+0\.00kb\) unpacked$/
   );
 });
 
@@ -124,6 +139,30 @@ should('bismar -dl prints just the changed file names, even on a terminal', asyn
   // Like -ds, -dl is an output mode: a tty prints the same list, no navigator.
   const tty = await capture(() => runCli(['-dl', './a', './b'], { cwd: base, tty: true }));
   deepStrictEqual(tty, want);
+});
+
+should('a piped diff stays plain while stderr keeps its terminal', async () => {
+  // `bismar -d … | less`: stdout is the pipe the diff lands on, stderr stays on
+  // the terminal for progress lines and warnings. Only stdout may decide the
+  // color, or the pager renders raw escapes.
+  const noColor = process.env.NO_COLOR;
+  const stderrTty = process.stderr.isTTY;
+  delete process.env.NO_COLOR;
+  process.stderr.isTTY = true;
+  try {
+    const out = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
+    deepStrictEqual(/\x1b\[/.test(out), false, JSON.stringify(out));
+    match(out, /diff --bismar a\/mod\.txt b\/mod\.txt/);
+    // FORCE_COLOR is the escape hatch for `less -R` and friends.
+    process.env.FORCE_COLOR = '1';
+    const forced = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
+    deepStrictEqual(/\x1b\[31m-two/.test(forced), true, JSON.stringify(forced));
+  } finally {
+    delete process.env.FORCE_COLOR;
+    process.stderr.isTTY = stderrTty;
+    if (noColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = noColor;
+  }
 });
 
 should('bismar -d reports identical trees instead of empty output', async () => {

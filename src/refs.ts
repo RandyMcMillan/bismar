@@ -140,19 +140,31 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
       2
     )}\n`
   );
-  try {
-    npmInstall(dir);
-  } catch (error) {
-    // A concurrent prime may have won the race; only fail when the ref is truly absent.
-    if (pinned && existsSync(installedAt(dir, ref))) return dir;
-    // The two everyday registry failures get one-liners; anything else keeps npm's story.
-    const msg = (error as Error).message;
+  // The two everyday registry failures get one-liners; anything else keeps npm's story.
+  const explain = (error: Error): never => {
+    const msg = error.message;
     const site = ref.jsr ? 'jsr.io' : 'npmjs.com';
     if (msg.includes('code ETARGET'))
       err(`no such version: ${bad(ref.label)}; check the version on ${site}`);
     if (msg.includes('code E404'))
       err(`package not found: ${bad(ref.bare)}; check the name on ${site}`);
-    err(`installing ${ref.jsr ? 'jsr' : 'npm'} ref ${ref.label} failed: ${msg}`);
+    return err(`installing ${ref.jsr ? 'jsr' : 'npm'} ref ${ref.label} failed: ${msg}`);
+  };
+  try {
+    npmInstall(dir);
+  } catch (error) {
+    // A concurrent prime may have won the race; only fail when the ref is truly absent.
+    if (pinned && existsSync(installedAt(dir, ref))) return dir;
+    const msg = (error as Error).message;
+    // A "missing" version or package may just be npm's offline-first cache
+    // holding a packument older than the release; ask the registry once for
+    // real before declaring it absent.
+    if (!msg.includes('code ETARGET') && !msg.includes('code E404')) explain(error as Error);
+    try {
+      npmInstall(dir, true);
+    } catch (again) {
+      explain(again as Error);
+    }
   }
   if (!pinned) {
     // The floating spec just resolved; remember the answer and promote the fresh

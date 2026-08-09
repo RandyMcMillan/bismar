@@ -14,12 +14,14 @@ import { join, resolve } from 'node:path';
 import { color, csvRow, paint } from './env.ts';
 import { bad, err, explicitPath, kb } from './public.ts';
 import { asRef, explicitRef, installedRef, npmHintUse, parseNpmRef } from './refs.ts';
-import { isRegistrySelector, parseRegistryRef, registryContext } from './registries.ts';
+import { isRegistrySelector, jsHitStats, parseRegistryRef, registryContext } from './registries.ts';
 
 export type DiffStatus = 'added' | 'modified' | 'removed';
 export type DiffEntry = { aBytes: number; bBytes: number; path: string; status: DiffStatus };
-export type TreeDiff = { entries: DiffEntry[]; same: number };
-export type DiffSide = { dir: string; label: string };
+// aTotal/bTotal are whole-tree shipped bytes, unchanged files included, so the
+// footer can say what each side weighs — not just the delta.
+export type TreeDiff = { aTotal: number; bTotal: number; entries: DiffEntry[]; same: number };
+export type DiffSide = { archiveBytes?: number; dir: string; label: string };
 
 // Resolve one diff selector to a directory: registry refs fetch + extract,
 // npm/jsr refs install, explicit paths mean the disk. Bare names never imply
@@ -27,7 +29,7 @@ export type DiffSide = { dir: string; label: string };
 export const diffTarget = async (outDir: string, raw: string, cwd: string): Promise<DiffSide> => {
   if (isRegistrySelector(raw)) {
     const got = await registryContext(outDir, parseRegistryRef(raw));
-    return { dir: got.pkgDir, label: got.label };
+    return { archiveBytes: got.archiveBytes, dir: got.pkgDir, label: got.label };
   }
   if (raw === '.' || explicitPath(raw)) {
     const dir = resolve(cwd, raw);
@@ -39,7 +41,16 @@ export const diffTarget = async (outDir: string, raw: string, cwd: string): Prom
     const ref = parseNpmRef(asRef(raw));
     if (ref.path) err(`--diff compares whole packages; drop /${ref.path} from ${bad(raw)}`);
     const got = installedRef(outDir, ref);
-    return { dir: got.pkgDir, label: got.label };
+    // Packed-tarball garnish for the footer: one cached metadata + HEAD
+    // round-trip per pinned version, quiet on any failure — never an error.
+    const archiveBytes = await jsHitStats(ref.jsr ? 'jsr:' : 'npm:', {
+      desc: '',
+      name: ref.bare,
+      version: got.pkg.version ?? '',
+    })
+      .then((stats) => stats?.tgzBytes)
+      .catch(() => undefined);
+    return { archiveBytes, dir: got.pkgDir, label: got.label };
   }
   const use = npmHintUse(raw);
   return err(`--diff expects package refs or directories, not ${bad(raw)}${use ? `; ${use}` : ''}`);
@@ -106,7 +117,14 @@ export const diffTrees = (aDir: string, bDir: string): TreeDiff => {
   }
   for (const [path, bBytes] of b)
     if (!a.has(path)) entries.push({ aBytes: 0, bBytes, path, status: 'added' });
-  return { entries: entries.sort((x, y) => x.path.localeCompare(y.path)), same };
+  const sum = (sizes: Map<string, number>): number =>
+    [...sizes.values()].reduce((total, bytes) => total + bytes, 0);
+  return {
+    aTotal: sum(a),
+    bTotal: sum(b),
+    entries: entries.sort((x, y) => x.path.localeCompare(y.path)),
+    same,
+  };
 };
 
 export type DiffOp = { kind: '+' | '-' | ' '; text: string };
@@ -273,28 +291,36 @@ const MARK_COLOR: Record<DiffStatus, string> = {
 };
 const deltaOf = (entry: DiffEntry): number => entry.bBytes - entry.aBytes;
 const fmtDelta = (bytes: number): string => `${bytes < 0 ? '-' : '+'}${kb(Math.abs(bytes))}kb`;
+const fmtPair = (aBytes: number, bBytes: number): string =>
+  `${kb(aBytes)}kb → ${kb(bBytes)}kb (${fmtDelta(bBytes - aBytes)})`;
 // The row's size tail, shared by the stat table and the interactive listing.
 export const statTail = (entry: DiffEntry): string =>
-  entry.status === 'modified'
-    ? `${kb(entry.aBytes)}kb → ${kb(entry.bBytes)}kb (${fmtDelta(deltaOf(entry))})`
-    : fmtDelta(deltaOf(entry));
-export const statSummary = (tree: TreeDiff): string => {
+  entry.status === 'modified' ? fmtPair(entry.aBytes, entry.bBytes) : fmtDelta(deltaOf(entry));
+// The footer, two lines: change counts, then sizes — whole-tree unpacked bytes
+// on each side plus, when both sides came off a registry, the packed archive
+// sizes. Local directories have no archive, so the packed tail stays off for
+// them. The interactive header joins the lines back with · to stay on one row.
+export const statSummary = (tree: TreeDiff, a?: DiffSide, b?: DiffSide): string[] => {
   const count = (status: DiffStatus): number =>
     tree.entries.filter((entry) => entry.status === status).length;
-  const total = tree.entries.reduce((sum, entry) => sum + deltaOf(entry), 0);
-  return (
+  const packed =
+    a?.archiveBytes && b?.archiveBytes
+      ? ` · ${fmtPair(a.archiveBytes, b.archiveBytes)} packed`
+      : '';
+  return [
     `${tree.entries.length} files changed: ${count('added')} added, ${count('removed')} removed, ` +
-    `${count('modified')} modified · ${tree.same} unchanged · ${fmtDelta(total)}`
-  );
+      `${count('modified')} modified · ${tree.same} unchanged`,
+    `${fmtPair(tree.aTotal, tree.bTotal)} unpacked${packed}`,
+  ];
 };
 const markOf = (entry: DiffEntry, on: boolean): string =>
   paint(MARK[entry.status], MARK_COLOR[entry.status], on);
-export const statHuman = (tree: TreeDiff, on: boolean): string[] => [
+export const statHuman = (tree: TreeDiff, on: boolean, a?: DiffSide, b?: DiffSide): string[] => [
   ...tree.entries.map(
     (entry) => `${markOf(entry, on)} ${entry.path}` + paint(`  ${statTail(entry)}`, color.dim, on)
   ),
   '',
-  statSummary(tree),
+  ...statSummary(tree, a, b).map((line) => paint(line, color.dim, on)),
 ];
 // `-dl`: just the changed files, name-status style — no sizes, no content.
 export const statNames = (tree: TreeDiff, on: boolean): string[] =>

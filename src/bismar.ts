@@ -12,7 +12,15 @@ import {
   statHuman,
   statNames,
 } from './diff.ts';
-import { color, csvEnabled, paint, progressDone, progressUpdate, wantColor } from './env.ts';
+import {
+  color,
+  csvEnabled,
+  paint,
+  progressDone,
+  progressUpdate,
+  stdoutColor,
+  wantColor,
+} from './env.ts';
 import { clearTempCaches, rmTempDir, tempDir } from './fs-modify.ts';
 import { bad, err, fmtBytes, runSelf } from './public.ts';
 import { readFileSync, statSync } from 'node:fs';
@@ -193,10 +201,10 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       const lines = args.size
         ? csvEnabled()
           ? statCsv(tree)
-          : statHuman(tree, wantColor())
+          : statHuman(tree, stdoutColor(), a, b)
         : args.list
-          ? statNames(tree, wantColor())
-          : renderUnified(a.dir, b.dir, tree, wantColor());
+          ? statNames(tree, stdoutColor())
+          : renderUnified(a.dir, b.dir, tree, stdoutColor());
       return console.log(lines.join('\n'));
     } finally {
       rmTempDir(tmp);

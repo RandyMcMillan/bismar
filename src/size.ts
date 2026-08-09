@@ -7,12 +7,13 @@ test/build and never installs the target project; only npm ref installs
 @module
  */
 import { createHash } from 'node:crypto';
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { availableParallelism } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
+import { walkFiles } from './diff.ts';
 import {
   color,
   csvEnabled,
@@ -20,7 +21,7 @@ import {
   paint,
   progressDone,
   progressUpdate,
-  wantColor,
+  stdoutColor,
 } from './env.ts';
 import {
   bad,
@@ -60,6 +61,7 @@ import {
   saveRefDb,
   soleIndexOf,
 } from './refs.ts';
+import { jsHitStats } from './registries.ts';
 
 export type BuildLike = (opts: {
   absWorkingDir?: string;
@@ -74,6 +76,15 @@ export type BuildLike = (opts: {
   outdir?: string;
   packages?: 'external';
   platform?: 'node';
+  plugins?: {
+    name: string;
+    setup: (hooks: {
+      onLoad: (
+        opts: { filter: RegExp },
+        cb: (args: { path: string }) => { contents: string; loader: 'js' } | undefined
+      ) => void;
+    }) => void;
+  }[];
   stdin?: { contents: string; resolveDir: string; sourcefile: string };
   write: false;
 }) => Promise<{
@@ -410,6 +421,11 @@ const bundle = async (
   // esbuild resolves files through symlinks, so a symlinked anchor (macOS's
   // /var/folders tmpdir) would turn every path comment into a `../..` walk.
   const workDir = realpathSync(cwd);
+  // Dependency files esbuild proved broken by a same-file const reassignment
+  // (deppack@old's `shims = shims.concat(…)`) — a hard error with no log
+  // override. Retries reload them with const demoted to var: measurement never
+  // executes the code, and the demotion is byte-neutral once minified.
+  const varPatch = new Set<string>();
   // The entry is named after globalName; esbuild may display it resolveDir-relative.
   const entry = `${globalName}.js`;
   const atEntry = (file: string | undefined) =>
@@ -431,6 +447,23 @@ const bundle = async (
         metafile: true,
         minify,
         platform,
+        plugins: varPatch.size
+          ? [
+              {
+                name: 'bismar-const-to-var',
+                setup: (hooks) => {
+                  hooks.onLoad({ filter: /\.[cm]?js$/ }, (args) =>
+                    varPatch.has(args.path)
+                      ? {
+                          contents: readFileSync(args.path, 'utf8').replace(/\bconst\b/g, 'var'),
+                          loader: 'js',
+                        }
+                      : undefined
+                  );
+                },
+              },
+            ]
+          : undefined,
         stdin: {
           contents: source,
           resolveDir: workDir,
@@ -443,17 +476,42 @@ const bundle = async (
       if (attempt >= 4) throw error;
       // Undeclared optional imports (preact's compat/server pulls preact-render-to-string)
       // are absent by design after a plain install; treat bare unresolvable packages as
-      // external so the rest of the package still measures. Relative paths stay fatal.
-      const missing = [...(error as Error).message.matchAll(/Could not resolve "([^"']+)"/g)]
+      // external so the rest of the package still measures.
+      const bare = [...(error as Error).message.matchAll(/Could not resolve "([^"']+)"/g)]
         .map((match) => match[1])
         .filter((spec) => spec && !/^[./#]/.test(spec) && !external.includes(spec));
-      if (missing.length) {
+      // Relative paths stay fatal in the measured package's own files (likely a
+      // real typo) but go external inside dependencies: dead conditional requires
+      // there — express/connect's `require('./lib-cov/x')` coverage split — name
+      // paths that never shipped, and the dep's remaining bytes still count.
+      const raised = (
+        error as { errors?: { location?: { file?: string } | null; text?: string }[] }
+      ).errors;
+      const depRelative = (raised ?? [])
+        .filter((one) => (one.location?.file ?? '').includes('node_modules/'))
+        .map((one) => /Could not resolve "([^"']+)"/.exec(one.text ?? '')?.[1])
+        .filter((spec): spec is string => !!spec && /^\./.test(spec) && !external.includes(spec));
+      const missing = [...bare, ...depRelative];
+      // Same dependency-only scope as depRelative: the measured package's own
+      // files keep the honest error.
+      const constFiles = (raised ?? [])
+        .filter((one) => / because it is a constant$/.test(one.text ?? ''))
+        .map((one) => one.location?.file)
+        .filter(
+          (file): file is string =>
+            !!file && file.includes('node_modules/') && !varPatch.has(resolve(workDir, file))
+        );
+      if (missing.length || constFiles.length) {
         for (const spec of new Set(missing)) {
           // The run-wide note sink dedupes the repeats: every bundle touching the same
           // import rediscovers it (preact's compat/server appears in the package row
           // plus each server row), and the concurrent minified twin rediscovers it too.
           note(`note: treating unresolvable import ${spec} as external`);
           external.push(spec);
+        }
+        for (const file of new Set(constFiles)) {
+          note(`note: demoting const to var in ${file} (reassigns a constant)`);
+          varPatch.add(resolve(workDir, file));
         }
         continue;
       }
@@ -645,6 +703,9 @@ const runList = async (
   const wanted = new Set<string>();
   const refs = new Map<string, ExternalRef>();
   const localNames = new Set(mods.map((mod) => mod.module));
+  // Import statements are stdout payload: a pipe gets them plain, even while
+  // stderr keeps its terminal.
+  const on = stdoutColor();
   for (const bare of only) {
     // `.` and the package's own name mean the local package itself: no filter.
     if (bare === '.' || bare === ctx.pkg.name) continue;
@@ -681,8 +742,8 @@ const runList = async (
       .filter((item) => !wanted.size || wanted.has(item.module))
       .map((item) =>
         input
-          ? importLine(item.export, '', relSpec(input))
-          : importLine(item.export, ctx.pkg.name, subOf(item.module))
+          ? importLine(item.export, '', relSpec(input), on)
+          : importLine(item.export, ctx.pkg.name, subOf(item.module), on)
       );
     if (lines.length) {
       progressDone();
@@ -713,8 +774,8 @@ const runList = async (
       // CJS entries defeat export enumeration; at least surface the module itself.
       .flatMap((mod) =>
         mod.exports.length
-          ? mod.exports.map((name) => importLine(name, base, subOf(mod)))
-          : [importLine('', base, subOf(mod))]
+          ? mod.exports.map((name) => importLine(name, base, subOf(mod), on))
+          : [importLine('', base, subOf(mod), on)]
       );
     if (lines.length) {
       progressDone();
@@ -854,6 +915,10 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
         ? module.slice(label.length + 1)
         : module;
   let prefilled = false;
+  // Whole-package ref browse closes its table with unpacked/packed sizes: the
+  // installed tree is exactly the shipped files, and the tarball bytes resolve
+  // in the background while the builds run (quiet on failure — garnish only).
+  let pkgSizes: { packed: Promise<number | undefined>; pkgDir: string } | undefined;
   // A single bare package selector is browse mode: expand to the same full table a
   // no-arg run prints inside that package. A single module selector (no export part)
   // browses the same way at module granularity: the module's bundle plus one row per
@@ -884,6 +949,16 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
           ctx = { ...refCtx, pkg: { ...refCtx.pkg, name: label } };
           only = [];
           if (pinnedRef) browseCache = { dir: refDir, full: true, label };
+          pkgSizes = {
+            packed: jsHitStats(ref.jsr ? 'jsr:' : 'npm:', {
+              desc: '',
+              name: ref.bare,
+              version: refCtx.pkg.version ?? '',
+            })
+              .then((stats) => stats?.tgzBytes)
+              .catch(() => undefined),
+            pkgDir: refCtx.pkgDir,
+          };
         } else {
           // A single segment may also name a root-module export (`qr/encodeQR`); only
           // real modules browse — the picker handles everything else.
@@ -1131,7 +1206,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
   // environments (LLM agents, pipes, CI logs) get CSV instead of a table.
   const show = !opts.silent;
   const csv = csvEnabled();
-  const colorOn = wantColor();
+  const colorOn = stdoutColor();
   // Human mode renders plain lines; non-interactive environments (LLM agents, pipes,
   // CI logs) get CSV. Module names show the real export file (`ml-kem.js`), matching
   // accepted selector spellings.
@@ -1245,6 +1320,13 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     for (const data of results) {
       if (csv) console.log(csvRow(csvCells(data)));
       else console.log(sizeLine(data, modFile, labelWidth, colorOn));
+    }
+    // CSV stays rows-only: the footer is a human summary, not another record.
+    if (!csv && pkgSizes) {
+      const unpacked = [...walkFiles(pkgSizes.pkgDir).values()].reduce((sum, b) => sum + b, 0);
+      const packed = await pkgSizes.packed;
+      const tail = packed ? ` · ${kb(packed)}kb packed` : '';
+      console.log(`\n${paint(`${kb(unpacked)}kb unpacked${tail}`, color.dim, colorOn)}`);
     }
   }
 };

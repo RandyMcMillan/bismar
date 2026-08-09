@@ -18,9 +18,12 @@ export const err = (msg: string): never => {
 };
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 export const ident = (name: string): boolean => !!name.length && IDENT.test(name);
-export const kb = (bytes: number): string => (bytes / 1024).toFixed(2);
+// Precision scales with magnitude — 5.04, 50.4, 504 — so big numbers don't
+// drag noise digits and small ones keep their resolution, whatever the unit.
+const fixed = (value: number): string => value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2);
+export const kb = (bytes: number): string => fixed(bytes / 1024);
 export const fmtBytes = (bytes: number): string =>
-  bytes < 1048576 ? `${kb(bytes)}kb` : `${(bytes / 1048576).toFixed(2)}mb`;
+  bytes < 1048576 ? `${kb(bytes)}kb` : `${fixed(bytes / 1048576)}mb`;
 export const readText = (file: string): string => readFileSync(file, 'utf8');
 export const readJson = <T>(file: string): T => JSON.parse(readText(file)) as T;
 export const relName = (cwd: string, file: string): string => relative(cwd, file) || basename(file);
