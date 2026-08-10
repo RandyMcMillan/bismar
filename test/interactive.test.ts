@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -91,7 +91,7 @@ const openMenu = (dirLabel: string, state: Record<string, unknown> = {}) => {
   };
 };
 
-should('launcher menu offers the current dir and the six registry searches', async () => {
+it('launcher menu offers the current dir and the six registry searches', async () => {
   // Bare `bismar` (menu: true) asks first; enter on the first option browses
   // the current package, and the session follows in the same terminal.
   const session = open(undefined, { menu: true });
@@ -106,7 +106,7 @@ should('launcher menu offers the current dir and the six registry searches', asy
   deepStrictEqual(/@bismar-test\/plain · files/.test(text), true, text);
 });
 
-should('launcher opens pinned and exact-name queries without searching', async () => {
+it('launcher opens pinned and exact-name queries without searching', async () => {
   // Option order: dir, npm, jsr, crate, gem, pypi, gh. A @version pin skips
   // search — search apis know nothing about versions — and type-ahead past the
   // submit is handed to the session that follows.
@@ -148,7 +148,7 @@ should('launcher opens pinned and exact-name queries without searching', async (
   deepStrictEqual(frames.lastIndexOf('what to open?') > frames.indexOf('name: ab'), true, frames);
 });
 
-should('launcher searches a registry and opens the picked hit', async () => {
+it('launcher searches a registry and opens the picked hit', async () => {
   // Local registry stand-ins: search is one request per submitted query.
   const routes: Record<string, string> = {
     '/api/v1/crates?q=serde&per_page=10': JSON.stringify({
@@ -232,7 +232,7 @@ should('launcher searches a registry and opens the picked hit', async () => {
   }
 });
 
-should('search hits paint a zero dep count green, others dim', async () => {
+it('search hits paint a zero dep count green, others dim', async () => {
   // A clean, dependency-free install is worth flagging: 0 deps shows green,
   // any other count stays dim like the rest of the garnish.
   process.env.FORCE_COLOR = '1';
@@ -276,7 +276,7 @@ should('search hits paint a zero dep count green, others dim', async () => {
   }
 });
 
-should('← from a session root climbs back into the launcher', async () => {
+it('← from a session root climbs back into the launcher', async () => {
   // Menu-launched sessions treat ← at their root as one more level up: the
   // launcher reopens (parked stage intact) instead of the key dying there.
   const session = open(undefined, { menu: true });
@@ -292,7 +292,7 @@ should('← from a session root climbs back into the launcher', async () => {
   deepStrictEqual(/@bismar-test\/plain · files/.test(session.text()), true, session.text());
 });
 
-should('launcher browses a package-less directory as plain files', async () => {
+it('launcher browses a package-less directory as plain files', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-dir-'));
   try {
     writeFileSync(join(cwd, 'notes.txt'), 'hello\n');
@@ -310,7 +310,7 @@ should('launcher browses a package-less directory as plain files', async () => {
   }
 });
 
-should('interactive mode navigates modules and exports like a filesystem', async () => {
+it('interactive mode navigates modules and exports like a filesystem', async () => {
   const res = await drive(undefined, 'mj\rq');
   // Root frame: package crumb, the `.` package row, and the module row.
   deepStrictEqual(/@bismar-test\/plain/.test(res.text), true, res.text);
@@ -326,7 +326,7 @@ should('interactive mode navigates modules and exports like a filesystem', async
   deepStrictEqual(res.frames.includes('\x1b[?25h\x1b[?1049l'), true);
 });
 
-should('interactive mode measures every row by itself, without s', async () => {
+it('interactive mode measures every row by itself, without s', async () => {
   const session = open(undefined);
   // Measurement starts in the background at launch, behind the files home
   // view; toggling to modules shows the rows already filled (or filling).
@@ -339,7 +339,7 @@ should('interactive mode measures every row by itself, without s', async () => {
   await session.done;
 });
 
-should('interactive mode navigates a filesystem selector as its own package', async () => {
+it('interactive mode navigates a filesystem selector as its own package', async () => {
   // `./` means the file: one module, its exports enumerated and measurable
   // through the same file-selector spelling, files view rooted at its dir.
   const session = open('./index.js');
@@ -355,7 +355,7 @@ should('interactive mode navigates a filesystem selector as its own package', as
   deepStrictEqual(/▸ \. /.test(text), false, text);
 });
 
-should('interactive mode forces the npm: prefix for bare names', async () => {
+it('interactive mode forces the npm: prefix for bare names', async () => {
   // Bare unscoped names never imply npm; errors point at the prefixed spelling.
   const timed = <T>(done: Promise<T>) =>
     Promise.race([
@@ -383,7 +383,7 @@ should('interactive mode forces the npm: prefix for bare names', async () => {
   }
 });
 
-should('interactive modules view measures unscoped npm refs', async () => {
+it('interactive modules view measures unscoped npm refs', async () => {
   // The pinned label of an unscoped ref (`qr@0.6.0`) is not an npm selector by
   // itself — rows must measure through the prefixed spelling (`npm:qr@0.6.0`),
   // or every row of such a package shows (build failed).
@@ -404,7 +404,7 @@ should('interactive modules view measures unscoped npm refs', async () => {
   );
 });
 
-should('interactive mode climbs back up via the .. entry and via h', async () => {
+it('interactive mode climbs back up via the .. entry and via h', async () => {
   // k moves from the first export onto `..`; enter on it returns to the root
   // with the module cursor preserved.
   const dots = await drive(undefined, 'mj\rk\rq');
@@ -413,7 +413,7 @@ should('interactive mode climbs back up via the .. entry and via h', async () =>
   deepStrictEqual(/▸ index\.js/.test(back.text), true, back.text);
 });
 
-should('interactive mode pages through bundled source on enter', async () => {
+it('interactive mode pages through bundled source on enter', async () => {
   const res = await drive(undefined, 'mj\r\rqq');
   // The pager header names the selector; the body is the plain bundle.
   deepStrictEqual(/index\/add · \d+ lines/.test(res.text), true, res.text);
@@ -425,7 +425,7 @@ should('interactive mode pages through bundled source on enter', async () => {
   );
 });
 
-should('interactive mode syntax-highlights paged source when colors are on', async () => {
+it('interactive mode syntax-highlights paged source when colors are on', async () => {
   process.env.FORCE_COLOR = '1';
   try {
     const res = await drive(undefined, 'mj\r\rqq');
@@ -438,7 +438,7 @@ should('interactive mode syntax-highlights paged source when colors are on', asy
   }
 });
 
-should('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async () => {
+it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async () => {
   const cases = [
     ['py', 'def greet(name):', 'def'],
     ['rb', 'def greet(name)', 'def'],
@@ -457,7 +457,7 @@ should('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', as
   }
 });
 
-should('interactive mode syntax-highlights Python and Rakefile previews', async () => {
+it('interactive mode syntax-highlights Python and Rakefile previews', async () => {
   process.env.FORCE_COLOR = '1';
   try {
     for (const [name, source] of [
@@ -481,7 +481,7 @@ should('interactive mode syntax-highlights Python and Rakefile previews', async 
   }
 });
 
-should('interactive mode starts in the package-files view with text previews', async () => {
+it('interactive mode starts in the package-files view with text previews', async () => {
   const res = await drive(undefined, '\rqmq');
   // The home view lists the shipped files with sizes: dirs first, then the
   // readme and package.json, then the rest; the header carries the package's
@@ -502,7 +502,7 @@ should('interactive mode starts in the package-files view with text previews', a
   deepStrictEqual(/▸ \./.test(res.text), true, res.text);
 });
 
-should('files view stays put on back at its root instead of leaving', async () => {
+it('files view stays put on back at its root instead of leaving', async () => {
   // h (and ← / backspace) climbs directories only; at the files root it is a
   // no-op — the modules view is behind m, and esc exits.
   const res = await drive(undefined, 'hq');
@@ -515,7 +515,7 @@ should('files view stays put on back at its root instead of leaving', async () =
   deepStrictEqual(esc.frames.includes('\x1b[?25h\x1b[?1049l'), true);
 });
 
-should('mouse clicks and wheel drive the listings; the pager releases tracking', async () => {
+it('mouse clicks and wheel drive the listings; the pager releases tracking', async () => {
   // Wheel down moves the selection like j; clicks on the blank header row and
   // past the listing miss without crashing. j/hjkl were never pressed here, so
   // the second row can only be reached by the wheel.
@@ -547,7 +547,7 @@ should('mouse clicks and wheel drive the listings; the pager releases tracking',
   deepStrictEqual(/▸ add/.test(mods.text), true, mods.text);
 });
 
-should('files view skips symlinked entries instead of following them', async (t) => {
+it('files view skips symlinked entries instead of following them', async (t) => {
   // Registry archives extract through the system tar and can ship symlinks
   // aimed anywhere (~/.ssh); the files view must never list — let alone
   // preview or descend into — anything a symlink points at.
@@ -584,7 +584,7 @@ should('files view skips symlinked entries instead of following them', async (t)
   }
 });
 
-should('interactive file preview sanitizes tabs and CRLF line endings', async () => {
+it('interactive file preview sanitizes tabs and CRLF line endings', async () => {
   // Tab-indented CRLF files (typescript vendors vscode-jsonrpc like this) must
   // not render wider than the width math counts — that scrolls the terminal
   // and stacks rows onto each other.
@@ -615,7 +615,7 @@ should('interactive file preview sanitizes tabs and CRLF line endings', async ()
   }
 });
 
-should('interactive pager searches with /pattern and jumps with :line', async () => {
+it('interactive pager searches with /pattern and jumps with :line', async () => {
   const res = await drive(undefined, 'mj\r\r/defProp\r:1\rqq');
   const frames = res.frames.split('\x1b[H').map((frame) => strip(frame).split('\r\n'));
   // `/defProp` scrolls the window to the matching line…
@@ -630,7 +630,7 @@ should('interactive pager searches with /pattern and jumps with :line', async ()
   deepStrictEqual(res.text.includes('/defProp'), true, res.text);
 });
 
-should('interactive pager wraps long lines to the width instead of truncating', async () => {
+it('interactive pager wraps long lines to the width instead of truncating', async () => {
   // A 20-column terminal: the bundle's `var bismarTestPlainIndexAdd…` line must
   // continue on following rows, not vanish behind an ellipsis.
   const session = open(undefined, { cols: 20 });
@@ -649,7 +649,7 @@ should('interactive pager wraps long lines to the width instead of truncating', 
   deepStrictEqual(wide, [], text);
 });
 
-should('interactive mode handles PgUp/PgDn/Home/End escape sequences', async () => {
+it('interactive mode handles PgUp/PgDn/Home/End escape sequences', async () => {
   // PgUp at the root must not quit (old parsing let unknown \x1b[5~-style
   // sequences fall through to bare Esc); End then jumps to the last export.
   const res = await drive(undefined, 'm\x1b[5~j\r\x1b[Fq');
@@ -660,7 +660,7 @@ should('interactive mode handles PgUp/PgDn/Home/End escape sequences', async () 
   deepStrictEqual(/\n(?:[1-9]\d?|100)% · ↑↓\/space scroll/.test(paged.text), true, paged.text);
 });
 
-should('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () => {
+it('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () => {
   // A broken exit path would hang the session forever; fail loudly instead.
   const timed = (done: Promise<void>) =>
     Promise.race([

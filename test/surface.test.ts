@@ -6,7 +6,7 @@ import { deepStrictEqual, throws } from 'node:assert';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, test as should } from 'node:test';
+import { after, test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -23,7 +23,7 @@ const put = (rel: string, data: string): string => {
   return file;
 };
 
-should('go surface maps package dirs to import paths under the go.mod module', () => {
+it('go surface maps package dirs to import paths under the go.mod module', () => {
   put('go/go.mod', 'module golang.org/x/time\n\ngo 1.21\n');
   put('go/rate/rate.go', '// Package rate limits.\npackage rate\n');
   put('go/rate/rate_test.go', 'package rate\n');
@@ -42,7 +42,7 @@ should('go surface maps package dirs to import paths under the go.mod module', (
   ]);
 });
 
-should('composer surface expands PSR-4 namespaces to one class per file', () => {
+it('composer surface expands PSR-4 namespaces to one class per file', () => {
   put(
     'php/composer.json',
     JSON.stringify({ autoload: { 'psr-4': { 'Monolog\\': 'src/Monolog' } } })
@@ -57,7 +57,7 @@ should('composer surface expands PSR-4 namespaces to one class per file', () => 
   ]);
 });
 
-should('pypi surface prefers top_level.txt and falls back to package layout', () => {
+it('pypi surface prefers top_level.txt and falls back to package layout', () => {
   put('py1/requests-2.32.0.dist-info/top_level.txt', 'requests\n');
   put('py1/requests/__init__.py', '');
   put('py1/requests/api.py', '');
@@ -75,7 +75,7 @@ should('pypi surface prefers top_level.txt and falls back to package layout', ()
   deepStrictEqual(surfaceOf('pypi:', 'requests', join(base, 'py3'), false), ['import requests']);
 });
 
-should('gem surface answers lib/ files as require paths', () => {
+it('gem surface answers lib/ files as require paths', () => {
   put('gem/lib/rails.rb', '');
   put('gem/lib/rails/all.rb', '');
   put('gem/lib/rails/version.rb', '');
@@ -87,7 +87,7 @@ should('gem surface answers lib/ files as require paths', () => {
   ]);
 });
 
-should('crate and gh fall back to the shipped file listing, as do empty surfaces', () => {
+it('crate and gh fall back to the shipped file listing, as do empty surfaces', () => {
   put('crate/Cargo.toml', '[package]\nname = "serde"\n');
   put('crate/src/lib.rs', 'pub fn x() {}\n');
   deepStrictEqual(surfaceOf('crate:', 'serde', join(base, 'crate'), false), [
@@ -99,7 +99,7 @@ should('crate and gh fall back to the shipped file listing, as do empty surfaces
   deepStrictEqual(surfaceOf('gem:', 'odd', join(base, 'gem2'), false), ['ext/native.c']);
 });
 
-should('registry sizes list every shipped file and close with a total', () => {
+it('registry sizes list every shipped file and close with a total', () => {
   put('sz/Cargo.toml', '12345678\n');
   put('sz/src/lib.rs', '1234\n');
   deepStrictEqual(sizesHuman(join(base, 'sz'), false), [
@@ -116,7 +116,7 @@ should('registry sizes list every shipped file and close with a total', () => {
   deepStrictEqual(sizesCsv(join(base, 'sz')), ['Cargo.toml,9b', 'src/lib.rs,5b']);
 });
 
-should('every ecosystem manifest yields the github repo it advertises', () => {
+it('every ecosystem manifest yields the github repo it advertises', () => {
   const at = (rel: string): string => join(base, rel);
   const NONE = { eco: '', repo: '' };
   // Cargo: the first github url in key = "value" order — docs.rs is not one.
@@ -192,7 +192,7 @@ should('every ecosystem manifest yields the github repo it advertises', () => {
   deepStrictEqual(ghRepoOf(at('r-crate')), { eco: 'crate', repo: 'rusty/mini' });
 });
 
-should('--list, shipped sizes, and archive stats let registry refs through', () => {
+it('--list, shipped sizes, and archive stats let registry refs through', () => {
   deepStrictEqual(parseArgs(['pypi:requests', '--list']).list, true);
   deepStrictEqual(parseArgs(['go:golang.org/x/time', '-l']).paths, ['go:golang.org/x/time']);
   deepStrictEqual(parseArgs(['gem:rails', '--size']).size, true);

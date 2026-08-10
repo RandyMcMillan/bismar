@@ -2,12 +2,12 @@ import { deepStrictEqual, rejects, throws } from 'node:assert';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
+import { parseArgs, runCli } from '../src/bismar.ts';
+import { __TEST as FS_TEST, promoteTemp } from '../src/fs-modify.ts';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
-import { __TEST as FS_TEST, promoteTemp } from '../src/fs-modify.ts';
-import { parseArgs, runCli } from '../src/bismar.ts';
 
 const FIXTURE = resolve('test/vectors/plain');
 
@@ -40,7 +40,7 @@ const capture = async (fn: () => Promise<void>) => {
   }
 };
 
-should('bundle parses flags and rejects removed ones', () => {
+it('bundle parses flags and rejects removed ones', () => {
   const args = parseArgs(['--minify', 'index/add']);
   deepStrictEqual(args, {
     bundle: false,
@@ -78,7 +78,7 @@ should('bundle parses flags and rejects removed ones', () => {
   throws(() => parseArgs(['-c']), /unknown option: -c/);
 });
 
-should('bundle combines short flags into artifact and report modes', () => {
+it('bundle combines short flags into artifact and report modes', () => {
   deepStrictEqual(parseArgs(['-bm']), parseArgs(['-b', '-m']));
   deepStrictEqual(
     parseArgs(['-bm', 'index/add']),
@@ -95,7 +95,7 @@ should('bundle combines short flags into artifact and report modes', () => {
   throws(() => parseArgs(['-ib']), /unknown option: -ib/);
 });
 
-should('bundle treats any colon head as a namespace and lists the known ones', () => {
+it('bundle treats any colon head as a namespace and lists the known ones', () => {
   const msg = (() => {
     try {
       parseArgs(['foo:bar']);
@@ -126,7 +126,7 @@ should('bundle treats any colon head as a namespace and lists the known ones', (
   deepStrictEqual(parseArgs(['-b', 'index/a:b']).paths, ['index/a:b']);
 });
 
-should('bundle prints size stats instead of bytes on a terminal', async () => {
+it('bundle prints size stats instead of bytes on a terminal', async () => {
   // The fallback measures exactly the bundle it refused (one row, not the browse
   // table); the stderr hint echoes the run's own arguments, copy-pasteable — and
   // the exit code still reports failure: the requested bundle was never produced.
@@ -154,7 +154,7 @@ should('bundle prints size stats instead of bytes on a terminal', async () => {
   deepStrictEqual(/\{add\} from/.test(listed.stdout), true, listed.stdout);
 });
 
-should('bundle writes the unminified bundle to stdout and nothing else', async () => {
+it('bundle writes the unminified bundle to stdout and nothing else', async () => {
   const res = await capture(() => runCli(['-b', 'index/add'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(res.ok, true, res.stderr);
   deepStrictEqual(res.stderr, '');
@@ -167,7 +167,7 @@ should('bundle writes the unminified bundle to stdout and nothing else', async (
   deepStrictEqual(/LOC|gzip|sha256|module,export|bismar-bundle-/.test(res.stdout), false);
 });
 
-should('bundle --minify emits the minified variant of the same artifact', async () => {
+it('bundle --minify emits the minified variant of the same artifact', async () => {
   const min = await capture(() => runCli(['--minify', 'index/add'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(min.ok, true, min.stderr);
   deepStrictEqual(
@@ -180,7 +180,7 @@ should('bundle --minify emits the minified variant of the same artifact', async 
   deepStrictEqual(min.stdout.length < plain.stdout.length, true);
 });
 
-should('-bs measures bundles and accepts redundant -m byte-for-byte', async () => {
+it('-bs measures bundles and accepts redundant -m byte-for-byte', async () => {
   const size = await capture(() => runCli(['-bs', 'index/add'], { cwd: FIXTURE, tty: false }));
   const min = await capture(() => runCli(['-bms', 'index/add'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(size.ok, true, size.stderr);
@@ -189,7 +189,7 @@ should('-bs measures bundles and accepts redundant -m byte-for-byte', async () =
   deepStrictEqual(/^index,add,\d+loc,\d+b,\d+b\n$/.test(size.stdout), true, size.stdout);
 });
 
-should('bundle defaults to the whole package and supports --list', async () => {
+it('bundle defaults to the whole package and supports --list', async () => {
   const res = await capture(() => runCli(['-b'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(res.ok, true, res.stderr);
   deepStrictEqual(/var bismarTestPlain = /.test(res.stdout), true, res.stdout.slice(0, 200));
@@ -200,7 +200,7 @@ should('bundle defaults to the whole package and supports --list', async () => {
   await rejects(() => runCli(['-b', 'index/nope'], { cwd: FIXTURE, tty: false }), /has no export/);
 });
 
-should('bundle treats a sole existing JS file selector as --input', async () => {
+it('bundle treats a sole existing JS file selector as --input', async () => {
   // No package.json anywhere near: the file itself becomes the package…
   const dir = mkdtempSync(join(tmpdir(), 'bismar-filesel-'));
   try {
@@ -226,7 +226,7 @@ should('bundle treats a sole existing JS file selector as --input', async () => 
   }
 });
 
-should('file selectors defer to public modules and compose with them', async () => {
+it('file selectors defer to public modules and compose with them', async () => {
   // index.js exists on disk AND is the public module: module semantics win.
   const mod = await capture(() => runCli(['-b', 'index.js'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(mod.ok, true, mod.stderr);
@@ -257,7 +257,7 @@ should('file selectors defer to public modules and compose with them', async () 
   );
 });
 
-should('bundle path comments stay ref-relative, never temp-dir walks', async () => {
+it('bundle path comments stay ref-relative, never temp-dir walks', async () => {
   // @microsoft/tsdoc@0.16.0 is a repo devDependency, so the npm cache serves it offline.
   const res = await capture(() =>
     runCli(['-b', 'npm:@microsoft/tsdoc@0.16.0'], { cwd: FIXTURE, tty: false })
@@ -268,14 +268,14 @@ should('bundle path comments stay ref-relative, never temp-dir walks', async () 
   deepStrictEqual(/^\s*\/\/ (\.\.\/)+/m.test(res.stdout), false, res.stdout.slice(0, 400));
 });
 
-should('fs-modify recognizes only bismar-owned temp dirs', () => {
+it('fs-modify recognizes only bismar-owned temp dirs', () => {
   deepStrictEqual(FS_TEST.inBismarTmp(join(tmpdir(), 'bismar-bundle-test')), true);
   deepStrictEqual(FS_TEST.inBismarTmp(join(tmpdir(), 'other-dir')), false);
   deepStrictEqual(FS_TEST.inBismarTmp(join(FIXTURE, 'test', 'build')), false);
   deepStrictEqual(FS_TEST.inBismarTmp('relative/bismar-x'), false);
 });
 
-should('fs-modify creates cache dirs keeper-private (0700)', async (t) => {
+it('fs-modify creates cache dirs keeper-private (0700)', async (t) => {
   // Persistent caches (bismar-refs, bismar-esbuild-*) live at predictable
   // tmpdir paths on shared machines: every dir bismar makes must be 0700
   // rather than umask-default, all the way down the recursive mkdirs.
@@ -297,7 +297,7 @@ should('fs-modify creates cache dirs keeper-private (0700)', async (t) => {
   }
 });
 
-should('fs-modify promotes run installs into the machine cache, bismar dirs only', () => {
+it('fs-modify promotes run installs into the machine cache, bismar dirs only', () => {
   const from = join(tmpdir(), 'bismar-promote-test-from');
   const to = join(tmpdir(), 'bismar-promote-test-to');
   rmSync(from, { force: true, recursive: true });
@@ -319,7 +319,7 @@ should('fs-modify promotes run installs into the machine cache, bismar dirs only
   rmSync(to, { force: true, recursive: true });
 });
 
-should('bundle --clear wipes bismar tmp caches, reports stats, runs alone', async () => {
+it('bundle --clear wipes bismar tmp caches, reports stats, runs alone', async () => {
   // A private TMPDIR keeps the sweep away from the real machine caches; the
   // non-bismar neighbor must survive it.
   const scratch = mkdtempSync(join(tmpdir(), 'clear-fixture-'));
@@ -353,7 +353,7 @@ should('bundle --clear wipes bismar tmp caches, reports stats, runs alone', asyn
   throws(() => parseArgs(['--clean', '--size']), /--clear runs alone/);
 });
 
-should('fs-modify npm install prefers offline packages, skips audit/fund', () => {
+it('fs-modify npm install prefers offline packages, skips audit/fund', () => {
   deepStrictEqual(FS_TEST.npmInstallArgs(), [
     'install',
     '--prefer-offline',

@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { after, test as should } from 'node:test';
+import { after, test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -66,7 +66,7 @@ const capture = async (fn: () => Promise<void>) => {
   return out;
 };
 
-should('diffLines yields minimal ops with common context intact', () => {
+it('diffLines yields minimal ops with common context intact', () => {
   deepStrictEqual(diffLines('a\nb\nc\n', 'a\nx\nc\n'), [
     { kind: ' ', text: 'a' },
     { kind: '-', text: 'b' },
@@ -82,7 +82,7 @@ should('diffLines yields minimal ops with common context intact', () => {
   ]);
 });
 
-should('hunksOf groups changes with context and 1-based line numbers', () => {
+it('hunksOf groups changes with context and 1-based line numbers', () => {
   const lines = Array.from({ length: 20 }, (_, i) => `l${i}`);
   const ops = diffLines(lines.join('\n'), lines.map((l) => (l === 'l10' ? 'X' : l)).join('\n'));
   const hunks = hunksOf(ops);
@@ -93,7 +93,7 @@ should('hunksOf groups changes with context and 1-based line numbers', () => {
   );
 });
 
-should('bundle stat rows join, sort, and render deterministic deltas', () => {
+it('bundle stat rows join, sort, and render deterministic deltas', () => {
   const stat = diffBundleRows(
     [
       { export: 'gone', gzBytes: 716, module: 'z' },
@@ -128,7 +128,7 @@ should('bundle stat rows join, sort, and render deterministic deltas', () => {
   );
 });
 
-should('diffTrees classifies files and skips dev trees and symlinks', () => {
+it('diffTrees classifies files and skips dev trees and symlinks', () => {
   const tree = diffTrees(join(base, 'a'), join(base, 'b'));
   deepStrictEqual(
     tree.entries.map((entry) => `${entry.status} ${entry.path}`),
@@ -138,7 +138,7 @@ should('diffTrees classifies files and skips dev trees and symlinks', () => {
   deepStrictEqual(tree.same, 2);
 });
 
-should('bismar -d prints a unified diff off a terminal', async () => {
+it('bismar -d prints a unified diff off a terminal', async () => {
   const out = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
   match(out, /diff --bismar a\/mod\.txt b\/mod\.txt/);
   match(out, /--- a\/mod\.txt\n\+\+\+ b\/mod\.txt\n@@ -1,3 \+1,3 @@\n one\n-two\n\+2\n three/);
@@ -148,7 +148,7 @@ should('bismar -d prints a unified diff off a terminal', async () => {
   match(out, /Binary files a\/blob\.bin and b\/blob\.bin differ/);
 });
 
-should('bismar -ds prints stat rows: CSV piped, painted table for humans', async () => {
+it('bismar -ds prints stat rows: CSV piped, painted table for humans', async () => {
   const csv = await capture(() => runCli(['-ds', './a', './b'], { cwd: base, tty: false }));
   // Headerless rows, units tagged: status, path, a bytes, b bytes, signed delta.
   match(csv, /^M,blob\.bin,3b,3b,\+0b\n/);
@@ -177,7 +177,7 @@ should('bismar -ds prints stat rows: CSV piped, painted table for humans', async
   );
 });
 
-should('bismar -dl prints just the changed file names, even on a terminal', async () => {
+it('bismar -dl prints just the changed file names, even on a terminal', async () => {
   const want = 'M blob.bin\nD gone.txt\nM mod.txt\nA new.txt\n';
   const out = await capture(() => runCli(['-dl', './a', './b'], { cwd: base, tty: false }));
   deepStrictEqual(out, want);
@@ -186,7 +186,7 @@ should('bismar -dl prints just the changed file names, even on a terminal', asyn
   deepStrictEqual(tty, want);
 });
 
-should('a piped diff stays plain while stderr keeps its terminal', async () => {
+it('a piped diff stays plain while stderr keeps its terminal', async () => {
   // `bismar -d … | less`: stdout is the pipe the diff lands on, stderr stays on
   // the terminal for progress lines and warnings. Only stdout may decide the
   // color, or the pager renders raw escapes.
@@ -210,12 +210,12 @@ should('a piped diff stays plain while stderr keeps its terminal', async () => {
   }
 });
 
-should('bismar -d reports identical trees instead of empty output', async () => {
+it('bismar -d reports identical trees instead of empty output', async () => {
   const out = await capture(() => runCli(['-d', './a', './a'], { cwd: base, tty: false }));
   match(out, /no differences: \.\/a and \.\/a ship identical files/);
 });
 
-should('-db diffs bundle text and -dbs reports per-export size deltas', async () => {
+it('-db diffs bundle text and -dbs reports per-export size deltas', async () => {
   const a = './test/vectors/plain';
   const b = './test/vectors/documented';
   const text = await capture(() => runCli(['-db', a, b], { tty: false }));
@@ -241,7 +241,7 @@ should('-db diffs bundle text and -dbs reports per-export size deltas', async ()
   deepStrictEqual(sameSize, `no bundle size changes: ${a} and ${a} measure identical\n`);
 });
 
-should('measured sides install tarballs and leave local dirs in place', async () => {
+it('measured sides install tarballs and leave local dirs in place', async () => {
   const { npmPack, rmTempDir, tempDir } = await import('../src/fs-modify.ts');
   put('mpkg/package.json', JSON.stringify({ name: 'bismar-test-mside', version: '1.0.0' }));
   put('mpkg/index.js', 'module.exports = 42;\n');
@@ -265,7 +265,7 @@ should('measured sides install tarballs and leave local dirs in place', async ()
   }
 });
 
-should('tarball selectors extract; a local dir against a package npm-packs first', async () => {
+it('tarball selectors extract; a local dir against a package npm-packs first', async () => {
   // A publishable fixture: the files field ships index.js only, so the test
   // file must vanish from any packed side.
   put(
@@ -330,7 +330,7 @@ should('tarball selectors extract; a local dir against a package npm-packs first
   );
 });
 
-should('ref selections pass through to bundle modes and stay rejected in tree modes', async () => {
+it('ref selections pass through to bundle modes and stay rejected in tree modes', async () => {
   // Tree modes: the whole-package rule holds, and the error precedes any install.
   await rejects(
     () => diffTarget(base, 'npm:qr@0.6.0/index', base),
@@ -342,7 +342,7 @@ should('ref selections pass through to bundle modes and stay rejected in tree mo
   );
 });
 
-should('bismar -d validates its arguments', async () => {
+it('bismar -d validates its arguments', async () => {
   // Exactly two selectors — the retired pkg-plus-two-versions form errs too.
   await rejects(
     () => runCli(['-d', './a'], { tty: false }),
@@ -402,7 +402,7 @@ should('bismar -d validates its arguments', async () => {
 
 // Strips colors and control sequences (clear, home, alternate screen).
 const strip = (text: string): string => text.replace(/\x1b\[[\d?;]*[a-zA-Z]/g, '');
-should('diff navigator lists changed files and pages through a line diff', async () => {
+it('diff navigator lists changed files and pages through a line diff', async () => {
   const input = new PassThrough();
   let raw = '';
   const io = {

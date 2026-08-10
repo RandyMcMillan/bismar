@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
@@ -123,7 +123,7 @@ const zipOf = (files: [string, string][]): Buffer => {
   return Buffer.concat([...locals, cd, eocd]);
 };
 
-should('registry refs parse names and exact versions only', () => {
+it('registry refs parse names and exact versions only', () => {
   deepStrictEqual(parseRegistryRef('crate:serde'), {
     name: 'serde',
     prefix: 'crate:',
@@ -202,7 +202,7 @@ should('registry refs parse names and exact versions only', () => {
   throws(() => parseRegistryRef('pypi:requests@latest'), /pin an exact version/);
 });
 
-should('archives at or past 100mb need consent before downloading', async () => {
+it('archives at or past 100mb need consent before downloading', async () => {
   // The prompt branch keys off the ambient streams, so pin them off-terminal:
   // run from a real terminal this would stop for a y/N answer nobody types.
   const stdin = process.stdin as unknown as { isTTY?: boolean };
@@ -239,7 +239,7 @@ should('archives at or past 100mb need consent before downloading', async () => 
   }
 });
 
-should('ref cache files one subdirectory per registry', () => {
+it('ref cache files one subdirectory per registry', () => {
   deepStrictEqual(
     refsCacheDir('crate:serde@1.0.219'),
     join(tmpdir(), 'bismar-refs', 'crate', 'serde-1-0-219')
@@ -256,7 +256,7 @@ should('ref cache files one subdirectory per registry', () => {
   );
 });
 
-should('registry refs take every output mode except minify', () => {
+it('registry refs take every output mode except minify', () => {
   // -b emits the saved registry archive; only minify-shaped output is refused.
   deepStrictEqual(parseArgs(['crate:serde', '-b']).bundle, true);
   deepStrictEqual(parseArgs(['crate:serde', '-bs']).size, true);
@@ -287,7 +287,7 @@ should('registry refs take every output mode except minify', () => {
   deepStrictEqual(parseArgs(['gh:octo/mini@dev']).interactive, true);
 });
 
-should('search parses hits from every registry api behind a browser agent', async () => {
+it('search parses hits from every registry api behind a browser agent', async () => {
   const agents: (string | undefined)[] = [];
   const routes: Record<string, string> = {
     '/-/v1/search?text=pre&size=10': JSON.stringify({
@@ -373,7 +373,7 @@ should('search parses hits from every registry api behind a browser agent', asyn
   }
 });
 
-should('js hit stats find packed tarball bytes and dep counts, then cache', async () => {
+it('js hit stats find packed tarball bytes and dep counts, then cache', async () => {
   // Versions are deliberately unpublishable: the stats cache is machine-wide,
   // and a real pkg@version must never be seeded with stand-in numbers.
   rmSync(join(tmpdir(), 'bismar-refs', '.stats'), { force: true, recursive: true });
@@ -452,7 +452,7 @@ should('js hit stats find packed tarball bytes and dep counts, then cache', asyn
   }
 });
 
-should('github search rate limits surface as a one-line hint, not a retry storm', async () => {
+it('github search rate limits surface as a one-line hint, not a retry storm', async () => {
   // Anonymous github search allows 10 queries a minute and answers 403; that
   // must map to a friendly message after exactly one request (403 never retries).
   let asked = 0;
@@ -475,7 +475,7 @@ should('github search rate limits surface as a one-line hint, not a retry storm'
   }
 });
 
-should('zip reader extracts members and refuses traversal', () => {
+it('zip reader extracts members and refuses traversal', () => {
   const dir = tempDir('check');
   try {
     extractZip(zipOf([['pkg/a.py', 'A = 1\n']]), join(dir, 'ok'));
@@ -488,7 +488,7 @@ should('zip reader extracts members and refuses traversal', () => {
   }
 });
 
-should('interactive crate ref downloads, extracts, and browses files only', async () => {
+it('interactive crate ref downloads, extracts, and browses files only', async () => {
   // A minimal `.crate`: gzipped tar with the standard `name-version/` top dir,
   // built by the same system tar the extractor shells out to.
   const fix = mkdtempSync(join(tmpdir(), 'bismar-crate-fix-'));
@@ -616,7 +616,7 @@ should('interactive crate ref downloads, extracts, and browses files only', asyn
   }
 });
 
-should('interactive gem ref unwraps the data layer of the gem shell', async () => {
+it('interactive gem ref unwraps the data layer of the gem shell', async () => {
   // A `.gem` is a PLAIN tar shell around data.tar.gz (the shipped files) and
   // metadata.gz; only the data layer should surface in the files view.
   const fix = mkdtempSync(join(tmpdir(), 'bismar-gem-fix-'));
@@ -653,7 +653,7 @@ should('interactive gem ref unwraps the data layer of the gem shell', async () =
   }
 });
 
-should('interactive composer ref resolves via p2 and extracts the dist zip', async () => {
+it('interactive composer ref resolves via p2 and extracts the dist zip', async () => {
   // Packagist dists are github-style zipballs: one hashed top dir, files below.
   const dist = zipOf([
     ['mini-pkg-1a2b3c/composer.json', '{\n  "name": "mini/pkg"\n}\n'],
@@ -696,7 +696,7 @@ should('interactive composer ref resolves via p2 and extracts the dist zip', asy
   }
 });
 
-should('registry dist urls are confined to allowlisted hosts', async () => {
+it('registry dist urls are confined to allowlisted hosts', async () => {
   // A hostile package points its dist at an off-registry host: the fetch is
   // refused by host before any bytes are read. With BISMAR_COMPOSER_API set,
   // the stand-in's own origin is allowed, so a same-origin dist still works —
@@ -744,7 +744,7 @@ should('registry dist urls are confined to allowlisted hosts', async () => {
   }
 });
 
-should('js garnish ignores a tarball url on an unexpected host', async () => {
+it('js garnish ignores a tarball url on an unexpected host', async () => {
   // A packument whose tarball points off-registry: the size garnish is dropped
   // (deps still count from the doc), never surfacing as an error. The version
   // is unpublishable so the machine stats cache is never seeded for a real one.
@@ -776,7 +776,7 @@ should('js garnish ignores a tarball url on an unexpected host', async () => {
   }
 });
 
-should('interactive gh ref pins any refspec to a commit sha before caching', async () => {
+it('interactive gh ref pins any refspec to a commit sha before caching', async () => {
   const sha = '1a2b3c4d5e6f7890123456789abcdef012345678';
   const short = sha.slice(0, 12);
   const fix = mkdtempSync(join(tmpdir(), 'bismar-gh-fix-'));
@@ -826,7 +826,7 @@ should('interactive gh ref pins any refspec to a commit sha before caching', asy
   }
 });
 
-should('files view jumps to the github repo named by package.json and back', async () => {
+it('files view jumps to the github repo named by package.json and back', async () => {
   const sha = 'fedcba9876543210fedcba9876543210fedcba98';
   const short = sha.slice(0, 12);
   const fix = mkdtempSync(join(tmpdir(), 'bismar-repo-fix-'));
@@ -886,7 +886,7 @@ should('files view jumps to the github repo named by package.json and back', asy
   }
 });
 
-should('files view jumps from a registry extract to the repo its manifest names', async () => {
+it('files view jumps from a registry extract to the repo its manifest names', async () => {
   // The same hop, with no package.json anywhere: a crate extract names its
   // repository in Cargo.toml, and the gh: side carries what the archive strips.
   const sha = '0123456789abcdef0123456789abcdef01234567';
@@ -946,7 +946,7 @@ should('files view jumps from a registry extract to the repo its manifest names'
   }
 });
 
-should('interactive go ref unwinds the nested import path of module zips', async () => {
+it('interactive go ref unwinds the nested import path of module zips', async () => {
   // Go module zips nest every file under module@version/…; the sole-directory
   // descent must unwind the whole chain (golang.org → x → mini@v0.5.0).
   const modZip = zipOf([
@@ -991,7 +991,7 @@ should('interactive go ref unwinds the nested import path of module zips', async
   }
 });
 
-should('interactive pypi ref prefers sdists and falls back to wheel zips', async () => {
+it('interactive pypi ref prefers sdists and falls back to wheel zips', async () => {
   // 0.3.0 publishes sdist + wheel (sdist must win: tars carry the readable tree);
   // 0.4.0 is wheel-only and exercises the zip reader end to end.
   const fix = mkdtempSync(join(tmpdir(), 'bismar-pypi-fix-'));

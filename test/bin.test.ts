@@ -1,6 +1,6 @@
 import { deepStrictEqual, rejects } from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -22,12 +22,12 @@ const capture = async (fn: () => Promise<void>) => {
   return out;
 };
 
-should('package build marks the bismar bin executable', () => {
+it('package build marks the bismar bin executable', () => {
   deepStrictEqual(/chmod \+x bismar\.js/.test(pkg.scripts.build), true);
   deepStrictEqual(pkg.bin, { bismar: 'bismar.js' });
 });
 
-should('bismar --help documents the single command, every flag and its alias', async () => {
+it('bismar --help documents the single command, every flag and its alias', async () => {
   const out = await capture(() => runCli(['--help'], { tty: false }));
   deepStrictEqual(/^usage:\n  bismar \[<selector>\]/.test(out), true, out);
   for (const flag of ['--bundle', '--size', '--minify', '--list', '--diff', '--clear'])
@@ -42,14 +42,14 @@ should('bismar --help documents the single command, every flag and its alias', a
   deepStrictEqual(out.includes('rs:   crates.io   gh:   github'), true, out);
 });
 
-should('bismar refuses unknown selector namespaces with the full listing', async () => {
+it('bismar refuses unknown selector namespaces with the full listing', async () => {
   await rejects(
     () => runCli(['foo:bar'], { tty: false }),
     /unknown namespace: foo:; use one of:\nnpm: \(or js:\)\njsr:/
   );
 });
 
-should('bare bismar off a terminal errs with the mode hints', async () => {
+it('bare bismar off a terminal errs with the mode hints', async () => {
   // On a terminal a bare bismar opens the navigator (the default mode); piped,
   // it cannot — the error points at the flags that do produce pipe output.
   await rejects(
@@ -58,7 +58,7 @@ should('bare bismar off a terminal errs with the mode hints', async () => {
   );
 });
 
-should('bismar rejects unknown options and cross-mode flag combos', async () => {
+it('bismar rejects unknown options and cross-mode flag combos', async () => {
   await rejects(
     () => runCli(['--nope'], { tty: false }),
     /unknown option: --nope; run bismar --help/

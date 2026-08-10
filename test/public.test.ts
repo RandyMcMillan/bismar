@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 // The progress test asserts plain stderr text; pin machine mode for standalone runs.
 process.env.NO_COLOR = '1';
 
+import { test as it } from 'node:test';
 import {
   csvEnabled,
   progressDone,
@@ -14,9 +15,8 @@ import {
   stdoutColor,
 } from '../src/env.ts';
 import { dtsPath, exportPath, jsPath, publicEntries, readPkg } from '../src/public.ts';
-import { test as should } from 'node:test';
 
-should('csvEnabled keys off stdout alone, not the still-attached stderr tty', () => {
+it('csvEnabled keys off stdout alone, not the still-attached stderr tty', () => {
   // `bismar -s pkg | sort` pipes stdout while stderr stays on the terminal:
   // the rows land on stdout, so stdout decides. Explicit env objects bypass
   // the ambient NO_COLOR pin above.
@@ -28,7 +28,7 @@ should('csvEnabled keys off stdout alone, not the still-attached stderr tty', ()
   deepStrictEqual(csvEnabled({ FORCE_COLOR: '1' }, false), false);
 });
 
-should('stdoutColor keys off stdout alone, not the still-attached stderr tty', () => {
+it('stdoutColor keys off stdout alone, not the still-attached stderr tty', () => {
   // `bismar -d pkg v1 v2 | less` pipes the diff while stderr keeps the terminal
   // for progress lines: the text lands on stdout, so stdout decides.
   deepStrictEqual(stdoutColor({}, false), false);
@@ -39,7 +39,7 @@ should('stdoutColor keys off stdout alone, not the still-attached stderr tty', (
   deepStrictEqual(stdoutColor({ CLICOLOR_FORCE: '1' }, false), true);
 });
 
-should('public path helpers walk nested export condition objects', () => {
+it('public path helpers walk nested export condition objects', () => {
   const value = {
     import: { default: './index.mjs' },
     require: './index.cjs',
@@ -49,13 +49,13 @@ should('public path helpers walk nested export condition objects', () => {
   deepStrictEqual(dtsPath(value), './index.d.ts');
 });
 
-should('public declaration paths fall back from JS leaves', () => {
+it('public declaration paths fall back from JS leaves', () => {
   deepStrictEqual(jsPath({ browser: './browser.js' }), './browser.js');
   deepStrictEqual(dtsPath({ node: './node.cjs' }), './node.d.ts');
   deepStrictEqual(dtsPath('./types.d.mts'), './types.d.mts');
 });
 
-should('exportPath walks export maps with caller-owned leaf policy', () => {
+it('exportPath walks export maps with caller-owned leaf policy', () => {
   const value = {
     import: './esm.mjs',
     node: { default: './node.js' },
@@ -71,7 +71,7 @@ should('exportPath walks export maps with caller-owned leaf policy', () => {
   );
 });
 
-should('readPkg normalizes export maps and legacy package entries', () => {
+it('readPkg normalizes export maps and legacy package entries', () => {
   deepStrictEqual(readPkg(resolve('test/vectors/documented/package.json')), {
     exports: { '.': 'index.js' },
     name: '@bismar-test/documented',
@@ -82,7 +82,7 @@ should('readPkg normalizes export maps and legacy package entries', () => {
   deepStrictEqual(readPkg(resolve('test/vectors/jsr-src/package.json')).self, true);
 });
 
-should('publicEntries lists sorted public JS export entries with package specs', () => {
+it('publicEntries lists sorted public JS export entries with package specs', () => {
   deepStrictEqual(
     publicEntries({
       cwd: '/tmp/pkg',
@@ -114,7 +114,7 @@ should('publicEntries lists sorted public JS export entries with package specs',
   );
 });
 
-should('progress line appears after a silent second, updates in place, clears', async () => {
+it('progress line appears after a silent second, updates in place, clears', async () => {
   // The startup indicator writes straight to process.stderr, gated on its TTY-ness;
   // stub both to observe it. NO_COLOR is pinned above, so the text stays plain.
   const stderr = process.stderr as unknown as {

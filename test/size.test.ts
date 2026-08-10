@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -81,7 +81,7 @@ const withEnv = async <T>(key: string, value: string | undefined, fn: () => Prom
   }
 };
 
-should('size command prints stats even with JSBT_QUIET and skips the audit', async () => {
+it('size command prints stats even with JSBT_QUIET and skips the audit', async () => {
   const cwd = fixture('documented');
   const res = await withEnv('JSBT_QUIET', '1', () =>
     run(cwd, () => runBismar(['-bs'], { color: false, cwd }))
@@ -97,7 +97,7 @@ should('size command prints stats even with JSBT_QUIET and skips the audit', asy
   deepStrictEqual(/Tip:/.test(out), false, out);
 });
 
-should('size command selector rows are in-memory only', async () => {
+it('size command selector rows are in-memory only', async () => {
   const cwd = fixture('documented');
   const res = await run(cwd, () => runBismar(['-bs', 'index'], { color: false, cwd }));
   const out = plain(res);
@@ -111,7 +111,7 @@ should('size command selector rows are in-memory only', async () => {
   deepStrictEqual(/unknown option: --keep/.test(plain(legacy)), true, plain(legacy));
 });
 
-should('size command works without a test/build template', async () => {
+it('size command works without a test/build template', async () => {
   const cwd = fixture('plain');
   try {
     const res = await run(cwd, () => runBismar(['-bs'], { color: false, cwd }));
@@ -144,7 +144,7 @@ should('size command works without a test/build template', async () => {
   }
 });
 
-should('size command needs no dependencies installed in the target repo', async () => {
+it('size command needs no dependencies installed in the target repo', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bismar-size-no-deps-'));
   try {
     // No node_modules at all: esbuild resolves near bismar itself (it's a real
@@ -176,7 +176,7 @@ should('size command needs no dependencies installed in the target repo', async 
   }
 });
 
-should('size command filters specific module/export paths', async () => {
+it('size command filters specific module/export paths', async () => {
   const cwd = fixture('plain');
   const res = await capture(() => runBismar(['-bs', 'index/add'], { color: false, cwd }));
   const out = plain(res);
@@ -241,7 +241,7 @@ should('size command filters specific module/export paths', async () => {
   );
 });
 
-should('size command keeps bare names local and hints the npm: prefix', async () => {
+it('size command keeps bare names local and hints the npm: prefix', async () => {
   const cwd = fixture('plain');
   // Registry access is explicit: a bare unscoped name stays a local error, with
   // the prefixed spelling suggested when the name could exist on the registry.
@@ -273,7 +273,7 @@ should('size command keeps bare names local and hints the npm: prefix', async ()
   }
 });
 
-should('size command resolves jsr refs via the jsr registry scope', async () => {
+it('size command resolves jsr refs via the jsr registry scope', async () => {
   const cwd = fixture('plain');
   // Malformed refs fail fast, offline: jsr names are always scoped.
   const bare = await capture(() => runBismar(['-bs', 'jsr:noscope'], { color: false, cwd }));
@@ -307,7 +307,7 @@ should('size command resolves jsr refs via the jsr registry scope', async () => 
   }
 });
 
-should('size command gives friendly hints for selector slips', async () => {
+it('size command gives friendly hints for selector slips', async () => {
   const cwd = fixture('plain');
   // A mistyped module extension is neither an export name nor an unknown module.
   const typo = await capture(() => runBismar(['-bs', 'index.t2/add'], { color: false, cwd }));
@@ -387,7 +387,7 @@ const withScratchPkg = async (
 const scratchJson = (extra: Record<string, unknown>) =>
   `${JSON.stringify({ name: '@bismar-test/scratch', private: true, version: '1.0.0', ...extra })}\n`;
 
-should('size command handles legacy and modern package entry shapes', async () => {
+it('size command handles legacy and modern package entry shapes', async () => {
   const cjs = "'use strict';\nexports.add = (a, b) => a + b;\n";
   const esm = 'export const add = (a, b) => a + b;\n';
   // Extensionless legacy main (ms).
@@ -534,7 +534,7 @@ should('size command handles legacy and modern package entry shapes', async () =
   );
 });
 
-should('size command rejects exports of CJS modules that have no exports', async () => {
+it('size command rejects exports of CJS modules that have no exports', async () => {
   // esbuild cannot statically validate named imports against CommonJS, so a bogus name
   // would otherwise "build" into a permanently-undefined property read (npm:noble-hashes
   // is the real-world shape: its entry just throws). The build warning becomes an error.
@@ -553,7 +553,7 @@ should('size command rejects exports of CJS modules that have no exports', async
   );
 });
 
-should('size command paints export names in listings and errors', async () => {
+it('size command paints export names in listings and errors', async () => {
   const cwd = fixture('plain');
   // Unknown-export listings paint `/export` green, matching size-line labels.
   const bad = await withEnv('FORCE_COLOR', '1', () =>
@@ -584,7 +584,7 @@ should('size command paints export names in listings and errors', async () => {
   );
 });
 
-should('size command --list prints import statements without bundling', async () => {
+it('size command --list prints import statements without bundling', async () => {
   const cwd = fixture('plain');
   const res = await capture(() => runBismar(['--list'], { color: false, cwd }));
   const out = plain(res);
@@ -621,7 +621,7 @@ should('size command --list prints import statements without bundling', async ()
   deepStrictEqual(/from '@microsoft\/tsdoc'/.test(bout), false, bout);
 });
 
-should('size command --list caches pinned ref enumeration in bismar.db.json', async () => {
+it('size command --list caches pinned ref enumeration in bismar.db.json', async () => {
   const cwd = fixture('plain');
   const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
@@ -643,7 +643,7 @@ should('size command --list caches pinned ref enumeration in bismar.db.json', as
   deepStrictEqual(plain(third), plain(first));
 });
 
-should('size command serves pinned ref sizes from the machine cache', async () => {
+it('size command serves pinned ref sizes from the machine cache', async () => {
   const cwd = fixture('plain');
   const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
@@ -701,7 +701,7 @@ should('size command serves pinned ref sizes from the machine cache', async () =
   deepStrictEqual(bytes.length > 1000, true);
 });
 
-should('size command pins floating refs through a fresh tag, re-resolves stale ones', async () => {
+it('size command pins floating refs through a fresh tag, re-resolves stale ones', async () => {
   const cwd = fixture('plain');
   // Prime the pinned machine cache, then cut the registry off: everything the
   // fresh-tag path needs must already be on disk.
@@ -739,7 +739,7 @@ should('size command pins floating refs through a fresh tag, re-resolves stale o
   rmSync(tag, { force: true });
 });
 
-should('size command measures external npm refs alongside local exports', async () => {
+it('size command measures external npm refs alongside local exports', async () => {
   const cwd = fixture('plain');
   // @microsoft/tsdoc@0.16.0 is a repo devDependency, so the npm cache serves it offline.
   const res = await capture(() =>
@@ -788,7 +788,7 @@ should('size command measures external npm refs alongside local exports', async 
   deepStrictEqual(/No matching export|bismar-size-/.test(missOut), false, missOut);
 });
 
-should('size command expands a single bare package selector to the full table', async () => {
+it('size command expands a single bare package selector to the full table', async () => {
   const cwd = fixture('plain');
   // Browse mode: one bare package ref prints the same breakdown a no-arg run prints
   // inside that package — package total plus per-module and per-export rows.
@@ -818,7 +818,7 @@ should('size command expands a single bare package selector to the full table', 
   deepStrictEqual(/^index,add,/m.test(mout), false, mout);
 });
 
-should('size command expands a single module selector to its exports', async () => {
+it('size command expands a single module selector to its exports', async () => {
   const cwd = fixture('plain');
   // Local module browse: the module row plus one row per export, no package row.
   const res = await capture(() => runBismar(['-bs', 'index.js'], { color: false, cwd }));
@@ -845,7 +845,7 @@ should('size command expands a single module selector to its exports', async () 
   deepStrictEqual(/^index,,/m.test(eout), false, eout);
 });
 
-should('size command measures npm refs without a local package.json', async () => {
+it('size command measures npm refs without a local package.json', async () => {
   // npm-first from anywhere: a directory without package.json still measures refs.
   const cwd = mkdtempSync(join(tmpdir(), 'bismar-size-nopkg-'));
   try {
@@ -878,7 +878,7 @@ should('size command measures npm refs without a local package.json', async () =
   }
 });
 
-should('size command measures a single file via the ./ selector', async () => {
+it('size command measures a single file via the ./ selector', async () => {
   // `./` always means the filesystem — even when a public module shares the name.
   const cwd = fixture('plain');
   const res = await capture(() => runBismar(['-bs', './index.js'], { color: false, cwd }));
@@ -892,7 +892,7 @@ should('size command measures a single file via the ./ selector', async () => {
   deepStrictEqual(/@bismar-test/.test(out), false, out);
 });
 
-should('npm install failures surface stderr with a stable prefix', async () => {
+it('npm install failures surface stderr with a stable prefix', async () => {
   // Run-dir deps assemble via symlinks; npm runs only on cold cache, so exercise the
   // failure surface directly at the fs-modify boundary.
   const tmp = mkdtempSync(join(tmpdir(), 'bismar-size-npmfail-'));

@@ -4,11 +4,11 @@
 import { deepStrictEqual } from 'node:assert';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { test as should } from 'node:test';
+import { test as it } from 'node:test';
 
 const VECTORS = resolve('test/vectors');
 
-should('vectors contain no machine-specific absolute paths', () => {
+it('vectors contain no machine-specific absolute paths', () => {
   const offenders: string[] = [];
   const walk = (dir: string): void => {
     for (const ent of readdirSync(dir, { withFileTypes: true })) {
