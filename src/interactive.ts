@@ -525,7 +525,12 @@ export const runDiff = async (
     cols: io.cols ?? (process.stdout.columns || 80),
     rows: io.rows ?? (process.stdout.rows || 24),
   });
-  const listRows = (): number => Math.max(3, term().rows - 4);
+  // Scoped diffs (`/path` ref tails) drop the summary footer, like -ds: over
+  // a handful of picked files its counts and totals just restate the rows.
+  const scoped = !!(a.sel || b.sel);
+  // Non-entry rows: title, two blanks, key bar — plus, unscoped, the
+  // counts and sizes footer lines.
+  const listRows = (): number => Math.max(3, term().rows - (scoped ? 4 : 6));
   const render = (lines: string[]): void => {
     const max = term().cols - 1;
     output.write(`\x1b[H${lines.map((line) => truncAnsi(line, max)).join('\x1b[K\r\n')}\x1b[J`);
@@ -548,7 +553,7 @@ export const runDiff = async (
       paintId(a.label, colorOn, 'module') +
         paint(' → ', color.dim, colorOn) +
         paintId(b.label, colorOn, 'module') +
-        paint(` · diff · ${statSummary(tree, a, b).join(' · ')}`, color.dim, colorOn),
+        paint(' · diff', color.dim, colorOn),
       '',
     ];
     for (const [i, entry] of tree.entries.slice(offset, offset + visible).entries()) {
@@ -559,7 +564,12 @@ export const runDiff = async (
           `${entry.path}${paint(`  ${statTail(entry)}`, color.dim, colorOn)}`
       );
     }
-    lines.push('', paint('↑↓ move · enter diff · q quit', color.dim, colorOn));
+    // Summary as a footer, -ds's two lines in -ds's order: counts, then sizes.
+    lines.push(
+      '',
+      ...(scoped ? [] : statSummary(tree, a, b).map((line) => paint(line, color.dim, colorOn))),
+      paint('↑↓ move · enter diff · q quit', color.dim, colorOn)
+    );
     render(lines);
   };
   const drawPager = (page: Pager): void => {

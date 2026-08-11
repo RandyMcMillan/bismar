@@ -1,5 +1,5 @@
 import { deepStrictEqual, rejects } from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { test as it } from 'node:test';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
@@ -25,6 +25,32 @@ const capture = async (fn: () => Promise<void>) => {
 it('package build marks the bismar bin executable', () => {
   deepStrictEqual(/chmod \+x bismar\.js/.test(pkg.scripts.build), true);
   deepStrictEqual(pkg.bin, { bismar: 'bismar.js' });
+});
+
+it('package exports name the supported subpaths and nothing else', () => {
+  // Every root .js ships, so before this map any module was importable and none was
+  // promised. The map is the promise: these subpaths have a downstream consumer
+  // (@paulmillr/jsbt) and break with a version bump, the rest are bismar's business.
+  deepStrictEqual(Object.keys(pkg.exports).sort(), [
+    '.',
+    './env.js',
+    './package.json',
+    './public.js',
+    './refs.js',
+    './size.js',
+  ]);
+  deepStrictEqual(pkg.exports['.'], `./${pkg.main}`);
+  for (const [key, target] of Object.entries(pkg.exports)) {
+    if (key === '.' || key === './package.json') continue;
+    // Self-mapped, so the published path and the source module stay one name; tsc
+    // emits the sibling .d.ts that types the subpath.
+    deepStrictEqual(target, key, key);
+    deepStrictEqual(existsSync(`src/${key.slice(2, -3)}.ts`), true, key);
+  }
+  // Withheld on purpose: fs-modify is the filesystem-mutation boundary, and the rest are
+  // CLI-shaped modules with no callers outside this package.
+  for (const internal of ['./bismar.js', './diff.js', './fs-modify.js', './interactive.js'])
+    deepStrictEqual(internal in pkg.exports, false, internal);
 });
 
 it('bismar --help documents the single command, every flag and its alias', async () => {

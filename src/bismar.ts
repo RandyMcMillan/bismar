@@ -70,8 +70,9 @@ flags:
   -d, --diff    compare two packages recursively (refs, dirs, .tgz tarballs;
                 a dir vs a package is npm-packed first): navigator on a
                 terminal, unified diff piped; -ds file sizes, -dl names,
-                -db bundle text, -dbs bundle-size deltas (JS only; refs
-                may pick one module/export: -db npm:qr@0.6.0/index)
+                -db bundle text, -dbs unminified bundle-size deltas, -dbms
+                min+gzip ones (JS only; refs may pick one module/export:
+                -db npm:qr@0.6.0/index)
       --clear   remove every bismar cache (ref installs, extracts, archives)
 
 short flags combine: bismar -bm == bismar -b -m
@@ -226,11 +227,15 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
             outDir: tmp,
           }),
         ]);
-        const stat = diffBundleRows(aRows, bRows);
+        // -m splits the metric like the text modes: -dbs compares the plain
+        // bundles' bytes, -dbms the min+gzip a consumer actually ships.
+        const stat = diffBundleRows(aRows, bRows, args.minify ? 'gzBytes' : 'plainBytes');
         progressDone();
         if (!stat.entries.length)
           return console.log(`no bundle size changes: ${a.label} and ${b.label} measure identical`);
-        const lines = csvEnabled() ? bundleStatCsv(stat) : bundleStatHuman(stat, stdoutColor());
+        const lines = csvEnabled(undefined, opts.tty)
+          ? bundleStatCsv(stat)
+          : bundleStatHuman(stat, stdoutColor(undefined, opts.tty));
         return console.log(lines.join('\n'));
       }
       if (bundleDiff) {
@@ -249,14 +254,22 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           decoder.decode(bBytes),
           a.label,
           b.label,
-          stdoutColor()
+          stdoutColor(undefined, opts.tty)
         );
         return console.log(lines.join('\n'));
       }
-      const tree = diffTrees(a.dir, b.dir);
+      // A tail on one side mirrors onto the other: a one-file scope against a
+      // whole tree is never the comparison anyone means.
+      const tree = diffTrees(a.dir, b.dir, a.sel ?? b.sel, b.sel ?? a.sel);
       progressDone();
-      if (!tree.entries.length)
+      if (!tree.entries.length) {
+        // A scoped diff that matched nothing on either side is a typo'd
+        // path, not sameness; `same` counts scoped-but-unchanged files.
+        const sel = a.sel ?? b.sel;
+        if (sel && !tree.same)
+          err(`no shipped file matches /${sel} on either side; use -s to list files`);
         return console.log(`no differences: ${a.label} and ${b.label} ship identical files`);
+      }
       // Same split as the base command: a terminal gets the navigator, a pipe
       // gets text — the unified diff, or with -s the changed-file stat rows,
       // or with -l just the changed file names.
@@ -266,12 +279,12 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       }
       // Size stats already list every changed file, so -dls reads as -ds.
       const lines = args.size
-        ? csvEnabled()
+        ? csvEnabled(undefined, opts.tty)
           ? statCsv(tree)
-          : statHuman(tree, stdoutColor(), a, b)
+          : statHuman(tree, stdoutColor(undefined, opts.tty), a, b)
         : args.list
-          ? statNames(tree, stdoutColor())
-          : renderUnified(a.dir, b.dir, tree, stdoutColor());
+          ? statNames(tree, stdoutColor(undefined, opts.tty))
+          : renderUnified(a.dir, b.dir, tree, stdoutColor(undefined, opts.tty));
       return console.log(lines.join('\n'));
     } finally {
       rmTempDir(tmp);
@@ -295,7 +308,7 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     const tmp = tempDir('size');
     const cwd = opts.cwd ?? process.cwd();
     const selectors = args.paths.length ? args.paths : ['.'];
-    const csv = csvEnabled();
+    const csv = csvEnabled(undefined, opts.tty);
     try {
       for (const [i, sel] of selectors.entries()) {
         const file = explicitPath(sel) ? resolve(cwd, sel) : '';
@@ -304,13 +317,13 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           fileStat?.isFile() && !tarballSelector.test(sel)
             ? csv
               ? fileSizesCsv(file)
-              : fileSizesHuman(file, stdoutColor())
+              : fileSizesHuman(file, stdoutColor(undefined, opts.tty))
             : await (async (): Promise<string[]> => {
                 const sideDir = join(tmp, `listing-${i}`);
                 const side = packLocalSide(sideDir, await diffTarget(sideDir, sel, cwd));
                 return csv
                   ? sizesCsv(side.dir)
-                  : sizesHuman(side.dir, stdoutColor(), side.archiveBytes);
+                  : sizesHuman(side.dir, stdoutColor(undefined, opts.tty), side.archiveBytes);
               })();
         progressDone();
         if (i && !csv) console.log('');
@@ -339,10 +352,10 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
         const bytes = statSync(got.file).size;
         progressDone();
         console.log(
-          csvEnabled()
+          csvEnabled(undefined, opts.tty)
             ? csvRow([name, `${bytes}b`])
-            : paint(name, color.green, stdoutColor()) +
-                paint(`  ${fmtBytes(bytes)}`, color.dim, stdoutColor())
+            : paint(name, color.green, stdoutColor(undefined, opts.tty)) +
+                paint(`  ${fmtBytes(bytes)}`, color.dim, stdoutColor(undefined, opts.tty))
         );
       }
       if (js.length || !args.paths.length) await runSize({ cwd: opts.cwd, only: js, outDir: tmp });

@@ -26,7 +26,8 @@ process.env.npm_config_progress = 'false';
 process.env.npm_config_update_notifier = 'false';
 const { runCli: runBismar } = await import('../src/bismar.ts');
 const { npmInstall } = await import('../src/fs-modify.ts');
-const { runSize } = await import('../src/size.ts');
+const { foreignSelector } = await import('../src/refs.ts');
+const { measureRows, runSize } = await import('../src/size.ts');
 
 const fixture = (name: string) => join(ROOT, name);
 const cleanup = (cwd: string) => {
@@ -655,7 +656,7 @@ it('size command serves pinned ref sizes from the machine cache', async () => {
   deepStrictEqual(Array.isArray(parsed.sizes.rows['index/TSDocParser']), true);
   deepStrictEqual(typeof parsed.sizes.esbuild, 'string');
   // Poison the cached row; a warm run must serve it verbatim, without esbuild.
-  parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7];
+  parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7, 21];
   writeFileSync(db, JSON.stringify(parsed));
   const second = await capture(() => runBismar(argv, { color: false, cwd }));
   deepStrictEqual(second.ok, true, all(second));
@@ -673,7 +674,7 @@ it('size command serves pinned ref sizes from the machine cache', async () => {
   deepStrictEqual(rewritten.sizes.esbuild === '0.0.0', false);
   // Bundle emission never reads the poisoned cache — it needs real bytes.
   parsed.sizes.esbuild = rewritten.sizes.esbuild;
-  parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7];
+  parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7, 21];
   writeFileSync(db, JSON.stringify(parsed));
   // -b streams bytes through stdout.write, which capture() does not hook. tty is
   // pinned off: a terminal refuses the bytes and prints the stat row instead, so
@@ -925,4 +926,76 @@ it('npm install failures surface stderr with a stable prefix', async () => {
     rmSync(tmp, { force: true, recursive: true });
     rmSync(cache, { force: true, recursive: true });
   }
+});
+
+it('size rows carry the selector spellings they are addressed by', async () => {
+  const cwd = fixture('plain');
+  const rows = await measureRows({ cwd });
+  deepStrictEqual(
+    rows.map((row) => row.label),
+    ['@bismar-test/plain', 'index.js', 'index.js/add', 'index.js/blob']
+  );
+  // moduleLabel is that module's own whole-module row label: an export row differs from
+  // it by the `/name` suffix alone, so neither has to be sliced back out of the other.
+  deepStrictEqual(
+    rows.map((row) => row.moduleLabel),
+    ['@bismar-test/plain', 'index.js', 'index.js', 'index.js']
+  );
+  // The printed table and the reported row are one measurement, not two that agree by
+  // convention: a budget compared against gzBytes is comparing what `bismar -bs` shows.
+  const shown = await run(cwd, () => runBismar(['-bs'], { color: false, cwd }));
+  for (const row of rows) {
+    const exp = row.export === 'all' ? '' : row.export;
+    const line = `${row.module},${exp},${row.loc}loc,${row.minBytes}b,${row.gzBytes}b`;
+    deepStrictEqual(plain(shown).includes(line), true, `${line}\n${plain(shown)}`);
+  }
+  // Every label round-trips: handed back as a selector it measures that same bundle.
+  for (const row of rows) {
+    const back = await measureRows({ cwd, localOnly: true, only: [row.label], single: true });
+    deepStrictEqual(
+      back.map((item) => item.gzBytes),
+      [row.gzBytes],
+      row.label
+    );
+  }
+});
+
+it('measureRows owns its out dir and can narrow to the combined bundle', async () => {
+  const cwd = fixture('plain');
+  const owned = () =>
+    readdirSync(tmpdir())
+      .filter((name) => /^bismar-size-[A-Za-z0-9]{6}$/.test(name))
+      .sort();
+  const before = owned();
+  const gzOf = async (only: string[]) =>
+    (await measureRows({ cwd, localOnly: true, only, single: true }))[0];
+  const combined = await gzOf(['index.js/add', 'index.js/blob']);
+  // `single` keeps the bismar-made combined row and drops the per-selector ones.
+  deepStrictEqual(combined.label, 'selection');
+  const [add, blob] = await Promise.all([gzOf(['index.js/add']), gzOf(['index.js/blob'])]);
+  // Imported together they share code: dearer than either alone, cheaper than the sum.
+  const sizes = `${combined.gzBytes} vs ${add.gzBytes} + ${blob.gzBytes}`;
+  deepStrictEqual(combined.gzBytes > Math.max(add.gzBytes, blob.gzBytes), true, sizes);
+  deepStrictEqual(combined.gzBytes < add.gzBytes + blob.gzBytes, true, sizes);
+  // None of those calls was given an outDir, so every dir they allocated is gone again.
+  deepStrictEqual(owned(), before);
+});
+
+it('foreignSelector marks selectors that name another package', () => {
+  const pkg = '@bismar-test/plain';
+  const cases: [string, boolean][] = [
+    ['index.js', false],
+    ['index.js/add', false],
+    [pkg, false],
+    [`${pkg}/sub.js`, false],
+    ['npm:qr', true],
+    ['jsr:@std/bytes', true],
+    ['@other/pkg', true],
+    // Near-misses on the package name are still other packages.
+    ['@bismar-test/plainer', true],
+    // Bare names stay ambiguous on purpose: spelling alone cannot separate a local
+    // module from a foreign package, so resolution decides and this keeps quiet.
+    ['lodash', false],
+  ];
+  for (const [raw, expected] of cases) deepStrictEqual(foreignSelector(raw, pkg), expected, raw);
 });

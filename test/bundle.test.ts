@@ -356,6 +356,9 @@ it('bundle --clear wipes bismar tmp caches, reports stats, runs alone', async ()
 it('fs-modify npm install prefers offline packages, skips audit/fund', () => {
   deepStrictEqual(FS_TEST.npmInstallArgs(), [
     'install',
+    // Platform-foreign packages (os/cpu fields) must stay installable: bismar
+    // inspects and measures, never runs, what lands in its temp dirs.
+    '--force',
     '--prefer-offline',
     '--ignore-scripts',
     '--no-package-lock',

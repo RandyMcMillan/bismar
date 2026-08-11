@@ -176,7 +176,11 @@ export type PublicEntry = { jsRel: string; key: string; spec: string; value: unk
 export type PublicMod = { dtsFile: string; jsFile: string; key: string; spec: string };
 export type PublicRow<T extends object = {}> = PublicMod & { file: string } & T;
 
-export const readPkg = (pkgFile: string): Pkg => {
+// `entryOptional` serves the consumers that never resolve code — tree diffs,
+// shipped-size listings — where a package with no JS entry at all (npm binary
+// packages like @esbuild/darwin-arm64 ship only os/cpu fields) is still a
+// perfectly good file tree; they get an empty exports map instead of an error.
+export const readPkg = (pkgFile: string, entryOptional = false): Pkg => {
   const raw = ((): RawPkg => {
     try {
       return readJson<RawPkg>(pkgFile);
@@ -206,6 +210,7 @@ export const readPkg = (pkgFile: string): Pkg => {
     if (entry) exports = { '.': entry };
     // No entry fields at all: node's legacy resolution defaults to ./index.js (express).
     else if (existsSync(resolve(dirname(pkgFile), 'index.js'))) exports = { '.': './index.js' };
+    else if (entryOptional) exports = {};
     else err(`missing exports or main/module entry in ${pkgFile}`);
     self = false;
   }

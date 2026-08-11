@@ -1,5 +1,7 @@
-import { deepStrictEqual } from 'node:assert';
-import { resolve } from 'node:path';
+import { deepStrictEqual, throws } from 'node:assert';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 // The progress test asserts plain stderr text; pin machine mode for standalone runs.
 process.env.NO_COLOR = '1';
@@ -80,6 +82,26 @@ it('readPkg normalizes export maps and legacy package entries', () => {
     version: '1.0.0',
   });
   deepStrictEqual(readPkg(resolve('test/vectors/jsr-src/package.json')).self, true);
+});
+
+it('readPkg tolerates entryless binary packages only when asked', () => {
+  // npm binary packages (@esbuild/darwin-arm64) ship no exports/main/index.js;
+  // file-tree consumers (diff, shipped sizes) read them with entryOptional.
+  const dir = mkdtempSync(join(tmpdir(), 'bismar-pubtest-'));
+  try {
+    const pkgFile = join(dir, 'package.json');
+    writeFileSync(pkgFile, JSON.stringify({ name: 'bin-only', version: '1.0.0' }));
+    throws(() => readPkg(pkgFile), /missing exports or main\/module entry/);
+    deepStrictEqual(readPkg(pkgFile, true), {
+      exports: {},
+      name: 'bin-only',
+      self: false,
+      types: '',
+      version: '1.0.0',
+    });
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
 });
 
 it('publicEntries lists sorted public JS export entries with package specs', () => {

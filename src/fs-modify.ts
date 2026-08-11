@@ -21,8 +21,13 @@ import { inflateRawSync } from 'node:zlib';
 const EXTS = ['.cjs', '.js', '.json', '.mjs', '.ts', '.crate', '.gem', '.gz', '.zip', '.whl'];
 // Never lifecycle scripts or lockfiles: installs land in throwaway bismar temp dirs.
 // Audit and funding checks are extra registry roundtrips with no reader here.
+// --force waives npm's os/cpu gate (EBADPLATFORM): these installs only feed
+// inspection and measurement, never execution, so a foreign-platform binary
+// package — `bismar -d npm:@esbuild/darwin-arm64@0.28.{1,2}` from linux — is
+// as diffable as any other.
 const NPM_INSTALL_ARGS = [
   'install',
+  '--force',
   '--prefer-offline',
   '--ignore-scripts',
   '--no-package-lock',

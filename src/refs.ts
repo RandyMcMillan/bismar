@@ -169,7 +169,8 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
   if (!pinned) {
     // The floating spec just resolved; remember the answer and promote the fresh
     // install into the machine cache so the pinned path is warm for 15 minutes.
-    const got = readPkg(installedAt(dir, ref)).version;
+    // Only the version matters here; entryless binary packages must still pin.
+    const got = readPkg(installedAt(dir, ref), true).version;
     if (PINNED.test(got)) {
       writeVersionTag(ref.label, got);
       const target = pinnedDirOf(ref, got);
@@ -206,6 +207,16 @@ export const noPkgErr = (raw: string, baseDir: string): never => {
 export const explicitRef = (raw: string): boolean =>
   raw.startsWith('npm:') || raw.startsWith('jsr:');
 export const asRef = (raw: string): string => (explicitRef(raw) ? raw : `npm:${raw}`);
+// Does this selector explicitly name a package other than `pkgName`? A `npm:`/`jsr:`
+// prefix says so outright, and a scoped name says so by shape — `@scope/name` can only be
+// a package id. Everything else is left alone on purpose: `lodash` and `sha2.js` are told
+// apart by resolution, not by spelling, so a bare name that turns out to be foreign
+// surfaces as an unknown-module error with the local list attached (or, without
+// `localOnly`, resolves as an implicit npm ref). Pure and package-read-free, so a caller
+// holding a config file — `sizeLimits` keys in jsbt-check — can reject an entry that
+// budgets someone else's package before paying for a measuring run.
+export const foreignSelector = (raw: string, pkgName: string): boolean =>
+  explicitRef(raw) || (raw.startsWith('@') && raw !== pkgName && !raw.startsWith(`${pkgName}/`));
 // Pinned ref installs are immutable, so both their export enumeration and their
 // measured sizes cache alongside them (`bismar.db.json`): a warm `--list` skips
 // enumeration, and a warm `-bs` skips esbuild entirely. Sizes are keyed by the
@@ -214,7 +225,9 @@ export const asRef = (raw: string): string => (explicitRef(raw) ? raw : `npm:${r
 const REF_DB = 'bismar.db.json';
 export type RefDbMod = { exports: string[]; file: string; module: string };
 // rows: unbranded `module/export` id -> [loc, minified bytes, gzipped bytes].
-export type RefDbSizes = { esbuild: string; rows: Record<string, [number, number, number]> };
+// Row shape: [loc, minBytes, gzBytes, plainBytes]. Readers treat shorter rows
+// (written before plainBytes existed) as cache misses.
+export type RefDbSizes = { esbuild: string; rows: Record<string, number[]> };
 export type RefDb = { modules?: RefDbMod[]; sizes?: RefDbSizes; v?: number };
 // Uncached on purpose: files are tiny, and rereading keeps long interactive
 // sessions honest about what other processes wrote. Hot loops read once per dir.
@@ -250,13 +263,15 @@ export const saveRefDb = (refDir: string, patch: Partial<RefDb>): void =>
 const refLabel = (ref: ExternalRef, pkg: Pkg): string =>
   ref.version || !pkg.version ? ref.label : `${ref.jsr ? 'jsr:' : ''}${ref.bare}@${pkg.version}`;
 // Install a ref and locate its package: the shared setup for listing and measuring.
+// `entryOptional` rides through to readPkg for callers that only read files.
 export const installedRef = (
   outDir: string,
-  ref: ExternalRef
+  ref: ExternalRef,
+  entryOptional = false
 ): { label: string; pkg: Pkg; pkgDir: string; pkgFile: string; refDir: string } => {
   const refDir = installRef(outDir, ref);
   const pkgFile = installedAt(refDir, ref);
-  const pkg = readPkg(pkgFile);
+  const pkg = readPkg(pkgFile, entryOptional);
   return { label: refLabel(ref, pkg), pkg, pkgDir: dirname(pkgFile), pkgFile, refDir };
 };
 // Selector-form id for a ref module: the pinned label (`qr@0.6.0`) rides along

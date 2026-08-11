@@ -2,8 +2,9 @@
 The measurement engine: packs a package, module, export, npm ref, or lone file
 into single-file IIFE bundles via esbuild — fully in-memory — and reports
 min+gzip sizes (`runSize`) or selectable ids (`--list`). Never touches
-test/build and never installs the target project; only npm ref installs
-(`refs.ts`) touch the filesystem.
+test/build and never installs the target project; the only filesystem writes are
+npm ref installs (`refs.ts`) and, when a caller supplies no `outDir`, allocating
+and removing the bismar temp dir those installs live in (`fs-modify.ts`).
 @module
  */
 import { createHash } from 'node:crypto';
@@ -23,6 +24,7 @@ import {
   progressUpdate,
   stdoutColor,
 } from './env.ts';
+import { rmTempDir, tempDir } from './fs-modify.ts';
 import {
   bad,
   err,
@@ -584,21 +586,34 @@ const buildCase = async (
   ]);
   return { ...item, min, plain };
 };
+// `module`/`export` are the internal ids; `label`/`moduleLabel` are the selector
+// spellings the same row is addressed by (`sha2.js/sha256` and `sha2.js`). Both labels
+// ride along rather than being derived downstream: recovering one from the other means
+// reproducing `lineLabel`'s file-flavoring and `all`-collapsing rules in every consumer.
+// `gzBytes` is level 9 — the number the table prints, so a budget compared against it
+// matches what `bismar -bs` reports without the comparer re-gzipping.
 export type RowData = {
   export: string;
   gzBytes: number;
+  label: string;
   loc: number;
   minBytes: number;
   module: string;
+  moduleLabel: string;
+  // The unminified bundle's bytes: what `-dbs` (no -m) compares.
+  plainBytes: number;
 };
-const rowData = (item: Item, out: Built): RowData => {
+const rowData = (item: Item, out: Built, modFile: Map<string, string>): RowData => {
   const gz = gzipSync(out.min, { level: 9 });
   return {
     export: item.export,
     gzBytes: gz.length,
+    label: lineLabel(modFile, item.module, item.export),
     loc: decoder.decode(out.plain).split('\n').length,
     minBytes: out.min.length,
     module: item.module,
+    moduleLabel: moduleLabel(modFile, item.module),
+    plainBytes: out.plain.length,
   };
 };
 // The whole-module row carries no export token at all: bare `sha3.js` (or the bare
@@ -636,17 +651,16 @@ const unknownErr = (
       ids.length ? `${use}\n${listLines(ids, leaf)}` : 'use --list to see modules and exports'
     }`
   );
+// The file-flavored module part of a label (`sha2.js`), which is also the whole-module
+// row's own label: an export row and its module row differ only by the `/name` suffix.
+const moduleLabel = (modFile: Map<string, string>, module: string): string =>
+  modFile.get(module) || module;
 const lineLabel = (modFile: Map<string, string>, module: string, exp: string): string => {
-  const mod = modFile.get(module) || module;
+  const mod = moduleLabel(modFile, module);
   return exp && exp !== ALL ? `${mod}/${exp}` : mod;
 };
-const sizeLine = (
-  data: RowData,
-  modFile: Map<string, string>,
-  width: number,
-  on: boolean
-): string => {
-  const plain = lineLabel(modFile, data.module, data.export);
+const sizeLine = (data: RowData, width: number, on: boolean): string => {
+  const plain = data.label;
   // The combined multi-selector row is bismar-made, not a selectable module: pink, not yellow.
   const painted =
     data.module === 'selection'
@@ -793,9 +807,16 @@ export type SizeOpts = {
   cwd?: string;
   input?: string;
   listOnly?: boolean;
-  // Selectors are local-by-contract (jsbt-check sizeLimits): never fall back to npm.
+  // Selectors are local-by-contract (jsbt-check sizeLimits): never fall back to npm, and
+  // never take file semantics. This suppresses the fallback; it does not reject a foreign
+  // selector up front — `foreignSelector` (refs.ts) is the pure check for that.
   localOnly?: boolean;
-  onBuilt?: (bundle: Built, meta: { id: string; label: string; name: string }) => void;
+  // Fires with the bundle bytes themselves. Wanting a *number* is not a reason to reach
+  // for this: sizes live on RowData, and forcing a build to get them defeats the ref cache.
+  onBuilt?: (
+    bundle: Built,
+    meta: { id: string; label: string; moduleLabel: string; name: string }
+  ) => void;
   // Diagnostic notes (unresolvable imports, node-condition retries), deduped per run;
   // default is stderr. Interactive mode overrides it: a stray stderr line would
   // scroll the alternate screen.
@@ -803,11 +824,16 @@ export type SizeOpts = {
   // Fires per measured row, cached or built; unlike onBuilt it never forces a build.
   onRow?: (data: RowData) => void;
   only?: string[];
-  outDir: string;
+  // Scratch space for ref installs and esbuild work dirs. Omit it and a bismar temp dir
+  // is allocated for the call and removed when it returns; pass one to share it across
+  // several calls (the CLI and the navigator both keep a session-wide dir).
+  outDir?: string;
   silent?: boolean;
   single?: boolean;
 };
-export const runSize = async (opts: SizeOpts): Promise<void> => {
+// The measurement engine proper: every path below reads `opts.outDir` as a given.
+// Allocating it is `runSize`'s job, so the engine has one less optional to thread.
+const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => {
   let only = [...(opts.only ?? [])];
   const baseDir = resolve(opts.cwd ?? process.cwd());
   let input = opts.input;
@@ -1239,19 +1265,24 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     const sizes = sizesByDir.get(item.cacheDir);
     if (!sizes || sizes.esbuild !== buildVersion()) return undefined;
     const hit = sizes.rows[item.cacheKey];
-    if (!hit) return undefined;
+    // Three-element rows predate plainBytes; treat them as misses so a stale
+    // cache rebuilds instead of reporting an undefined size.
+    if (!hit || hit.length < 4) return undefined;
     return {
       export: item.export,
       gzBytes: hit[2],
+      label: lineLabel(modFile, item.module, item.export),
       loc: hit[0],
       minBytes: hit[1],
       module: item.module,
+      moduleLabel: moduleLabel(modFile, item.module),
+      plainBytes: hit[3],
     };
   };
   // Builds run BUILD_POOL-wide while results are consumed — printed, cached,
   // reported — strictly in input order.
   const limit = makeLimit(BUILD_POOL);
-  const dirty = new Map<string, Record<string, [number, number, number]>>();
+  const dirty = new Map<string, Record<string, [number, number, number, number]>>();
   // Run-wide note sink: dedupes repeats before they reach stderr (or the caller).
   const noted = new Set<string>();
   const note = (text: string): void => {
@@ -1301,14 +1332,16 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
         });
         opts.onBuilt?.(out, {
           id: itemId(ctx.pkg, item),
-          // Selector-spelling label (`index.js`, `sha2.js/sha256`), as accepted by `only`.
+          // Selector-spelling label (`index.js`, `sha2.js/sha256`), as accepted by `only`,
+          // and the module part alone — the same pair `RowData` carries.
           label: lineLabel(modFile, item.module, item.export),
+          moduleLabel: moduleLabel(modFile, item.module),
           name: outPath(ctx.pkg, item, 'js'),
         });
-        if (show || opts.onRow || item.cacheDir) data = rowData(item, out);
+        if (show || opts.onRow || item.cacheDir) data = rowData(item, out, modFile);
         if (data && item.cacheDir && item.cacheKey) {
           const rows = dirty.get(item.cacheDir) ?? {};
-          rows[item.cacheKey] = [data.loc, data.minBytes, data.gzBytes];
+          rows[item.cacheKey] = [data.loc, data.minBytes, data.gzBytes, data.plainBytes];
           dirty.set(item.cacheDir, rows);
         }
       }
@@ -1330,7 +1363,7 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
   if (show && results.length) {
     for (const data of results) {
       if (csv) console.log(csvRow(csvCells(data)));
-      else console.log(sizeLine(data, modFile, labelWidth, colorOn));
+      else console.log(sizeLine(data, labelWidth, colorOn));
     }
     // CSV stays rows-only: the footer is a human summary, not another record.
     if (!csv && pkgSizes) {
@@ -1345,11 +1378,24 @@ export const runSize = async (opts: SizeOpts): Promise<void> => {
     }
   }
 };
+export const runSize = async (opts: SizeOpts): Promise<void> => {
+  // A caller-supplied dir is the caller's to clean, and sharing one across calls is why
+  // the option exists (the CLI and the navigator both do). Only a dir we allocated is
+  // ours to remove — unpinned ref installs land under it, so that removal is the point.
+  if (opts.outDir) return runSizeIn({ ...opts, outDir: opts.outDir });
+  const owned = tempDir('size');
+  try {
+    await runSizeIn({ ...opts, outDir: owned });
+  } finally {
+    rmTempDir(owned);
+  }
+};
 // Collect the existing measurement engine's rows without printing them. Diff
 // modes use this wrapper so enumeration, bundling, gzip, and pinned-ref caching
-// remain one implementation.
+// remain one implementation. `single` narrows a multi-selector run to the combined
+// bundle alone — the cost of importing those selectors together, measured once.
 export const measureRows = async (
-  opts: Pick<SizeOpts, 'cacheDir' | 'cwd' | 'only' | 'outDir'>
+  opts: Pick<SizeOpts, 'cacheDir' | 'cwd' | 'localOnly' | 'onNote' | 'only' | 'outDir' | 'single'>
 ): Promise<RowData[]> => {
   const rows: RowData[] = [];
   await runSize({

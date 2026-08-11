@@ -17,6 +17,7 @@ const {
   diffLines,
   diffTarget,
   diffTrees,
+  fileDiffLines,
   hunksOf,
   measuredSide,
   packLocalSides,
@@ -94,18 +95,17 @@ it('hunksOf groups changes with context and 1-based line numbers', () => {
 });
 
 it('bundle stat rows join, sort, and render deterministic deltas', () => {
-  const stat = diffBundleRows(
-    [
-      { export: 'gone', gzBytes: 716, module: 'z' },
-      { export: 'same', gzBytes: 409, module: 'a' },
-      { export: 'changed', gzBytes: 512, module: 'a' },
-    ],
-    [
-      { export: 'new', gzBytes: 614, module: 'b' },
-      { export: 'changed', gzBytes: 563, module: 'a' },
-      { export: 'same', gzBytes: 409, module: 'a' },
-    ]
-  );
+  const aRows = [
+    { export: 'gone', gzBytes: 716, module: 'z', plainBytes: 2100 },
+    { export: 'same', gzBytes: 409, module: 'a', plainBytes: 1200 },
+    { export: 'changed', gzBytes: 512, module: 'a', plainBytes: 1500 },
+  ];
+  const bRows = [
+    { export: 'new', gzBytes: 614, module: 'b', plainBytes: 1800 },
+    { export: 'changed', gzBytes: 563, module: 'a', plainBytes: 1650 },
+    { export: 'same', gzBytes: 409, module: 'a', plainBytes: 1200 },
+  ];
+  const stat = diffBundleRows(aRows, bRows);
   deepStrictEqual(
     stat.entries.map((entry) => `${entry.status} ${entry.module}/${entry.export}`),
     ['modified a/changed', 'added b/new', 'removed z/gone']
@@ -119,13 +119,32 @@ it('bundle stat rows join, sort, and render deterministic deltas', () => {
   // -ds's dress: A/M/D marks, modified rows pair a → b with the delta,
   // single-sided rows sign their whole size.
   const human = bundleStatHuman(stat, false).join('\n');
-  match(human, /M a\/changed {2}0\.50kb → 0\.55kb \(\+0\.05kb\) gzip/);
+  match(human, /M a\/changed {2}0\.50 → 0\.55kb \(\+10%\) gzip/);
   match(human, /A b\/new {2}\+0\.60kb gzip/);
   match(human, /D z\/gone {2}-0\.70kb gzip/);
   match(
     bundleStatHuman(stat, false).at(-1)!,
     /3 exports changed: 1 added, 1 removed, 1 modified · 1 unchanged/
   );
+  // The plain metric reports and compares plainBytes; rows carry no suffix.
+  const plainStat = diffBundleRows(aRows, bRows, 'plainBytes');
+  deepStrictEqual(bundleStatCsv(plainStat), [
+    'M,a,changed,1500b,1650b,+150b',
+    'A,b,new,0b,1800b,+1800b',
+    'D,z,gone,2100b,0b,-2100b',
+  ]);
+  match(
+    bundleStatHuman(plainStat, false).join('\n'),
+    /M a\/changed {2}1\.46 → 1\.61kb \(\+10%\)$/m
+  );
+  // "Changed" follows the metric: equal gzip with differing plain bytes is a
+  // modification under the plain metric and unchanged under gzip.
+  const gzTie = diffBundleRows(
+    [{ export: 'x', gzBytes: 100, module: 'm', plainBytes: 400 }],
+    [{ export: 'x', gzBytes: 100, module: 'm', plainBytes: 410 }],
+    'plainBytes'
+  );
+  deepStrictEqual([gzTie.entries.length, gzTie.same], [1, 0]);
 });
 
 it('diffTrees classifies files and skips dev trees and symlinks', () => {
@@ -142,10 +161,38 @@ it('bismar -d prints a unified diff off a terminal', async () => {
   const out = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
   match(out, /diff --bismar a\/mod\.txt b\/mod\.txt/);
   match(out, /--- a\/mod\.txt\n\+\+\+ b\/mod\.txt\n@@ -1,3 \+1,3 @@\n one\n-two\n\+2\n three/);
-  // Added and removed files diff against /dev/null; binary ones say so.
+  // Added and removed files diff against /dev/null; small modified binaries
+  // diff as xxd-style rows through the same hunk machinery.
   match(out, /--- \/dev\/null\n\+\+\+ b\/new\.txt\n@@ -0,0 \+1,1 @@\n\+fresh/);
   match(out, /--- a\/gone\.txt\n\+\+\+ \/dev\/null\n@@ -1,1 \+0,0 @@\n-bye/);
-  match(out, /Binary files a\/blob\.bin and b\/blob\.bin differ/);
+  match(
+    out,
+    /--- a\/blob\.bin\n\+\+\+ b\/blob\.bin\n@@ -1,1 \+1,1 @@\n-00 01 02 +\|\.\.\.\|\n\+00 09 02 +\|\.\.\.\|/
+  );
+});
+
+it('binary diffs hexdump small files and summarize big ones', () => {
+  // Above the 64KB cap a dump would be noise; the one-liner gets the first
+  // mismatch offset and an equal-at-offset percentage instead.
+  const big = new Uint8Array(70000);
+  const changed = big.slice();
+  changed[7000] = 1;
+  put('biga/huge.bin', big);
+  put('bigb/huge.bin', changed);
+  const entry = { aBytes: 70000, bBytes: 70000, path: 'huge.bin', status: 'modified' } as const;
+  const lines = fileDiffLines(join(base, 'biga'), join(base, 'bigb'), entry, false);
+  deepStrictEqual(lines, [
+    'diff --bismar a/huge.bin b/huge.bin',
+    'Binary files a/huge.bin and b/huge.bin differ (68.4 → 68.4kb)',
+    'first change at byte 7000, 99% of bytes match',
+  ]);
+  // Added/removed binaries keep the bare one-liner: a hexdump against
+  // /dev/null is noise and the summary would always read "byte 0, 0%".
+  const gone = { aBytes: 70000, bBytes: 0, path: 'huge.bin', status: 'removed' } as const;
+  deepStrictEqual(
+    fileDiffLines(join(base, 'biga'), join(base, 'bigb'), gone, false)[1],
+    'Binary files a/huge.bin and b/huge.bin differ (68.4 → 0.00kb)'
+  );
 });
 
 it('bismar -ds prints stat rows: CSV piped, painted table for humans', async () => {
@@ -159,10 +206,10 @@ it('bismar -ds prints stat rows: CSV piped, painted table for humans', async () 
   // whole-tree sizes in the same a → b (±delta) shape as the modified rows.
   const tree = diffTrees(join(base, 'a'), join(base, 'b'));
   const human = statHuman(tree, false);
-  match(human.join('\n'), /M mod\.txt {2}0\.01kb → 0\.01kb \(-0\.00kb\)/);
+  match(human.join('\n'), /M mod\.txt {2}0\.01 → 0\.01kb \(-14%\)/);
   match(
     human.join('\n'),
-    /4 files changed: 1 added, 1 removed, 2 modified · 2 unchanged\n0\.03kb → 0\.03kb \(\+0\.00kb\) unpacked$/
+    /4 files changed: 1 added, 1 removed, 2 modified · 2 unchanged\n0\.03 → 0\.03kb \(~0%\) unpacked$/
   );
   // Registry sides carry packed archive bytes; both known appends the packed
   // tail, either missing (a local directory) leaves it off.
@@ -170,11 +217,8 @@ it('bismar -ds prints stat rows: CSV piped, painted table for humans', async () 
     { archiveBytes: 1024, dir: '', label: '' },
     { archiveBytes: 2048, dir: '', label: '' },
   ];
-  match(statSummary(tree, a, b)[1], / unpacked · 1\.00kb → 2\.00kb \(\+1\.00kb\) packed$/);
-  match(
-    statSummary(tree, { dir: '', label: '' }, b)[1],
-    /^0\.03kb → 0\.03kb \(\+0\.00kb\) unpacked$/
-  );
+  match(statSummary(tree, a, b)[1], / unpacked · 1\.00 → 2\.00kb \(\+100%\) packed$/);
+  match(statSummary(tree, { dir: '', label: '' }, b)[1], /^0\.03 → 0\.03kb \(~0%\) unpacked$/);
 });
 
 it('bismar -dl prints just the changed file names, even on a terminal', async () => {
@@ -190,9 +234,13 @@ it('a piped diff stays plain while stderr keeps its terminal', async () => {
   // `bismar -d … | less`: stdout is the pipe the diff lands on, stderr stays on
   // the terminal for progress lines and warnings. Only stdout may decide the
   // color, or the pager renders raw escapes.
-  const noColor = process.env.NO_COLOR;
+  // Force flags beat the tty check, so the ambient shell must not leak in:
+  // macOS profiles commonly export CLICOLOR_FORCE/CLICOLOR, which would paint
+  // the "plain" run. Pin every env var wantColor reads, not just NO_COLOR.
+  const colorVars = ['NO_COLOR', 'FORCE_COLOR', 'CLICOLOR_FORCE', 'CLICOLOR'] as const;
+  const saved = colorVars.map((name) => [name, process.env[name]] as const);
   const stderrTty = process.stderr.isTTY;
-  delete process.env.NO_COLOR;
+  for (const name of colorVars) delete process.env[name];
   process.stderr.isTTY = true;
   try {
     const out = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
@@ -203,10 +251,11 @@ it('a piped diff stays plain while stderr keeps its terminal', async () => {
     const forced = await capture(() => runCli(['-d', './a', './b'], { cwd: base, tty: false }));
     deepStrictEqual(/\x1b\[31m-two/.test(forced), true, JSON.stringify(forced));
   } finally {
-    delete process.env.FORCE_COLOR;
     process.stderr.isTTY = stderrTty;
-    if (noColor === undefined) delete process.env.NO_COLOR;
-    else process.env.NO_COLOR = noColor;
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
@@ -229,11 +278,18 @@ it('-db diffs bundle text and -dbs reports per-export size deltas', async () => 
   match(min, /\+var bismarTestDocumented=/);
   deepStrictEqual(await capture(() => runCli(['-dbm', a, b], { tty: false })), min);
 
+  // -dbs compares the plain bundles' bytes; adding -m switches the metric to
+  // min+gzip. The plain `all` bundles differ by kilobytes (the blob export
+  // exists on one side only), so the M row is stable in both metrics.
   const stat = await capture(() => runCli(['-dbs', a, b], { tty: false }));
   match(stat, /^A,@bismar-test\/documented,,0b,\d+b,\+\d+b$/m);
   match(stat, /^D,@bismar-test\/plain,,\d+b,0b,-\d+b$/m);
-  match(stat, /^M,index,add,\d+b,\d+b,[+-]\d+b$/m);
-  deepStrictEqual(await capture(() => runCli(['-dbms', a, b], { tty: false })), stat);
+  match(stat, /^M,index,all,\d+b,\d+b,-\d+b$/m);
+  const gzStat = await capture(() => runCli(['-dbms', a, b], { tty: false }));
+  match(gzStat, /^M,index,all,\d+b,\d+b,-\d+b$/m);
+  // Different metrics, different numbers: plain bytes dwarf min+gzip.
+  const allBytes = (out: string): number => Number(/^M,index,all,(\d+)b/m.exec(out)![1]);
+  ok(allBytes(stat) > allBytes(gzStat), `${allBytes(stat)} vs ${allBytes(gzStat)}`);
 
   const sameText = await capture(() => runCli(['-db', a, a], { tty: false }));
   deepStrictEqual(sameText, `no bundle changes: ${a} and ${a} bundle identical\n`);
@@ -330,15 +386,25 @@ it('tarball selectors extract; a local dir against a package npm-packs first', a
   );
 });
 
-it('ref selections pass through to bundle modes and stay rejected in tree modes', async () => {
-  // Tree modes: the whole-package rule holds, and the error precedes any install.
-  await rejects(
-    () => diffTarget(base, 'npm:qr@0.6.0/index', base),
-    /--diff compares whole packages; drop \/index from npm:qr@0\.6\.0\/index/
+it('ref /path tails scope tree diffs to a shipped file or subtree', () => {
+  // An exact file tail: one row, totals weigh the scope — not the package.
+  const one = diffTrees(join(base, 'a'), join(base, 'b'), 'mod.txt', 'mod.txt');
+  deepStrictEqual(
+    one.entries.map((entry) => entry.path),
+    ['mod.txt']
   );
-  await rejects(
-    () => runCli(['-ds', 'npm:qr@0.5.0/index', 'npm:qr@0.6.0/index'], { tty: false }),
-    /--diff compares whole packages; drop \/index/
+  deepStrictEqual([one.same, one.aTotal, one.bTotal], [0, 14, 12]);
+  // A directory tail takes the subtree; unchanged files still count as same,
+  // which is what separates "identical within scope" from "matched nothing".
+  const sub = diffTrees(join(base, 'a'), join(base, 'b'), 'sub', 'sub');
+  deepStrictEqual([sub.entries.length, sub.same], [0, 1]);
+  // A tail matching neither side yields the empty tree the CLI errors on.
+  const none = diffTrees(join(base, 'a'), join(base, 'b'), 'nope.js', 'nope.js');
+  deepStrictEqual([none.entries.length, none.same], [0, 0]);
+  // Scoped tables drop the two-line footer — it would just restate the rows.
+  deepStrictEqual(
+    statHuman(one, false, { dir: '', label: '', sel: 'mod.txt' }, { dir: '', label: '' }),
+    ['M mod.txt  0.01 → 0.01kb (-14%)']
   );
 });
 
@@ -394,10 +460,6 @@ it('bismar -d validates its arguments', async () => {
     () => runCli(['-d', '@noble/hashes@1.8.0', './a'], { cwd: base, tty: false }),
     /--diff expects package refs or directories, not @noble\/hashes@1\.8\.0; use npm:@noble\/hashes@1\.8\.0/
   );
-  await rejects(
-    () => runCli(['-d', 'npm:qr@0.6.0/index', './a'], { cwd: base, tty: false }),
-    /--diff compares whole packages; drop \/index from npm:qr@0\.6\.0\/index/
-  );
 });
 
 // Strips colors and control sequences (clear, home, alternate screen).
@@ -428,8 +490,11 @@ it('diff navigator lists changed files and pages through a line diff', async () 
   input.write('qq');
   await done;
   const text = strip(raw);
-  match(text, /\.\/a → \.\/b · diff · 4 files changed/);
-  match(text, /M mod\.txt {2}0\.01kb → 0\.01kb \(-0\.00kb\)/);
+  // The summary is a footer in -ds's shape — counts, then sizes — between the
+  // file list and the key bar; the title row carries only labels and mode.
+  match(text, /\.\/a → \.\/b · diff[^\n]*\n[^\n]*\n[^\n]*M blob\.bin/);
+  match(text, /4 files changed[^\n]*\n0\.03 → 0\.03kb \(~0%\) unpacked[^\n]*\n↑↓ move/);
+  match(text, /M mod\.txt {2}0\.01 → 0\.01kb \(-14%\)/);
   match(text, /A new\.txt {2}\+0\.01kb/);
   match(text, /@@ -1,3 \+1,3 @@/);
   match(text, /-two/);

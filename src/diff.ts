@@ -30,8 +30,8 @@ export type DiffSide = {
   dir: string;
   label: string;
   localDir?: boolean;
-  // Bundle modes only: the `/module/export` tail of a ref selector, scoping
-  // what that side measures/builds. Tree modes reject paths outright.
+  // The `/path` tail of a ref selector: bundle modes measure/build that
+  // module or export; tree modes compare just that shipped file or subtree.
   sel?: string;
   // The archive an extracted side came from; measuredSide installs from it.
   tarball?: string;
@@ -54,9 +54,9 @@ const extractedTgz = (outDir: string, file: string, label: string): DiffSide => 
 // Resolve one diff selector to a directory: registry refs fetch + extract,
 // npm/jsr refs install, tarballs extract, explicit paths mean the disk. Bare
 // names never imply npm, same as everywhere else in the selector grammar.
-// `bundle` marks the measured modes (-db/-dbm/-dbs): only they accept a
-// `/module/export` tail on a ref — a file-tree diff of one export means
-// nothing, but a bundle diff of one is as real as `bismar -b ref/mod/exp`.
+// A `/path` tail on a ref scopes the diff. `bundle` marks the measured modes
+// (-db/-dbm/-dbs), where the tail selects a module/export to build; in tree
+// modes it names a shipped file or subtree (`-ds npm:qr@0.5/dom.js`).
 export const diffTarget = async (
   outDir: string,
   raw: string,
@@ -80,9 +80,10 @@ export const diffTarget = async (
   }
   if (explicitRef(raw)) {
     const ref = parseNpmRef(asRef(raw));
-    if (ref.path && !bundle)
-      err(`--diff compares whole packages; drop /${ref.path} from ${bad(raw)}`);
-    const got = installedRef(outDir, ref);
+    // Tree modes only walk files, so packages with no JS entry (binary
+    // packages: os/cpu fields, no exports/main) stay diffable; bundle modes
+    // keep the strict read — they are about to resolve that entry.
+    const got = installedRef(outDir, ref, !bundle);
     // Packed-tarball garnish for the footer: one cached metadata + HEAD
     // round-trip per pinned version, quiet on any failure — never an error.
     const archiveBytes = await jsHitStats(ref.jsr ? 'jsr:' : 'npm:', {
@@ -170,9 +171,19 @@ export const walkFiles = (root: string): Map<string, number> => {
   walk(root, '', out);
   return out;
 };
-export const diffTrees = (aDir: string, bDir: string): TreeDiff => {
-  const a = walkFiles(aDir);
-  const b = walkFiles(bDir);
+// A `/path` ref tail scopes a side's walk: the exact shipped file, or a
+// directory's whole subtree. Filtering the maps (not the merged entries)
+// keeps the footer totals honest — they weigh the scope, not the package.
+const scoped = (files: Map<string, number>, sel?: string): Map<string, number> => {
+  if (!sel) return files;
+  const dir = `${sel.replace(/\/+$/, '')}/`;
+  const out = new Map<string, number>();
+  for (const [path, bytes] of files) if (path === sel || path.startsWith(dir)) out.set(path, bytes);
+  return out;
+};
+export const diffTrees = (aDir: string, bDir: string, aSel?: string, bSel?: string): TreeDiff => {
+  const a = scoped(walkFiles(aDir), aSel);
+  const b = scoped(walkFiles(bDir), bSel);
   const entries: DiffEntry[] = [];
   let same = 0;
   for (const [path, aBytes] of a) {
@@ -347,6 +358,46 @@ export const renderTextUnified = (
   ...textHunks(aText, bText, on),
 ];
 const looksBinary = (buf: Uint8Array): boolean => buf.subarray(0, 8192).includes(0);
+// Small modified binaries diff as xxd-style rows through the ordinary line
+// machinery. The cap keeps the pathological case unreachable: in a large
+// executable a single inserted byte shifts every later row, so the "diff"
+// degenerates into two complete dumps that the Myers walk then chews on.
+const HEX_DIFF_MAX = 65536;
+const HEX_ROW = 16;
+// No offset column: printed offsets would mark even re-aligned rows as
+// changed. Hunk headers carry row numbers; byte offset ≈ (row − 1) × 16.
+const hexdump = (buf: Uint8Array): string => {
+  let out = '';
+  for (let off = 0; off < buf.length; off += HEX_ROW) {
+    const row = buf.subarray(off, off + HEX_ROW);
+    let hex = '';
+    let ascii = '';
+    for (const byte of row) {
+      hex += `${byte.toString(16).padStart(2, '0')} `;
+      ascii += byte >= 0x20 && byte < 0x7f ? String.fromCharCode(byte) : '.';
+    }
+    out += `${hex.padEnd(HEX_ROW * 3)} |${ascii}|\n`;
+  }
+  return out;
+};
+// Binaries above the cap get numbers instead of a dump: one pass over bytes
+// already in memory, counting equal-at-equal-offset bytes and the first
+// mismatch. The percentage reads as ~0 for shifted content — honest, if blunt.
+// Rendered as its own line under the "Binary files … differ" header.
+const binarySummary = (aBuf: Uint8Array, bBuf: Uint8Array): string => {
+  const n = Math.min(aBuf.length, bBuf.length);
+  let equal = 0;
+  let first = -1;
+  for (let i = 0; i < n; i++) {
+    if (aBuf[i] === bBuf[i]) equal++;
+    else if (first < 0) first = i;
+  }
+  // Equal prefix: the shorter side ends where the sizes diverge.
+  if (first < 0) first = n;
+  const total = Math.max(aBuf.length, bBuf.length);
+  const pct = total ? Math.floor((equal / total) * 100) : 0;
+  return `first change at byte ${first}, ${pct}% of bytes match`;
+};
 export const fileDiffLines = (
   aDir: string,
   bDir: string,
@@ -358,9 +409,18 @@ export const fileDiffLines = (
   const aBuf = entry.status === 'added' ? Buffer.alloc(0) : readFileSync(join(aDir, p));
   const bBuf = entry.status === 'removed' ? Buffer.alloc(0) : readFileSync(join(bDir, p));
   if (looksBinary(aBuf) || looksBinary(bBuf)) {
+    // Modified only: hexdumping a whole added/removed file against /dev/null
+    // is noise, and its summary would always read "byte 0, 0% match".
+    if (entry.status === 'modified' && aBuf.length <= HEX_DIFF_MAX && bBuf.length <= HEX_DIFF_MAX) {
+      lines.push(paint(`--- a/${p}`, color.bold, on), paint(`+++ b/${p}`, color.bold, on));
+      lines.push(...textHunks(hexdump(aBuf), hexdump(bBuf), on));
+      return lines;
+    }
     lines.push(
-      `Binary files a/${p} and b/${p} differ (${kb(entry.aBytes)}kb → ${kb(entry.bBytes)}kb)`
+      `Binary files a/${p} and b/${p} differ (${kb(entry.aBytes)} → ${kb(entry.bBytes)}kb)`
     );
+    // Its own line: appended to the header it pushes past every terminal width.
+    if (entry.status === 'modified') lines.push(binarySummary(aBuf, bBuf));
     return lines;
   }
   lines.push(
@@ -381,15 +441,26 @@ const MARK_COLOR: Record<DiffStatus, string> = {
 };
 const deltaOf = (entry: DiffEntry): number => entry.bBytes - entry.aBytes;
 const fmtDelta = (bytes: number): string => `${bytes < 0 ? '-' : '+'}${kb(Math.abs(bytes))}kb`;
+const fmtPct = (aBytes: number, bBytes: number): string => {
+  const pct = (Math.abs(bBytes - aBytes) / aBytes) * 100;
+  if (pct < 0.5) return '~0%';
+  return `${bBytes < aBytes ? '-' : '+'}${Math.round(pct)}%`;
+};
 const fmtPair = (aBytes: number, bBytes: number): string =>
-  `${kb(aBytes)}kb → ${kb(bBytes)}kb (${fmtDelta(bBytes - aBytes)})`;
+  // The shared unit rides the pair's last number, and the parenthesized delta
+  // is relative: `5.41 → 5.28kb (-2%)`. Rounded; below half a percent reads
+  // `~0%` rather than a flat 0 that would claim nothing changed. An empty a
+  // side has no meaningful ratio — those keep the byte delta.
+  aBytes
+    ? `${kb(aBytes)} → ${kb(bBytes)}kb (${fmtPct(aBytes, bBytes)})`
+    : `${kb(aBytes)} → ${kb(bBytes)}kb (${fmtDelta(bBytes - aBytes)})`;
 // The row's size tail, shared by the stat table and the interactive listing.
 export const statTail = (entry: DiffEntry): string =>
   entry.status === 'modified' ? fmtPair(entry.aBytes, entry.bBytes) : fmtDelta(deltaOf(entry));
 // The footer, two lines: change counts, then sizes — whole-tree unpacked bytes
 // on each side plus, when both sides came off a registry, the packed archive
 // sizes. Local directories have no archive, so the packed tail stays off for
-// them. The interactive header joins the lines back with · to stay on one row.
+// them. The interactive header puts counts on its title row, sizes on the next.
 export const statSummary = (tree: TreeDiff, a?: DiffSide, b?: DiffSide): string[] => {
   const count = (status: DiffStatus): number =>
     tree.entries.filter((entry) => entry.status === status).length;
@@ -405,12 +476,15 @@ export const statSummary = (tree: TreeDiff, a?: DiffSide, b?: DiffSide): string[
 };
 const markOf = (entry: DiffEntry, on: boolean): string =>
   paint(MARK[entry.status], MARK_COLOR[entry.status], on);
+// Scoped diffs (`/path` ref tails) drop the footer: over a handful of picked
+// files its counts and totals just restate the rows.
 export const statHuman = (tree: TreeDiff, on: boolean, a?: DiffSide, b?: DiffSide): string[] => [
   ...tree.entries.map(
     (entry) => `${markOf(entry, on)} ${entry.path}` + paint(`  ${statTail(entry)}`, color.dim, on)
   ),
-  '',
-  ...statSummary(tree, a, b).map((line) => paint(line, color.dim, on)),
+  ...(a?.sel || b?.sel
+    ? []
+    : ['', ...statSummary(tree, a, b).map((line) => paint(line, color.dim, on))]),
 ];
 // `-dl`: just the changed files, name-status style — no sizes, no content.
 export const statNames = (tree: TreeDiff, on: boolean): string[] =>
@@ -429,12 +503,17 @@ export const statCsv = (tree: TreeDiff): string[] =>
   });
 
 // Bundle measurement diffs are keyed by the public identity a consumer selects,
-// independent of where either package was installed for this run. Gzipped size
-// is the one number reported: it is what a consumer actually ships.
+// independent of where either package was installed for this run. The metric
+// picks the one number a run reports: `-dbms` compares min+gzip — what a
+// consumer actually ships — while `-dbs` compares the plain bundle's bytes,
+// the unminified code itself. "Changed" depends on the metric too: two sides
+// may gzip identically while their plain bundles differ.
+export type BundleMetric = 'gzBytes' | 'plainBytes';
 export type BundleRow = {
   export: string;
   gzBytes: number;
   module: string;
+  plainBytes: number;
 };
 export type BundleStatEntry = {
   a?: BundleRow;
@@ -443,9 +522,13 @@ export type BundleStatEntry = {
   module: string;
   status: DiffStatus;
 };
-export type BundleStat = { entries: BundleStatEntry[]; same: number };
+export type BundleStat = { entries: BundleStatEntry[]; metric: BundleMetric; same: number };
 const bundleKey = (row: BundleRow): string => JSON.stringify([row.module, row.export]);
-export const diffBundleRows = (aRows: BundleRow[], bRows: BundleRow[]): BundleStat => {
+export const diffBundleRows = (
+  aRows: BundleRow[],
+  bRows: BundleRow[],
+  metric: BundleMetric = 'gzBytes'
+): BundleStat => {
   const a = new Map(aRows.map((row) => [bundleKey(row), row]));
   const b = new Map(bRows.map((row) => [bundleKey(row), row]));
   const entries: BundleStatEntry[] = [];
@@ -454,7 +537,7 @@ export const diffBundleRows = (aRows: BundleRow[], bRows: BundleRow[]): BundleSt
     const right = b.get(key);
     if (!right)
       entries.push({ a: left, export: left.export, module: left.module, status: 'removed' });
-    else if (left.gzBytes !== right.gzBytes)
+    else if (left[metric] !== right[metric])
       entries.push({
         a: left,
         b: right,
@@ -468,21 +551,23 @@ export const diffBundleRows = (aRows: BundleRow[], bRows: BundleRow[]): BundleSt
     if (!a.has(key))
       entries.push({ b: right, export: right.export, module: right.module, status: 'added' });
   entries.sort((x, y) => x.module.localeCompare(y.module) || x.export.localeCompare(y.export));
-  return { entries, same };
+  return { entries, metric, same };
 };
 
 const bundleLabel = (entry: BundleStatEntry): string =>
   entry.export && entry.export !== 'all' ? `${entry.module}/${entry.export}` : entry.module;
-const bundleDelta = (entry: BundleStatEntry): number =>
-  (entry.b?.gzBytes ?? 0) - (entry.a?.gzBytes ?? 0);
-// statTail's exact spelling, gzip-flavored: modified rows show the a → b pair
-// with the parenthesized delta, single-sided rows sign their whole size.
-const bundleTail = (entry: BundleStatEntry): string =>
+const bundleDelta = (entry: BundleStatEntry, metric: BundleMetric): number =>
+  (entry.b?.[metric] ?? 0) - (entry.a?.[metric] ?? 0);
+// statTail's exact spelling, metric-flavored: modified rows show the a → b
+// pair with the parenthesized delta, single-sided rows sign their whole size.
+// Only the -m metric earns a suffix: "gzip" marks the number as min+gzip,
+// while unminified sizes read like -ds rows and need no tag.
+const bundleTail = (entry: BundleStatEntry, metric: BundleMetric): string =>
   `${
     entry.status === 'modified'
-      ? fmtPair(entry.a!.gzBytes, entry.b!.gzBytes)
-      : fmtDelta(bundleDelta(entry))
-  } gzip`;
+      ? fmtPair(entry.a![metric], entry.b![metric])
+      : fmtDelta(bundleDelta(entry, metric))
+  }${metric === 'gzBytes' ? ' gzip' : ''}`;
 // Same dress as -ds stat rows: A/M/D marks in the same colors, dim size tail.
 export const bundleStatHuman = (stat: BundleStat, on: boolean): string[] => {
   const count = (status: DiffStatus): number =>
@@ -491,7 +576,7 @@ export const bundleStatHuman = (stat: BundleStat, on: boolean): string[] => {
     ...stat.entries.map(
       (entry) =>
         `${paint(MARK[entry.status], MARK_COLOR[entry.status], on)} ${bundleLabel(entry)}` +
-        paint(`  ${bundleTail(entry)}`, color.dim, on)
+        paint(`  ${bundleTail(entry, stat.metric)}`, color.dim, on)
     ),
     '',
     paint(
@@ -503,16 +588,16 @@ export const bundleStatHuman = (stat: BundleStat, on: boolean): string[] => {
   ];
 };
 // Headerless machine rows, statCsv's shape: status, id, a bytes, b bytes,
-// signed delta — all gzipped.
+// signed delta — all in the stat's metric (min+gzip under -m, plain without).
 export const bundleStatCsv = (stat: BundleStat): string[] =>
   stat.entries.map((entry) => {
-    const delta = bundleDelta(entry);
+    const delta = bundleDelta(entry, stat.metric);
     return csvRow([
       MARK[entry.status],
       entry.module,
       entry.export,
-      `${entry.a?.gzBytes ?? 0}b`,
-      `${entry.b?.gzBytes ?? 0}b`,
+      `${entry.a?.[stat.metric] ?? 0}b`,
+      `${entry.b?.[stat.metric] ?? 0}b`,
       `${delta < 0 ? '' : '+'}${delta}b`,
     ]);
   });
