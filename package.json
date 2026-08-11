@@ -1,6 +1,6 @@
 {
   "name": "bismar",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with min+gzip stats per export",
   "files": [
     "*.js",
@@ -11,8 +11,16 @@
   "bin": {
     "bismar": "bismar.js"
   },
+  "exports": {
+    ".": "./public.js",
+    "./env.js": "./env.js",
+    "./package.json": "./package.json",
+    "./public.js": "./public.js",
+    "./refs.js": "./refs.js",
+    "./size.js": "./size.js"
+  },
   "dependencies": {
-    "esbuild": "0.28.1",
+    "esbuild": "0.28.2",
     "micro-ftch": "1.1.0"
   },
   "devDependencies": {
