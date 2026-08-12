@@ -3,7 +3,7 @@ Static facts about a package, derived from its extracted files and manifests
 alone — JSON reads, file layout, and line regexes; package code is never parsed
 beyond that, and never executed.
 `--list` (non-JS registry refs): go/composer/pypi/gem print one import statement
-per line in their own syntax; crate: and gh: have no statically derivable
+per line in their own syntax; crate:, gh:, and gitlab: have no statically derivable
 surface and fall back to the shipped file listing, as does any package whose
 lister comes up empty.
 `--size`: plain shipped-file sizes — no bundling, no minification, just bytes
@@ -15,9 +15,9 @@ registries.ts; everything here is reads.
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { walkFiles } from './diff.ts';
+import { scoped, walkFiles } from './diff.ts';
 import { color, csvEnabled, csvRow, paint, stdoutColor } from './env.ts';
-import { fmtBytes, kb, readJson, sorted } from './public.ts';
+import { bad, err, fmtBytes, kb, readJson, sorted } from './public.ts';
 import { parseRegistryRef, registryContext } from './registries.ts';
 
 const IDENT = /^[A-Za-z_]\w*$/;
@@ -250,8 +250,8 @@ const REPO_OF: Record<string, (pkgDir: string, refName: string) => string> = {
 export type GhRepo = { eco: string; repo: string };
 const NO_REPO: GhRepo = { eco: '', repo: '' };
 export const ghRepoOf = (pkgDir: string, prefix: string = '', refName: string = ''): GhRepo => {
-  // gh: extracts are the repository already; there is nowhere to jump.
-  if (prefix === 'gh:') return NO_REPO;
+  // gh:/gitlab: extracts are the repository already; there is nowhere to jump.
+  if (prefix === 'gh:' || prefix === 'gitlab:') return NO_REPO;
   const known = REPO_OF[prefix];
   if (known) {
     const repo = known(pkgDir, refName);
@@ -291,15 +291,23 @@ export const surfaceOf = (
 
 export const registrySurface = async (outDir: string, selector: string): Promise<string[]> => {
   const ref = parseRegistryRef(selector);
+  // The import surface is a whole-package fact; a `/path` tail belongs to the
+  // file modes (flagless deep link / cat, -s scope).
+  if (ref.path) err(`the import surface lists whole packages; drop /${bad(ref.path)}`);
   const got = await registryContext(outDir, ref);
   return surfaceOf(ref.prefix, ref.name, got.pkgDir);
 };
 
 // `--size` rows for a registry extract: every shipped file with its byte size,
 // path order. The human table closes with a total line; CSV stays rows-only,
-// like every other machine listing (sums are one awk away).
-const sizeEntries = (pkgDir: string): [string, number][] =>
-  [...walkFiles(pkgDir).entries()].sort(([a], [b]) => a.localeCompare(b));
+// like every other machine listing (sums are one awk away). A `/path` ref tail
+// scopes the rows by diff's rule (the file, or a directory's subtree) — and a
+// scope matching nothing is a typo'd path, not an empty package; never go silent.
+const sizeEntries = (pkgDir: string, sel?: string): [string, number][] => {
+  const files = scoped(walkFiles(pkgDir), sel);
+  if (sel && !files.size) err(`no shipped file matches /${bad(sel)}; drop the tail to list files`);
+  return [...files.entries()].sort(([a], [b]) => a.localeCompare(b));
+};
 const sizeCsv = (entries: [string, number][]): string[] =>
   entries.map(([path, bytes]) => csvRow([path, `${bytes}b`]));
 // The navigator's files-view palette (interactive.ts): directories cyan,
@@ -330,12 +338,14 @@ const sizeHuman = (entries: [string, number][], on: boolean, archiveBytes?: numb
   ];
 };
 // Headerless like every machine listing; the unit tag keeps rows self-describing.
-export const sizesCsv = (pkgDir: string): string[] => sizeCsv(sizeEntries(pkgDir));
+export const sizesCsv = (pkgDir: string, sel?: string): string[] =>
+  sizeCsv(sizeEntries(pkgDir, sel));
 export const sizesHuman = (
   pkgDir: string,
   on: boolean = stdoutColor(),
-  archiveBytes?: number
-): string[] => sizeHuman(sizeEntries(pkgDir), on, archiveBytes);
+  archiveBytes?: number,
+  sel?: string
+): string[] => sizeHuman(sizeEntries(pkgDir, sel), on, archiveBytes);
 // Degenerate shipped tree for `-s ./input.js`: keep the same row and footer
 // grammar without staging a read-only input in a temp directory.
 export const fileSizesCsv = (file: string): string[] =>

@@ -121,7 +121,7 @@ it('size command works without a test/build template', async () => {
     deepStrictEqual(/module,export/.test(out), false, out);
     deepStrictEqual(/@bismar-test\/plain,,/.test(out), true, out);
     // Output is unsorted: natural order puts the package row first. Sorting is
-    // the shell's job over the CSV, e.g. `| sort -t, -k5 -rn`.
+    // the shell's job over the CSV, e.g. `| sort -t, -k4 -rn`.
     deepStrictEqual(out.indexOf('@bismar-test/plain,,') < out.indexOf('index,add,'), true, out);
     const badSort = await run(cwd, () => runBismar(['-bs', '--sort=gzip'], { color: false, cwd }));
     deepStrictEqual(badSort.ok, false);
@@ -624,7 +624,7 @@ it('size command --list prints import statements without bundling', async () => 
 
 it('size command --list caches pinned ref enumeration in bismar.db.json', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['--list', 'npm:@microsoft/tsdoc@0.16.0'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
@@ -646,34 +646,58 @@ it('size command --list caches pinned ref enumeration in bismar.db.json', async 
 
 it('size command serves pinned ref sizes from the machine cache', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['-bs', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
   deepStrictEqual(first.ok, true, all(first));
-  // The measuring run wrote its row under the unbranded key.
+  // The measuring run wrote its row under the unbranded key, stamped with both
+  // the file-format version and the sizes semantics version.
   const parsed = JSON.parse(readFileSync(db, 'utf8'));
   deepStrictEqual(Array.isArray(parsed.sizes.rows['index/TSDocParser']), true);
   deepStrictEqual(typeof parsed.sizes.esbuild, 'string');
+  deepStrictEqual(parsed.v, 1);
+  deepStrictEqual(parsed.sizes.v, 1);
   // Poison the cached row; a warm run must serve it verbatim, without esbuild.
   parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7, 21];
   writeFileSync(db, JSON.stringify(parsed));
   const second = await capture(() => runBismar(argv, { color: false, cwd }));
   deepStrictEqual(second.ok, true, all(second));
   deepStrictEqual(
-    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,1loc,11b,7b$/m.test(plain(second)),
+    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,1loc,21b$/m.test(plain(second)),
     true,
     plain(second)
   );
+  // -m flips the same cached row to its min+gzip pair.
+  const minArgv = ['-bsm', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'];
+  const minified = await capture(() => runBismar(minArgv, { color: false, cwd }));
+  deepStrictEqual(minified.ok, true, all(minified));
+  deepStrictEqual(
+    /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,11b,7b$/m.test(plain(minified)),
+    true,
+    plain(minified)
+  );
   // A different esbuild version invalidates the poison: real numbers come back.
   parsed.sizes.esbuild = '0.0.0';
+  // Top-level fields this bismar doesn't know (a newer version's data) must
+  // survive the rewrite instead of being silently dropped.
+  parsed.future = { keep: true };
   writeFileSync(db, JSON.stringify(parsed));
   const third = await capture(() => runBismar(argv, { color: false, cwd }));
   deepStrictEqual(plain(third), plain(first));
   const rewritten = JSON.parse(readFileSync(db, 'utf8'));
   deepStrictEqual(rewritten.sizes.esbuild === '0.0.0', false);
-  // Bundle emission never reads the poisoned cache — it needs real bytes.
+  deepStrictEqual(rewritten.future, { keep: true });
+  // A bumped sizes semantics version invalidates the same way: cached rows from
+  // a bismar whose numbers mean something else are misses, never served.
   parsed.sizes.esbuild = rewritten.sizes.esbuild;
+  parsed.sizes.v = 0;
+  parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7, 21];
+  writeFileSync(db, JSON.stringify(parsed));
+  const fourth = await capture(() => runBismar(argv, { color: false, cwd }));
+  deepStrictEqual(plain(fourth), plain(first));
+  // Bundle emission never reads the poisoned cache — it needs real bytes.
+  parsed.sizes.v = 1;
   parsed.sizes.rows['index/TSDocParser'] = [1, 11, 7, 21];
   writeFileSync(db, JSON.stringify(parsed));
   // -b streams bytes through stdout.write, which capture() does not hook. tty is
@@ -702,6 +726,89 @@ it('size command serves pinned ref sizes from the machine cache', async () => {
   deepStrictEqual(bytes.length > 1000, true);
 });
 
+it('unknown-module errors on multi-module refs list real selector ids', async () => {
+  const cwd = fixture('plain');
+  // Seed a pinned machine-cache install by its documented layout: pinned refs
+  // hit the cache by existence alone, so the fake package works fully offline.
+  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-9-9-9');
+  const pkgDir = join(refDir, 'node_modules', 'bismar-fake');
+  rmSync(refDir, { force: true, recursive: true });
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    join(refDir, 'package.json'),
+    JSON.stringify({ dependencies: { 'bismar-fake': '9.9.9' }, private: true })
+  );
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({
+      exports: { '.': './index.js', './extra.js': './extra.js' },
+      name: 'bismar-fake',
+      version: '9.9.9',
+    })
+  );
+  writeFileSync(join(pkgDir, 'index.js'), 'export const one = 1;\n');
+  writeFileSync(join(pkgDir, 'extra.js'), 'export const two = 2;\n');
+  mkdirSync(join(pkgDir, 'src'), { recursive: true });
+  writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const three = 3;\n');
+  writeFileSync(join(pkgDir, 'LICENSE'), 'MIT\n');
+  try {
+    const res = await capture(() =>
+      runBismar(['-bs', 'npm:bismar-fake@9.9.9/nope/x'], { color: false, cwd })
+    );
+    deepStrictEqual(res.ok, false);
+    const out = plain(res);
+    // The listing carries branded selector ids — never map-index artifacts
+    // (`bismar-fake@9.9.9/0`), the refRename-into-map regression.
+    deepStrictEqual(
+      /unknown module: nope; use one of:\nbismar-fake@9\.9\.9\/extra\nbismar-fake@9\.9\.9\/index/.test(
+        out
+      ),
+      true,
+      out
+    );
+    deepStrictEqual(/9\.9\.9\/\d/.test(out), false, out);
+    // Tails that name shipped files bridge to the flagless grammar instead of
+    // dead-ending as unknown modules/exports — one hint per failure shape:
+    // a deep path (unknown module), a non-identifier root file (invalid
+    // export), and an identifier-shaped root file (esbuild no-such-export).
+    for (const tail of ['src/util.ts', 'package.json', 'LICENSE']) {
+      const hinted = await capture(() =>
+        runBismar(['-bs', `npm:bismar-fake@9.9.9/${tail}`], { color: false, cwd })
+      );
+      deepStrictEqual(hinted.ok, false, tail);
+      deepStrictEqual(
+        new RegExp(
+          `names a shipped file, not (a module/export|an export); drop the flags to open it: bismar npm:bismar-fake@9\\.9\\.9/${tail.replaceAll('/', '\\/').replaceAll('.', '\\.')}`
+        ).test(plain(hinted)),
+        true,
+        `${tail}\n${plain(hinted)}`
+      );
+    }
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+  }
+});
+
+it('bare -s honors a /path scope on refs and fails on a miss', async () => {
+  const cwd = fixture('plain');
+  // The tail scopes the listing by diff's rule: this exact shipped file.
+  const one = await capture(() =>
+    runBismar(['-s', 'npm:@microsoft/tsdoc@0.16.0/package.json'], { color: false, cwd })
+  );
+  deepStrictEqual(one.ok, true, all(one));
+  deepStrictEqual(/^package\.json,\d+b\n$/.test(one.stdout), true, one.stdout);
+  // A scope matching nothing is a typo'd path, never a silently unscoped listing.
+  const miss = await capture(() =>
+    runBismar(['-s', 'npm:@microsoft/tsdoc@0.16.0/retry'], { color: false, cwd })
+  );
+  deepStrictEqual(miss.ok, false);
+  deepStrictEqual(
+    /no shipped file matches \/retry; drop the tail to list files/.test(plain(miss)),
+    true,
+    plain(miss)
+  );
+});
+
 it('size command pins floating refs through a fresh tag, re-resolves stale ones', async () => {
   const cwd = fixture('plain');
   // Prime the pinned machine cache, then cut the registry off: everything the
@@ -710,7 +817,7 @@ it('size command pins floating refs through a fresh tag, re-resolves stale ones'
     runBismar(['-bs', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'], { color: false, cwd })
   );
   deepStrictEqual(prime.ok, true, all(prime));
-  const tagDir = join(tmpdir(), 'bismar-refs', '.tags');
+  const tagDir = join(tmpdir(), 'bismar-refs', 'v1', '.tags');
   mkdirSync(tagDir, { recursive: true });
   const tag = join(tagDir, 'microsoft-tsdoc.json');
   const argv = ['-bs', 'npm:@microsoft/tsdoc/index/TSDocParser'];
@@ -722,7 +829,7 @@ it('size command pins floating refs through a fresh tag, re-resolves stale ones'
         const fresh = await capture(() => runBismar(argv, { color: false, cwd }));
         deepStrictEqual(fresh.ok, true, all(fresh));
         deepStrictEqual(
-          /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+loc,\d+b,\d+b$/m.test(plain(fresh)),
+          /^@microsoft\/tsdoc@0\.16\.0,TSDocParser,\d+loc,\d+b$/m.test(plain(fresh)),
           true,
           plain(fresh)
         );
@@ -942,12 +1049,16 @@ it('size rows carry the selector spellings they are addressed by', async () => {
     ['@bismar-test/plain', 'index.js', 'index.js', 'index.js']
   );
   // The printed table and the reported row are one measurement, not two that agree by
-  // convention: a budget compared against gzBytes is comparing what `bismar -bs` shows.
+  // convention: a budget compared against gzBytes is comparing what `bismar -bsm` shows,
+  // and plainBytes what plain `-bs` shows.
   const shown = await run(cwd, () => runBismar(['-bs'], { color: false, cwd }));
+  const shownMin = await run(cwd, () => runBismar(['-bsm'], { color: false, cwd }));
   for (const row of rows) {
     const exp = row.export === 'all' ? '' : row.export;
-    const line = `${row.module},${exp},${row.loc}loc,${row.minBytes}b,${row.gzBytes}b`;
+    const line = `${row.module},${exp},${row.loc}loc,${row.plainBytes}b`;
     deepStrictEqual(plain(shown).includes(line), true, `${line}\n${plain(shown)}`);
+    const minLine = `${row.module},${exp},${row.minBytes}b,${row.gzBytes}b`;
+    deepStrictEqual(plain(shownMin).includes(minLine), true, `${minLine}\n${plain(shownMin)}`);
   }
   // Every label round-trips: handed back as a selector it measures that same bundle.
   for (const row of rows) {

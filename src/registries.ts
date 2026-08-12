@@ -1,6 +1,7 @@
 /**
 Non-JS registry refs (`crate:serde`, `gem:rails`, `pypi:requests`,
-`composer:monolog/monolog`, `gh:owner/repo`, `go:golang.org/x/text`):
+`composer:monolog/monolog`, `gh:owner/repo`, `gitlab:group/project`,
+`go:golang.org/x/text`):
 navigator-only — fetched and extracted so the interactive files view can browse
 a package's shipped sources. Nothing here bundles, measures, or executes
 package code; extraction goes through fs-modify.ts. All ecosystems share one
@@ -8,21 +9,28 @@ flow: parse → resolve version (or pin a git ref) → download → extract → 
 Also home to the namespace table (aliases, `canonSelector`) and the launcher's
 registry search (`searchRegistry`), all through one rate-limited fetch. Download
 urls read from registry metadata are confined to known-registry origins first
-(`allowUrl`); hardcoded-base fetches (gem/crate/gh/go) need no such check.
+(`allowUrl`); hardcoded-base fetches (gem/crate/gh/gitlab/go) need no such check.
 @module
  */
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { type FetchFn, ftch, retry } from 'micro-ftch';
 import { cliProcess, envFlag, progressDone, progressShow } from './env.ts';
-import { extractArchive, extractTar, promoteTemp, rmTempDir, write } from './fs-modify.ts';
+import {
+  appendLog,
+  extractArchive,
+  extractTar,
+  promoteTemp,
+  rmTempDir,
+  write,
+} from './fs-modify.ts';
 import { bad, err, explicitPath, fmtBytes, readJson, slug } from './public.ts';
 import {
   PINNED,
   readArchiveBytes,
   readVersionTag,
   refsCacheDir,
+  refsRoot,
   writeArchiveBytes,
   writeVersionTag,
 } from './refs.ts';
@@ -39,13 +47,62 @@ const UA =
 // Built on first use so BISMAR_RPS can tune the budget; 0 drops the spacing
 // entirely — local test stand-ins and trusted proxies, where politeness only
 // buys latency. Unset or garbage keeps the default.
+// Defense in depth atop allowUrl: micro-ftch's allowedHosts makes the wrapped
+// fetch itself refuse any host outside the known-registry set (the README's
+// host table), and re-checks the final post-redirect URL — a layer allowUrl
+// cannot provide. Hosts derive from the configured bases, so an overridden
+// BISMAR_* base admits its own host instead of the default's.
+const hostOf = (baseUrl: string): string => {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return '';
+  }
+};
+const allowedHosts = (): string[] =>
+  [
+    hostOf(crates()),
+    // crates.io download redirect target.
+    'static.crates.io',
+    hostOf(gems()),
+    hostOf(pypi()),
+    'files.pythonhosted.org',
+    hostOf(composer()),
+    hostOf(packagist()),
+    hostOf(ghApi()),
+    hostOf(ghCodeload()),
+    hostOf(gitlabApi()),
+    hostOf(goProxy()),
+    hostOf(npmApi()),
+    hostOf(jsrApi()),
+    hostOf(jsrNpm()),
+  ].filter(Boolean);
 let lazyNet: FetchFn | undefined;
+let lazyHosts = '';
 const net = (): FetchFn => {
-  if (!lazyNet) {
+  // Rebuilt when the effective host set changes (env-overridden bases vary
+  // per test); a stable environment builds exactly once.
+  const hosts = allowedHosts();
+  const key = hosts.join(',');
+  if (!lazyNet || key !== lazyHosts) {
+    lazyHosts = key;
     const tuned = Number(process.env.BISMAR_RPS ?? NaN);
     const rps = Number.isFinite(tuned) ? tuned : 8;
     lazyNet = retry(
-      ftch(fetch, { concurrencyLimit: 4, ...(rps > 0 ? { rps } : {}), timeout: 30_000 })
+      ftch(fetch, {
+        allowedHosts: hosts,
+        concurrencyLimit: 4,
+        // micro-ftch's own request hook: BISMAR_LOG=file.txt appends one line
+        // per request. The env is read per call, not baked in, so a long
+        // session (or a test) can toggle it; unset costs one lookup.
+        log: (url, opts) => {
+          const file = process.env.BISMAR_LOG;
+          if (file)
+            appendLog(file, `${new Date().toISOString()} ${opts?.method ?? 'GET'} ${url}\n`);
+        },
+        ...(rps > 0 ? { rps } : {}),
+        timeout: 30_000,
+      })
     );
   }
   return lazyNet;
@@ -159,6 +216,11 @@ type Registry = {
   pin?: (name: string, refspec: string) => Promise<string>;
   // Resolve the floating "latest" to a concrete version ('' when unresolvable).
   resolve?: (name: string) => Promise<string>;
+  // Fixed name arity in `/`-segments; set, the segments past it are a `/path`
+  // tail (a shipped file or directory). Unset — go: import paths, gitlab:
+  // subgroups — names have variable arity, so a tail cannot be split off
+  // unambiguously and the whole body stays the name.
+  segs?: number;
   site: string;
   // Ref shape for error hints, e.g. 'vendor/name@version'.
   use: string;
@@ -227,6 +289,11 @@ const pypiOrigins = (): string[] => [
 const npmApi = (): string => base('BISMAR_NPM_API', 'https://registry.npmjs.org');
 const jsrApi = (): string => base('BISMAR_JSR_API', 'https://api.jsr.io');
 const ghCodeload = (): string => base('BISMAR_GH_CODELOAD', 'https://codeload.github.com');
+// GitLab's v4 api takes url-encoded `group/project` paths (nested subgroups
+// included) and serves metadata and archives alike, so one base covers all.
+const gitlabApi = (): string => base('BISMAR_GITLAB_API', 'https://gitlab.com/api/v4');
+const gitlabProject = (name: string): string =>
+  `${gitlabApi()}/projects/${encodeURIComponent(name)}`;
 // Module paths escape uppercase as !lowercase in proxy URLs (github.com/!azure).
 const goProxy = (): string => base('BISMAR_GO_PROXY', 'https://proxy.golang.org');
 const goEsc = (path: string): string => path.replace(/[A-Z]/g, (ch) => `!${ch.toLowerCase()}`);
@@ -248,6 +315,7 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.zip' };
     },
     name: /^[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*$/i,
+    segs: 2,
     resolve: async (name) => {
       // Newest first; prefer the newest stable, like crates' max_stable_version.
       const list = await p2(name);
@@ -270,6 +338,7 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.crate' };
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/,
+    segs: 1,
     resolve: async (name) => {
       const url = `${crates()}/api/v1/crates/${name}`;
       const meta = await jsonOf<CrateMeta>(url, () => notFound(REGISTRIES['crate:'], name));
@@ -302,6 +371,7 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.gem' };
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/,
+    segs: 1,
     resolve: async (name) => {
       const url = `${gems()}/api/v1/gems/${name}.json`;
       const meta = await jsonOf<GemMeta>(url, () => notFound(REGISTRIES['gem:'], name));
@@ -336,6 +406,7 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.tar.gz' };
     },
     name: /^[a-z\d][a-z\d-]*\/[\w.-]+$/i,
+    segs: 2,
     pin: async (name, refspec) => {
       const id = `gh:${name}${refspec ? `@${refspec}` : ''}`;
       const url = `${ghApi()}/repos/${name}/commits/${refspec || 'HEAD'}`;
@@ -351,6 +422,37 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     site: 'github.com',
     use: 'owner/repo@ref',
+    version: /^[\w./-]+$/,
+    what: 'repository',
+  },
+  // GitLab repos, same contract as gh:: any ref pins to a commit id first.
+  // Names are group/project with nested subgroups allowed.
+  'gitlab:': {
+    example: 'main',
+    fetch: async (name, version, label, dir) => {
+      // Unlike gh:, no size pre-check: the project api hides repository size
+      // from anonymous callers. The content-length guard in bytesOf still
+      // fires when the archive endpoint announces one.
+      const url = `${gitlabProject(name)}/repository/archive.tar.gz?sha=${version}`;
+      const bytes = await bytesOf(url, () => noVersion(REGISTRIES['gitlab:'], label), label);
+      extractArchive(bytes, dir);
+      return { bytes, ext: '.tar.gz' };
+    },
+    name: /^[a-z\d][\w.-]*(?:\/[\w.-]+)+$/i,
+    pin: async (name, refspec) => {
+      const id = `gitlab:${name}${refspec ? `@${refspec}` : ''}`;
+      // The commit list resolves branches, tags, and shas alike; without
+      // ref_name it reads the default branch's tip (the HEAD case).
+      const ref = refspec ? `ref_name=${encodeURIComponent(refspec)}&` : '';
+      const url = `${gitlabProject(name)}/repository/commits?${ref}per_page=1`;
+      const miss = (): never => err(`repository or ref not found: ${bad(id)}; check gitlab.com`);
+      const list = await jsonOf<{ id?: string }[]>(url, miss);
+      const sha = (Array.isArray(list) && list[0]?.id) || '';
+      if (!sha) miss();
+      return sha.trim().slice(0, 12);
+    },
+    site: 'gitlab.com',
+    use: 'group/project@ref',
     version: /^[\w./-]+$/,
     what: 'repository',
   },
@@ -410,6 +512,7 @@ export const REGISTRIES: Record<string, Registry> = {
       };
     },
     name: /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/,
+    segs: 1,
     resolve: async (name) => (await pypiMeta(name)).info?.version || '',
     site: 'pypi.org',
     use: 'name@version',
@@ -510,6 +613,11 @@ type GemFound = { info?: string; name?: string; version?: string }[];
 type GhFound = {
   items?: { description?: string | null; full_name?: string; stargazers_count?: number }[];
 };
+type GitlabFound = {
+  description?: string | null;
+  path_with_namespace?: string;
+  star_count?: number;
+}[];
 type Searcher = (q: string, miss: () => never) => Promise<SearchHit[]>;
 const SEARCHERS: Record<string, Searcher> = {
   'crate:': async (q, miss) => {
@@ -546,6 +654,23 @@ const SEARCHERS: Record<string, Searcher> = {
         : []
     );
   },
+  'gitlab:': async (q, miss) => {
+    // Anonymous project search has no relevance ordering (similarity needs
+    // auth); last_activity_at keeps maintained projects ahead of squatters.
+    const url = `${gitlabApi()}/projects?search=${q}&order_by=last_activity_at&per_page=10`;
+    const meta = await jsonOf<GitlabFound>(url, miss);
+    return (Array.isArray(meta) ? meta : []).flatMap((r) =>
+      r.path_with_namespace
+        ? [
+            hitOf(
+              r.path_with_namespace,
+              r.star_count != null ? `${r.star_count}★` : '',
+              r.description
+            ),
+          ]
+        : []
+    );
+  },
   'jsr:': async (q, miss) => {
     const meta = await jsonOf<JsrFound>(`${jsrApi()}/packages?query=${q}&limit=10`, miss);
     // dependencyCount rides in on the search response itself: deps are free.
@@ -569,6 +694,181 @@ const SEARCHERS: Record<string, Searcher> = {
   },
 };
 export const canSearch = (prefix: string): boolean => prefix in SEARCHERS;
+
+// Profile refs: `prefix:@user` names a person, org, scope, or vendor rather
+// than a package — gh:@visionmedia, npm:@noble. Only a bare `@user` head
+// qualifies (no path, no version); `@scope/name` stays a package spelling.
+export type ProfileRef = { prefix: string; user: string };
+const PROFILE_USER = /^[\w.-]+$/;
+// Registries whose package names always take several segments (owner/repo,
+// vendor/name): there a bare single segment can only be a profile, so the `@`
+// sigil is optional — `gh:veorq` reads as `gh:@veorq`. Single-segment-name
+// registries (crate:, gem:, pypi:) and npm/jsr keep requiring the sigil, since
+// a bare segment there is a package name.
+const BARE_PROFILE = new Set(['composer:', 'gh:', 'gitlab:']);
+export const parseProfileRef = (raw: string): ProfileRef | undefined => {
+  const colon = raw.indexOf(':');
+  if (colon <= 0) return undefined;
+  const head = raw.slice(0, colon + 1);
+  const prefix =
+    head === 'npm:' || head === 'jsr:'
+      ? head
+      : PREFIXES.includes(head)
+        ? (ALIASES[head] ?? head)
+        : undefined;
+  if (!prefix) return undefined;
+  const sigil = raw[colon + 1] === '@';
+  if (!sigil && !BARE_PROFILE.has(prefix)) return undefined;
+  const user = raw.slice(colon + (sigil ? 2 : 1));
+  return PROFILE_USER.test(user) ? { prefix, user } : undefined;
+};
+// Packagist's vendor listing lives on the www host, not the p2 metadata one.
+const packagist = (): string => base('BISMAR_PACKAGIST_API', 'https://packagist.org');
+type CrateUser = { user?: { id?: number } };
+type GhRepo = { description?: string | null; full_name?: string; stargazers_count?: number };
+const ghRepoHits = (repos: GhRepo[]): SearchHit[] =>
+  repos.flatMap((r) =>
+    r.full_name
+      ? [
+          hitOf(
+            r.full_name,
+            r.stargazers_count != null ? `${r.stargazers_count}★` : '',
+            r.description
+          ),
+        ]
+      : []
+  );
+const gitlabHits = (projects: GitlabFound): SearchHit[] =>
+  (Array.isArray(projects) ? projects : []).flatMap((r) =>
+    r.path_with_namespace
+      ? [
+          hitOf(
+            r.path_with_namespace,
+            r.star_count != null ? `${r.star_count}★` : '',
+            r.description
+          ),
+        ]
+      : []
+  );
+// One page each, newest activity first where the api can sort: a profile
+// listing is a jumping-off point, not an inventory of a 900-repo org.
+type Profiler = (user: string, miss: () => never) => Promise<SearchHit[]>;
+const PROFILERS: Record<string, Profiler> = {
+  'composer:': async (user, miss) => {
+    const url = `${packagist()}/packages/list.json?vendor=${encodeURIComponent(user)}`;
+    const meta = await jsonOf<{ packageNames?: string[] }>(url, miss);
+    return (meta.packageNames ?? []).slice(0, 25).map((name) => hitOf(name, '', ''));
+  },
+  'crate:': async (user, miss) => {
+    // Two hops: crates.io keys the crate listing by numeric user id.
+    const who = await jsonOf<CrateUser>(
+      `${crates()}/api/v1/users/${encodeURIComponent(user)}`,
+      miss
+    );
+    if (!who.user?.id) miss();
+    const url = `${crates()}/api/v1/crates?user_id=${who.user?.id}&per_page=25&sort=recent-updates`;
+    const meta = await jsonOf<CrateFound>(url, miss);
+    return (meta.crates ?? []).flatMap((c) =>
+      c.name
+        ? [
+            hitOf(
+              c.name,
+              c.max_stable_version || c.newest_version || c.max_version || '',
+              c.description
+            ),
+          ]
+        : []
+    );
+  },
+  'gem:': async (user, miss) => {
+    const url = `${gems()}/api/v1/owners/${encodeURIComponent(user)}/gems.json`;
+    const meta = await jsonOf<GemFound>(url, miss);
+    return meta
+      .slice(0, 25)
+      .flatMap((g) => (g.name ? [hitOf(g.name, g.version ?? '', g.info)] : []));
+  },
+  'gh:': async (user, miss) => {
+    // The repos api only sorts by dates/name; the search api sorts by stars in
+    // the same single request (its anonymous quota is tighter — 10/min, and
+    // 403 doubles as its rate-limit answer, hence the wider miss wording).
+    const url = `${ghApi()}/search/repositories?q=${encodeURIComponent(`user:${user}`)}&sort=stars&per_page=25`;
+    const meta = await jsonOf<GhFound>(url, miss);
+    return ghRepoHits(meta.items ?? []);
+  },
+  'gitlab:': async (user, miss) => {
+    // `@name` may be a user or a group; try the user listing, fall back to the
+    // group one (which also answers for subgroup-less orgs).
+    const tail = `projects?order_by=last_activity_at&per_page=25`;
+    try {
+      const meta = await jsonOf<GitlabFound>(
+        `${gitlabApi()}/users/${encodeURIComponent(user)}/${tail}`,
+        miss
+      );
+      if (Array.isArray(meta) && meta.length) return gitlabHits(meta);
+    } catch {
+      // Not a user (or an empty one): the group listing decides below.
+    }
+    return gitlabHits(
+      await jsonOf<GitlabFound>(`${gitlabApi()}/groups/${encodeURIComponent(user)}/${tail}`, miss)
+    );
+  },
+  'jsr:': async (user, miss) => {
+    const meta = await jsonOf<JsrFound>(
+      `${jsrApi()}/scopes/${encodeURIComponent(user)}/packages?limit=25`,
+      miss
+    );
+    return (meta.items ?? []).flatMap((p) =>
+      p.scope && p.name
+        ? [
+            {
+              ...hitOf(`@${p.scope}/${p.name}`, p.latestVersion ?? '', p.description),
+              ...(p.dependencyCount != null ? { deps: p.dependencyCount } : {}),
+            },
+          ]
+        : []
+    );
+  },
+  'npm:': async (user, miss) => {
+    const q = async (text: string, size: number) =>
+      (
+        await jsonOf<NpmFound>(
+          `${npmApi()}/-/v1/search?text=${encodeURIComponent(text)}&size=${size}`,
+          miss
+        )
+      ).objects ?? [];
+    // maintainer: is the one qualifier the registry search reliably answers
+    // (scope: silently matches nothing). Scopes have no listing api at all, so
+    // `@x` the scope falls back to a text search filtered to exact members —
+    // relevance ranks real members high, and 250 rows is the api's page cap.
+    let objects = await q(`maintainer:${user}`, 25);
+    if (!objects.length)
+      objects = (await q(`@${user}/`, 250))
+        .filter((o) => o.package?.name?.startsWith(`@${user}/`))
+        .slice(0, 25);
+    return objects.flatMap((o) =>
+      o.package?.name ? [hitOf(o.package.name, o.package.version ?? '', '')] : []
+    );
+  },
+};
+export const canProfile = (prefix: string): boolean => prefix in PROFILERS;
+// Display spelling for labels and crumbs: the long registry name. Only gh: has
+// a short canonical prefix; the long alias is equally valid to type back in,
+// so prettified crumbs stay copy-pasteable selectors.
+export const displayLabel = (label: string): string =>
+  label.startsWith('gh:') ? `github:${label.slice(3)}` : label;
+export const profileHits = async (prefix: string, user: string): Promise<SearchHit[]> => {
+  const profile = PROFILERS[prefix];
+  if (!profile)
+    return err(`no profile listing behind ${bad(prefix)}; open an exact package instead`);
+  const miss = (): never =>
+    prefix === 'gh:'
+      ? err(`profile not found: ${bad(`gh:@${user}`)} — or github's rate limit; retry in a minute`)
+      : err(`profile not found: ${bad(`${prefix}@${user}`)}`);
+  const hits = await profile(user, miss);
+  if (!hits.length) err(`no packages under ${bad(`${prefix}@${user}`)}`);
+  return hits;
+};
+
 export const searchRegistry = async (prefix: string, query: string): Promise<SearchHit[]> => {
   const search = SEARCHERS[prefix];
   if (!search) return err(`no search api behind ${bad(prefix)}; open an exact name instead`);
@@ -626,8 +926,7 @@ export type HitStats = { deps?: number; tgzBytes?: number; version?: string };
 // are immutable per exact version, so repeat searches (and reopened listings)
 // skip the metadata round-trips. One file per pkg@version, like the version
 // tags — no read-modify-write races; --clear wipes it with the rest.
-const statsFile = (label: string): string =>
-  join(tmpdir(), 'bismar-refs', '.stats', `${slug(label)}.json`);
+const statsFile = (label: string): string => join(refsRoot(), '.stats', `${slug(label)}.json`);
 const readHitStats = (label: string): HitStats | undefined => {
   try {
     const got = readJson<HitStats>(statsFile(label));
@@ -687,7 +986,9 @@ export const jsHitStats = async (
     version,
   };
 };
-export type RegistryRef = { name: string; prefix: string; version: string };
+// `path` is the `/`-tail past a fixed-arity name: '' when absent, and always
+// '' for variable-arity registries (go:, gitlab:), which take no tails.
+export type RegistryRef = { name: string; path: string; prefix: string; version: string };
 export const isRegistrySelector = (raw: string): boolean =>
   PREFIXES.some((prefix) => raw.startsWith(prefix));
 export const parseRegistryRef = (raw: string): RegistryRef => {
@@ -695,7 +996,24 @@ export const parseRegistryRef = (raw: string): RegistryRef => {
   if (!matched) return err(`not a registry ref: ${bad(raw)}`);
   const prefix = ALIASES[matched] ?? matched;
   const reg = REGISTRIES[prefix];
-  const body = raw.slice(matched.length);
+  let body = raw.slice(matched.length);
+  // `gh:@user/repo` tolerates the profile sigil on a full ref: registry names
+  // never start with `@`, so it is unambiguous (npm/jsr scopes are parsed by
+  // parseNpmRef, never here). A bare `@user` stays a profile (parseProfileRef).
+  if (body.startsWith('@') && body.includes('/')) body = body.slice(1);
+  // Fixed-arity names split a `/path` tail off first, so the version `@` is
+  // looked for on the name alone (`crate:serde@1.0.0/src/lib.rs`). Registries
+  // whose refspecs may themselves contain slashes (gh branches: feature/x)
+  // make `@…/…` ambiguous — there the version wins, and only unversioned refs
+  // take a tail (`gh:owner/repo/README.md`).
+  let path = '';
+  if (reg.segs) {
+    const parts = body.split('/');
+    if (parts.length > reg.segs && (!reg.version.source.includes('/') || !body.includes('@'))) {
+      body = parts.slice(0, reg.segs).join('/');
+      path = parts.slice(reg.segs).join('/');
+    }
+  }
   const at = body.lastIndexOf('@');
   const name = at > 0 ? body.slice(0, at) : body;
   let version = at > 0 ? body.slice(at + 1) : '';
@@ -711,7 +1029,7 @@ export const parseRegistryRef = (raw: string): RegistryRef => {
         `invalid ${reg.what} version: ${bad(raw)}; pin an exact version like ${matched}${name}@${reg.example}`
       );
   }
-  return { name, prefix, version };
+  return { name, path, prefix, version };
 };
 
 // Extracted root: descend sole-directory chains — crates and sdists wrap one

@@ -3,6 +3,7 @@
 // symlinks; npm runs only on a cold esbuild cache. bismar never writes into user repos.
 import { execFileSync } from 'node:child_process';
 import {
+  appendFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -73,6 +74,16 @@ export const write = (file: string, data: string | Uint8Array): string => (
   writeFileSync(file, data),
   file
 );
+// The network-request log (BISMAR_LOG=file.txt): the one user-directed write
+// bismar makes outside its own temp dirs — an explicit opt-in, append-only.
+// Logging is garnish: a bad path must not break the request it observed.
+export const appendLog = (file: string, line: string): void => {
+  try {
+    appendFileSync(file, line);
+  } catch {
+    // Unwritable log target; the fetch itself proceeds.
+  }
+};
 export const writePkg = (file: string, data: string | Uint8Array): string => {
   if (basename(file) !== 'package.json') err(`expected package.json path: ${file}`);
   mkdir(dirname(assertTemp(file)));

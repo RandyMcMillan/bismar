@@ -14,7 +14,7 @@ import { availableParallelism } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
-import { walkFiles } from './diff.ts';
+import { scoped, walkFiles } from './diff.ts';
 import {
   color,
   csvEnabled,
@@ -62,6 +62,7 @@ import {
   type RefDbSizes,
   refRename,
   saveRefDb,
+  SIZES_V,
   soleIndexOf,
 } from './refs.ts';
 import { jsHitStats } from './registries.ts';
@@ -119,6 +120,9 @@ type Item = {
   // Set when a bare name fell back to a root-module export: on failure the error lists
   // the package's modules, since the name may have meant either a module or an export.
   rootModules?: string[];
+  // Set when that fallback name is also a shipped file (LICENSE): its esbuild
+  // failure hints this flagless selector spelling instead of a no-such-export.
+  shippedSel?: string;
   source: string;
 };
 export type Built = Item & { min: Uint8Array; plain: Uint8Array };
@@ -590,8 +594,8 @@ const buildCase = async (
 // spellings the same row is addressed by (`sha2.js/sha256` and `sha2.js`). Both labels
 // ride along rather than being derived downstream: recovering one from the other means
 // reproducing `lineLabel`'s file-flavoring and `all`-collapsing rules in every consumer.
-// `gzBytes` is level 9 — the number the table prints, so a budget compared against it
-// matches what `bismar -bs` reports without the comparer re-gzipping.
+// `gzBytes` is level 9 — the number the table prints under -m, so a budget compared
+// against it matches what `bismar -bsm` reports without the comparer re-gzipping.
 export type RowData = {
   export: string;
   gzBytes: number;
@@ -600,7 +604,7 @@ export type RowData = {
   minBytes: number;
   module: string;
   moduleLabel: string;
-  // The unminified bundle's bytes: what `-dbs` (no -m) compares.
+  // The unminified bundle's bytes: what `-bs` prints and `-dbs` (no -m) compares.
   plainBytes: number;
 };
 const rowData = (item: Item, out: Built, modFile: Map<string, string>): RowData => {
@@ -625,11 +629,17 @@ const DATA_HEAVY_TAG = 'data-heavy';
 const dataHeavy = (data: RowData): boolean =>
   data.minBytes > 2048 && data.gzBytes / data.minBytes > 0.6;
 const exportLabel = (name: string): string => (name === ALL ? '' : name);
-// One spelling for the measured triple, shared by size lines and interactive rows.
+// One spelling for the measured triple, shared by interactive rows.
 export const sizeTail = (loc: number, minBytes: number, gzBytes: number): string =>
   `${loc} LOC, ${kb(minBytes)}kb min, ${kb(gzBytes)}kb gzip`;
+// -m splits the printed metric like the diff modes (-dbs/-dbms): lines plus the
+// unminified bundle's bytes without it, the min+gzip a consumer ships with it.
+// Like -dbs rows, the unminified size needs no tag; only the -m pair earns them.
+// "lines", not "LOC": the same word the pager header counts with.
+const plainTail = (data: RowData): string => `${data.loc} lines, ${kb(data.plainBytes)}kb`;
+const minTail = (data: RowData): string => `${kb(data.minBytes)}kb min, ${kb(data.gzBytes)}kb gzip`;
 // Table-less human mode (bismar -bs on a TTY): one line per bundle, e.g.
-// `ml-kem.js/ml_kem1024 - 120 LOC, 5.61kb, 3.30kb`
+// `ml-kem.js/ml_kem1024 - 120 lines, 18.20kb`
 const LINE_LABEL_MAX = 40;
 // Wrap an installed ref (refs.ts owns the install/locate details) into a measurement Ctx.
 export const refContext = (
@@ -659,7 +669,7 @@ const lineLabel = (modFile: Map<string, string>, module: string, exp: string): s
   const mod = moduleLabel(modFile, module);
   return exp && exp !== ALL ? `${mod}/${exp}` : mod;
 };
-const sizeLine = (data: RowData, width: number, on: boolean): string => {
+const sizeLine = (data: RowData, width: number, on: boolean, minified: boolean): string => {
   const plain = data.label;
   // The combined multi-selector row is bismar-made, not a selectable module: pink, not yellow.
   const painted =
@@ -669,18 +679,20 @@ const sizeLine = (data: RowData, width: number, on: boolean): string => {
   // Pad by the uncolored width so colored labels still line up.
   const label = painted + ' '.repeat(Math.max(0, width - plain.length));
   const tag = dataHeavy(data) ? ` ${paint(DATA_HEAVY_TAG, color.dim, on)}` : '';
-  // The measured triple dims like every other size tail (-s rows, -ds stats).
-  return `${label} ${paint(sizeTail(data.loc, data.minBytes, data.gzBytes), color.dim, on)}${tag}`;
+  // The measured pair dims like every other size tail (-s rows, -ds stats).
+  const tail = minified ? minTail(data) : plainTail(data);
+  return `${label} ${paint(tail, color.dim, on)}${tag}`;
 };
 // Headerless machine rows, each value tagged with its unit: sort/awk still
 // parse the leading digits, and a row stays self-describing after filtering.
-// Column order: module, export, loc, minified bytes, gzipped bytes.
-const csvCells = (data: RowData) => [
+// Column order: module, export, then the mode's metric — loc + unminified
+// bytes, or under -m minified + gzipped bytes.
+const csvCells = (data: RowData, minified: boolean) => [
   data.module,
   exportLabel(data.export),
-  `${data.loc}loc`,
-  `${data.minBytes}b`,
-  `${data.gzBytes}b`,
+  ...(minified
+    ? [`${data.minBytes}b`, `${data.gzBytes}b`]
+    : [`${data.loc}loc`, `${data.plainBytes}b`]),
 ];
 // Display file for a module: the real export file basename (`ml-kem.js`), or the
 // exports-map key basename when the key is the user-visible spelling.
@@ -811,6 +823,9 @@ export type SizeOpts = {
   // never take file semantics. This suppresses the fallback; it does not reject a foreign
   // selector up front — `foreignSelector` (refs.ts) is the pure check for that.
   localOnly?: boolean;
+  // Printed-metric switch (`-bsm`): min+gzip instead of LOC + unminified bytes.
+  // Measurement is identical either way — RowData always carries all four numbers.
+  minify?: boolean;
   // Fires with the bundle bytes themselves. Wanting a *number* is not a reason to reach
   // for this: sizes live on RowData, and forcing a build to get them defeats the ref cache.
   onBuilt?: (
@@ -1069,6 +1084,10 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
       mods: Mod[];
       pkg: Pkg;
       rootExportFallback: boolean;
+      // Does the ref ship `path` as a file or directory? Bridges the two tail
+      // grammars — module/export selectors here, shipped paths in the flagless
+      // and -s modes: a failed pick that names a shipped path hints the other.
+      shipped?: (path: string) => boolean;
     };
     const makePicker = ({
       brand,
@@ -1078,6 +1097,7 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
       mods: pkgMods,
       pkg,
       rootExportFallback,
+      shipped,
     }: PickerOpts): Picker => {
       const rows = pkgItems.filter((item) => item.export);
       const byId = new Map(rows.map((item) => [`${item.module}/${item.export}`, item]));
@@ -1121,7 +1141,13 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
         }
         const mod = modsByName.get(modName);
         if (!mod) {
-          const ids = sorted(modsByName.keys()).map(modLabel);
+          if (shipped?.(path))
+            return err(
+              `${bad(rawPath)} names a shipped file, not a module/export; drop the flags to open it: bismar ${raw}`
+            );
+          // Explicit lambda: modLabel (refRename) takes a display leaf as its
+          // second parameter, which map's index would silently fill (`label/0`).
+          const ids = sorted(modsByName.keys()).map((name) => modLabel(name));
           return unknownErr('unknown module', local ? `"${modName}"` : modName, ids);
         }
         const known = byId.get(`${mod.module}/${name}`);
@@ -1136,6 +1162,10 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
         // The name is spliced into `export { name } from ...`, so it must be an identifier;
         // catching it here beats a cryptic esbuild parse error against the generated file.
         if (!ident(name)) {
+          if (shipped?.(path))
+            return err(
+              `${bad(rawPath)} names a shipped file, not a module/export; drop the flags to open it: bismar ${raw}`
+            );
           const fixed = name.replace(/-/g, '_');
           const hint = ident(fixed) ? `; did you mean ${mod.module}/${fixed}?` : '';
           return err(`invalid export name: ${bad(name)} (exports are JS identifiers)${hint}`);
@@ -1143,8 +1173,15 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
         // Fast mode skipped export enumeration; esbuild validates the name during bundling.
         return brand({
           ...exportItem(pkg, mod, name),
-          // Failed fallbacks report unknown-module style: the raw name may have meant either.
-          rootModules: fellBack ? sorted(modsByName.keys()).map(modLabel) : undefined,
+          // Failed fallbacks report unknown-module style: the raw name may have
+          // meant either. Explicit lambda for the same map-index reason as above.
+          rootModules: fellBack
+            ? sorted(modsByName.keys()).map((name) => modLabel(name))
+            : undefined,
+          // Identifier-shaped shipped names (LICENSE) survive the fallback and
+          // only fail inside esbuild; tag the pick so that failure can hint the
+          // flagless spelling instead of a bare no-such-export.
+          shippedSel: fellBack && shipped?.(path) ? raw : undefined,
         });
       };
     };
@@ -1194,6 +1231,8 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
         modLabel: rename,
         mods: refMods,
         pkg: refCtx.pkg,
+        // Lazy walk: only failed picks pay for it, and only on refs.
+        shipped: (path) => scoped(walkFiles(refCtx.pkgDir), path).size > 0,
         rootExportFallback: true,
       });
       refPickers.set(ref.label, picker);
@@ -1322,6 +1361,12 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
             ? (mods.find((entry) => entry.module === item.module) ?? extMods.get(item.module))
             : undefined;
           if (mod) {
+            // The fallback name is a shipped file (LICENSE): the flagless
+            // spelling opens it — say so instead of a bare no-such-export.
+            if (item.shippedSel)
+              return err(
+                `${bad(item.export)} names a shipped file, not an export; drop the flags to open it: bismar ${item.shippedSel}`
+              );
             const ids = await exportIds(mod);
             // A bare name that fell back to an export-less root was likely a module typo.
             if (!ids.length && item.rootModules)
@@ -1355,15 +1400,17 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
     for (const [dir, rows] of dirty) {
       const prev = refDb(dir).sizes;
       const keep = prev && prev.esbuild === buildVersion() ? prev.rows : {};
-      saveRefDb(dir, { sizes: { esbuild: buildVersion(), rows: { ...keep, ...rows } } });
+      saveRefDb(dir, {
+        sizes: { esbuild: buildVersion(), rows: { ...keep, ...rows }, v: SIZES_V },
+      });
     }
     // The line must be gone before whatever comes next: table, bundle, or error.
     progressDone();
   }
   if (show && results.length) {
     for (const data of results) {
-      if (csv) console.log(csvRow(csvCells(data)));
-      else console.log(sizeLine(data, labelWidth, colorOn));
+      if (csv) console.log(csvRow(csvCells(data, !!opts.minify)));
+      else console.log(sizeLine(data, labelWidth, colorOn, !!opts.minify));
     }
     // CSV stays rows-only: the footer is a human summary, not another record.
     if (!csv && pkgSizes) {

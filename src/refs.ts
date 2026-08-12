@@ -71,15 +71,21 @@ const installedAt = (base: string, ref: ExternalRef): string =>
 // imports resolvable. Specs already under the package's own name stay untouched.
 export const realSpec = (ref: ExternalRef, spec: string, pkgName: string): string =>
   spec.startsWith(pkgName) ? spec : `${installName(ref)}/${spec.replace(/^\.\//, '')}`;
+// The machine cache's layout version. Caches are disposable derivatives:
+// a layout change (dir naming, siblings, commit markers, extraction rules)
+// bumps this segment and abandons the old tree — recomputed, never migrated —
+// and concurrent bismar versions each own their whole tree. The root keeps its
+// `bismar-` prefix, so `--clear` from any version removes any version's caches.
+export const refsRoot = (): string => join(tmpdir(), 'bismar-refs', 'v1');
 // The machine-wide ref cache root: one label-keyed dir per pinned install,
 // shared by npm/jsr refs here and every registry ecosystem (registries.ts),
-// filed one subdirectory per registry — bismar-refs/gem/, bismar-refs/crate/…
-// — with bare npm labels (`qr@0.6.0`) under npm/.
+// filed one subdirectory per registry — …/v1/gem/, …/v1/crate/ — with bare npm
+// labels (`qr@0.6.0`) under npm/.
 export const refsCacheDir = (label: string): string => {
   const colon = label.indexOf(':');
   const prefix = colon > 0 ? label.slice(0, colon) : 'npm';
   const rest = colon > 0 ? label.slice(colon + 1) : label;
-  return join(tmpdir(), 'bismar-refs', prefix, slug(rest));
+  return join(refsRoot(), prefix, slug(rest));
 };
 // For originally-pinned refs this reproduces ref.label, so both spellings of one
 // version (`qr@0.6.0` and a fresh-tagged `qr`) share a single cache dir.
@@ -87,8 +93,7 @@ const pinnedDirOf = (ref: ExternalRef, version: string): string =>
   refsCacheDir(`${ref.jsr ? 'jsr:' : ''}${ref.bare}@${version}`);
 // Tag files are keyed by display label (`npm:qr`, `crate:serde`), so every
 // ecosystem's floating "latest" shares one TTL cache without colliding.
-const tagFile = (label: string): string =>
-  join(tmpdir(), 'bismar-refs', '.tags', `${slug(label)}.json`);
+const tagFile = (label: string): string => join(refsRoot(), '.tags', `${slug(label)}.json`);
 export const readVersionTag = (label: string): string | undefined => {
   try {
     const tag = readJson<{ at: number; version: string }>(tagFile(label));
@@ -109,8 +114,7 @@ export const writeVersionTag = (label: string, version: string): void =>
 // the tag cache (never inside the extract dir, whose sole-dir descent and file
 // listings must stay pristine). Extracts predating the meta file simply omit
 // the stat.
-const metaFile = (label: string): string =>
-  join(tmpdir(), 'bismar-refs', '.meta', `${slug(label)}.json`);
+const metaFile = (label: string): string => join(refsRoot(), '.meta', `${slug(label)}.json`);
 export const readArchiveBytes = (label: string): number | undefined => {
   try {
     const bytes = readJson<{ archiveBytes?: unknown }>(metaFile(label)).archiveBytes;
@@ -227,8 +231,14 @@ export type RefDbMod = { exports: string[]; file: string; module: string };
 // rows: unbranded `module/export` id -> [loc, minified bytes, gzipped bytes].
 // Row shape: [loc, minBytes, gzBytes, plainBytes]. Readers treat shorter rows
 // (written before plainBytes existed) as cache misses.
-export type RefDbSizes = { esbuild: string; rows: Record<string, number[]> };
+export type RefDbSizes = { esbuild: string; rows: Record<string, number[]>; v: number };
 export type RefDb = { modules?: RefDbMod[]; sizes?: RefDbSizes; v?: number };
+// Measurement-semantics version for cached size rows, next to the esbuild key:
+// `esbuild` catches toolchain drift, this catches bismar's own — a change to
+// gzip level, LOC counting, or what a row's numbers mean bumps it, and cached
+// rows read as misses. Rows themselves stay positional append-only arrays:
+// new fields append, and readers length-check (see cachedRow in size.ts).
+export const SIZES_V = 1;
 // Uncached on purpose: files are tiny, and rereading keeps long interactive
 // sessions honest about what other processes wrote. Hot loops read once per dir.
 export const refDb = (refDir: string): RefDb => {
@@ -243,6 +253,7 @@ export const refDb = (refDir: string): RefDb => {
     const sizes =
       raw.sizes &&
       typeof raw.sizes === 'object' &&
+      raw.sizes.v === SIZES_V &&
       typeof raw.sizes.esbuild === 'string' &&
       !!raw.sizes.rows &&
       typeof raw.sizes.rows === 'object'
@@ -254,10 +265,21 @@ export const refDb = (refDir: string): RefDb => {
     return {};
   }
 };
+// The parsed file as written, gated only on the whole-format version: rewrite
+// merges spread this, not the validated view, so fields a newer bismar added
+// survive a rewrite by this one instead of being silently dropped.
+const rawRefDb = (refDir: string): Record<string, unknown> => {
+  try {
+    const raw = JSON.parse(readText(join(refDir, REF_DB))) as Record<string, unknown> | null;
+    return raw && typeof raw === 'object' && raw.v === 1 ? raw : {};
+  } catch {
+    return {};
+  }
+};
 // Read-modify-write keeps the other half (modules vs sizes) intact; concurrent
 // processes may lose each other's last write, which only costs a re-measure.
 export const saveRefDb = (refDir: string, patch: Partial<RefDb>): void =>
-  void write(join(refDir, REF_DB), `${JSON.stringify({ ...refDb(refDir), ...patch, v: 1 })}\n`);
+  void write(join(refDir, REF_DB), `${JSON.stringify({ ...rawRefDb(refDir), ...patch, v: 1 })}\n`);
 // Display label for a ref: versionless refs (`npm:qr`) adopt the installed version
 // (`qr@0.6.0`), so output is pinned and copy-pasteable; jsr refs keep their prefix.
 const refLabel = (ref: ExternalRef, pkg: Pkg): string =>

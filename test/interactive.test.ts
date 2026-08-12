@@ -1,7 +1,7 @@
 // Tests for `bismar -i`: filesystem-style navigation of modules and exports,
 // driven headlessly through the injectable io of runInteractive.
 import assert, { deepStrictEqual } from 'node:assert';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -91,7 +91,7 @@ const openMenu = (dirLabel: string, state: Record<string, unknown> = {}) => {
   };
 };
 
-it('launcher menu offers the current dir and the six registry searches', async () => {
+it('launcher menu offers the current dir and the seven registry searches', async () => {
   // Bare `bismar` (menu: true) asks first; enter on the first option browses
   // the current package, and the session follows in the same terminal.
   const session = open(undefined, { menu: true });
@@ -100,14 +100,22 @@ it('launcher menu offers the current dir and the six registry searches', async (
   const text = session.text();
   deepStrictEqual(/bismar · what to open\?/.test(text), true, text);
   deepStrictEqual(/▸ browse current directory \(plain\)/.test(text), true, text);
-  for (const label of ['JS/NPM', 'JS/JSR', 'Rust/Cargo', 'Ruby/Gems', 'Python/PyPi', 'GitHub'])
+  for (const label of [
+    'JS/NPM',
+    'JS/JSR',
+    'Rust/Cargo',
+    'Ruby/Gems',
+    'Python/PyPi',
+    'GitHub',
+    'GitLab',
+  ])
     deepStrictEqual(text.includes(`search ${label}`), true, `${label}\n${text}`);
   deepStrictEqual(/↑↓ move · enter select · q quit/.test(text), true, text);
   deepStrictEqual(/@bismar-test\/plain · files/.test(text), true, text);
 });
 
 it('launcher opens pinned and exact-name queries without searching', async () => {
-  // Option order: dir, npm, jsr, crate, gem, pypi, gh. A @version pin skips
+  // Option order: dir, npm, jsr, crate, gem, pypi, gh, gitlab. A @version pin skips
   // search — search apis know nothing about versions — and type-ahead past the
   // submit is handed to the session that follows.
   const gem = openMenu('x');
@@ -116,8 +124,12 @@ it('launcher opens pinned and exact-name queries without searching', async () =>
   deepStrictEqual(/name: railties@7\.1\.0/.test(gem.text()), true, gem.text());
   deepStrictEqual(/e\.g\. railties/.test(gem.text()), true, gem.text());
   const gh = openMenu('x');
-  gh.send('G\rpaulmillr/qr@main\r');
+  gh.send('jjjjjj\rpaulmillr/qr@main\r');
   deepStrictEqual((await gh.done)?.selector, 'gh:paulmillr/qr@main');
+  // G jumps to the last option, now gitlab; a pinned ref opens directly too.
+  const gitlab = openMenu('x');
+  gitlab.send('G\rgroup/proj@main\r');
+  deepStrictEqual((await gitlab.done)?.selector, 'gitlab:group/proj@main');
   // pypi has no search api: enter opens the exact name, and the prompt says so.
   const pypi = openMenu('x');
   pypi.send('jjjjj\rrequests\r');
@@ -438,7 +450,7 @@ it('interactive mode syntax-highlights paged source when colors are on', async (
   }
 });
 
-it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async () => {
+it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, HTML, C, and Bash', async () => {
   const cases = [
     ['py', 'def greet(name):', 'def'],
     ['rb', 'def greet(name)', 'def'],
@@ -446,6 +458,8 @@ it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async 
     ['go', 'func greet(name string)', 'func'],
     ['php', '<?php function greet(string $name)', 'function'],
     ['html', '<main>Hello</main>', 'main'],
+    ['c', 'int main(void) { return 0; }', 'int'],
+    ['bash', 'if test -f file; then echo yes; fi', 'if'],
   ] as const;
   for (const [lang, source, keyword] of cases) {
     const highlighted = await highlightText(source, lang);
@@ -457,12 +471,41 @@ it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, and HTML', async 
   }
 });
 
-it('interactive mode syntax-highlights Python and Rakefile previews', async () => {
+it('vendored Markdown highlighter highlights common fenced-code language names', async () => {
+  for (const [lang, source, keyword] of [
+    ['cpp', 'int main() { return 0; }', 'int'],
+    ['sh', 'if test -f file; then echo yes; fi', 'if'],
+    ['javascript', 'const answer = 42;', 'const'],
+    ['typescript', 'interface Answer { value: number }', 'interface'],
+    ['python', 'def answer(): return 42', 'def'],
+    ['ruby', 'def answer; 42; end', 'def'],
+    ['rust', 'fn answer() -> i32 { 42 }', 'fn'],
+    ['golang', 'func answer() int { return 42 }', 'func'],
+  ] as const) {
+    const highlighted = await highlightText(`\`\`\`${lang}\n${source}\n\`\`\``, 'md');
+    deepStrictEqual(
+      highlighted.includes(`\x1b[31m${keyword}\x1b[0m`),
+      true,
+      `${lang} fence was not highlighted: ${JSON.stringify(highlighted)}`
+    );
+  }
+});
+
+it('vendored Markdown highlighter paints ATX headings as sections', async () => {
+  const highlighted = await highlightText('intro\n### heading\nbody', 'md');
+  deepStrictEqual(highlighted.includes('\x1b[35m### heading\x1b[0m'), true, highlighted);
+  deepStrictEqual(highlighted.includes('\x1b[35mbody\x1b[0m'), false, highlighted);
+});
+
+it('interactive mode syntax-highlights Python, Rakefile, C, C++, and shell previews', async () => {
   process.env.FORCE_COLOR = '1';
   try {
-    for (const [name, source] of [
-      ['greet.py', 'def greet(name):\n    return f"Hello, {name}"\n'],
-      ['Rakefile', 'def build\n  puts "building"\nend\n'],
+    for (const [name, source, keyword] of [
+      ['greet.py', 'def greet(name):\n    return f"Hello, {name}"\n', 'def'],
+      ['Rakefile', 'def build\n  puts "building"\nend\n', 'def'],
+      ['greet.c', 'int greet(void) { return 1; }\n', 'int'],
+      ['greet.cpp', 'int greet() { return 1; }\n', 'int'],
+      ['greet.sh', 'if test -n "$USER"; then echo hello; fi\n', 'if'],
     ] as const) {
       const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-highlight-'));
       try {
@@ -470,7 +513,7 @@ it('interactive mode syntax-highlights Python and Rakefile previews', async () =
         const session = open(undefined, { cwd, menu: true });
         session.send('\r\rqq');
         await session.done;
-        deepStrictEqual(session.raw().includes('\x1b[31mdef\x1b[0m'), true, session.raw());
+        deepStrictEqual(session.raw().includes(`\x1b[31m${keyword}\x1b[0m`), true, session.raw());
         deepStrictEqual(session.text().includes(source.split('\n')[0]), true, session.text());
       } finally {
         rmSync(cwd, { force: true, recursive: true });
@@ -686,4 +729,185 @@ it('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () =
   const eof = open(undefined);
   eof.send('\x04');
   await timed(eof.done);
+});
+
+it('a ref /path tail deep-links the files view', async () => {
+  // Seed a pinned machine-cache install by its documented layout: pinned refs
+  // hit the cache by existence alone, so the fake package works fully offline.
+  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-nav-9-9-9');
+  const pkgDir = join(refDir, 'node_modules', 'bismar-fake-nav');
+  rmSync(refDir, { force: true, recursive: true });
+  mkdirSync(join(pkgDir, 'src'), { recursive: true });
+  writeFileSync(
+    join(refDir, 'package.json'),
+    JSON.stringify({ dependencies: { 'bismar-fake-nav': '9.9.9' }, private: true })
+  );
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({ exports: { '.': './index.js' }, name: 'bismar-fake-nav', version: '9.9.9' })
+  );
+  writeFileSync(join(pkgDir, 'index.js'), 'export const twice = (n) => n * 2;\n');
+  writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const twice = (n: number) => n * 2;\n');
+  try {
+    // An exact shipped file opens the session with its preview pager up.
+    const file = open('npm:bismar-fake-nav@9.9.9/src/util.ts');
+    await waitFor(file, /n: number/);
+    file.send('q'); // close the pager: the file's own directory listing is under it
+    await waitFor(file, /bismar-fake-nav@9\.9\.9\/src · files/);
+    file.send('q');
+    await file.done;
+    // A directory tail opens the session on that subtree's listing.
+    const dir = open('npm:bismar-fake-nav@9.9.9/src');
+    await waitFor(dir, /bismar-fake-nav@9\.9\.9\/src · files/);
+    deepStrictEqual(/util\.ts/.test(dir.text()), true, dir.text());
+    dir.send('q');
+    await dir.done;
+    // A tail matching nothing is a typo'd path: error out before the TUI opens,
+    // never a silently whole-package browse.
+    const miss = open('npm:bismar-fake-nav@9.9.9/nope');
+    await assert.rejects(miss.done, /no shipped file matches \/nope; drop the tail to browse/);
+    deepStrictEqual(miss.raw().includes('\x1b[?1049h'), false, 'TUI must not open');
+    // A tail that names a module hints its shipped-file spelling instead.
+    const asMod = open('npm:bismar-fake-nav@9.9.9/index');
+    await assert.rejects(
+      asMod.done,
+      /no shipped file matches \/index; the module's file ships as \/index\.js/
+    );
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+  }
+});
+
+it('profile refs seed the launcher listing; @user searches one from the prompt', async () => {
+  // Seeded session (bismar gh:@user): the launcher opens on the results stage.
+  const input = new PassThrough();
+  let raw = '';
+  const io = {
+    cols: 100,
+    input,
+    output: {
+      write: (text: string) => {
+        raw += text;
+        return true;
+      },
+    },
+    rows: 16,
+  };
+  const done = runInteractive(undefined, {
+    cwd: FIXTURE,
+    io,
+    profile: {
+      hits: [{ desc: 'Minimal QR', name: 'paulmillr/qr', version: '12★' }],
+      prefix: 'gh:',
+      user: 'paulmillr',
+    },
+  });
+  const seeded = { text: () => strip(raw) };
+  // The crumb is the profile itself, spelled with the long registry name.
+  await waitFor(seeded, /github:@paulmillr · 1 listed/);
+  await waitFor(seeded, /paulmillr\/qr.*12★.*Minimal QR/);
+  // The seeded listing is the session root: q/esc/← back out of the root,
+  // which is exiting — never the menu, which this session never came from.
+  deepStrictEqual(/↑↓ move · enter open · q quit/.test(seeded.text()), true, seeded.text());
+  input.write('\x1b');
+  await done;
+  deepStrictEqual(/what to open\?/.test(seeded.text()), false, seeded.text());
+
+  // Opening a hit keeps the profile as the session crumb's head, with the
+  // redundant owner collapsed: `npm:@fake · bismar-fake-prof@9.9.9`. Offline:
+  // a seeded pinned install plus a fresh version tag resolve the floating hit.
+  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-prof-9-9-9');
+  const pkgDir = join(refDir, 'node_modules', 'bismar-fake-prof');
+  const tagDir = join(tmpdir(), 'bismar-refs', 'v1', '.tags');
+  const tag = join(tagDir, 'bismar-fake-prof.json');
+  rmSync(refDir, { force: true, recursive: true });
+  mkdirSync(pkgDir, { recursive: true });
+  mkdirSync(tagDir, { recursive: true });
+  writeFileSync(
+    join(refDir, 'package.json'),
+    JSON.stringify({ dependencies: { 'bismar-fake-prof': '9.9.9' }, private: true })
+  );
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({ exports: { '.': './index.js' }, name: 'bismar-fake-prof', version: '9.9.9' })
+  );
+  writeFileSync(join(pkgDir, 'index.js'), 'export const one = 1;\n');
+  writeFileSync(tag, `${JSON.stringify({ at: Date.now(), version: '9.9.9' })}\n`);
+  try {
+    const input2 = new PassThrough();
+    let raw2 = '';
+    const io2 = {
+      cols: 100,
+      input: input2,
+      output: {
+        write: (text: string) => {
+          raw2 += text;
+          return true;
+        },
+      },
+      rows: 16,
+    };
+    const done2 = runInteractive(undefined, {
+      cwd: FIXTURE,
+      io: io2,
+      profile: {
+        hits: [{ desc: '', name: 'bismar-fake-prof', version: '9.9.9' }],
+        prefix: 'npm:',
+        user: 'fake',
+      },
+    });
+    const opened = { text: () => strip(raw2) };
+    await waitFor(opened, /npm:@fake · 1 listed/);
+    input2.write('\r');
+    await waitFor(opened, /npm:@fake · bismar-fake-prof@9\.9\.9 · files/);
+    input2.write('\x03');
+    await done2;
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+    rmSync(tag, { force: true });
+  }
+
+  // The search prompt: a bare @user lists that profile instead of name search.
+  const routes: Record<string, string> = {
+    '/api/v1/users/vision': JSON.stringify({ user: { id: 7 } }),
+    '/api/v1/crates?user_id=7&per_page=25&sort=recent-updates': JSON.stringify({
+      crates: [{ description: 'QR toolkit', max_stable_version: '1.2.3', name: 'vision-qr' }],
+    }),
+  };
+  const server = createServer((req, res) => {
+    const body = routes[req.url ?? ''];
+    if (!body) {
+      res.statusCode = 404;
+      return void res.end('{}');
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(body);
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  const prev = process.env.BISMAR_CRATES_API;
+  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const menu = openMenu('x');
+    menu.send('jjj\r'); // crate search box
+    await waitFor(menu, /search Rust\/Cargo/);
+    // The prompt advertises the profile spelling.
+    deepStrictEqual(/e\.g\. serde or @user/.test(menu.text()), true, menu.text());
+    menu.send('@vision\r');
+    await waitFor(menu, /vision-qr.*1\.2\.3.*QR toolkit/);
+    // The prompt-entered profile crumbs the same way as the CLI-seeded one.
+    deepStrictEqual(/crate:@vision · 1 listed/.test(menu.text()), true, menu.text());
+    // Enter opens the picked crate like any search hit, carrying the profile
+    // crumb along as the session's head.
+    menu.send('\r');
+    deepStrictEqual(await menu.done, {
+      leftover: [],
+      selector: 'crate:vision-qr',
+      via: 'crate:@vision',
+    });
+  } finally {
+    if (prev === undefined) delete process.env.BISMAR_CRATES_API;
+    else process.env.BISMAR_CRATES_API = prev;
+    server.closeAllConnections();
+    await new Promise((res) => server.close(res));
+  }
 });

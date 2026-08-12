@@ -2,6 +2,7 @@ import { deepStrictEqual, rejects, throws } from 'node:assert';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { test as it } from 'node:test';
 import { parseArgs, runCli } from '../src/bismar.ts';
 import { __TEST as FS_TEST, promoteTemp } from '../src/fs-modify.ts';
@@ -84,7 +85,7 @@ it('bundle combines short flags into artifact and report modes', () => {
     parseArgs(['-bm', 'index/add']),
     parseArgs(['--bundle', '--minify', 'index/add'])
   );
-  // -s modifies the bundle into a measurement report, and -m is redundant there.
+  // -s modifies the bundle into a measurement report; -m picks its metric.
   deepStrictEqual(parseArgs(['-bs']), parseArgs(['-b', '-s']));
   deepStrictEqual(parseArgs(['-bms']), parseArgs(['-b', '-m', '-s']));
   throws(() => parseArgs(['-sm']), /--minify shapes the emitted bundle; use -bms or drop -m/);
@@ -114,6 +115,7 @@ it('bundle treats any colon head as a namespace and lists the known ones', () =>
     'pypi: (or py: python:)',
     'composer: (or php:)',
     'gh: (or github:)',
+    'gitlab:',
     'go: (or golang:)',
   ])
     deepStrictEqual(msg.includes(line), true, `${line}\n${msg}`);
@@ -126,28 +128,69 @@ it('bundle treats any colon head as a namespace and lists the known ones', () =>
   deepStrictEqual(parseArgs(['-b', 'index/a:b']).paths, ['index/a:b']);
 });
 
-it('bundle prints size stats instead of bytes on a terminal', async () => {
-  // The fallback measures exactly the bundle it refused (one row, not the browse
-  // table); the stderr hint echoes the run's own arguments, copy-pasteable — and
-  // the exit code still reports failure: the requested bundle was never produced.
+// Headless TTY harness: runCli with an injected io, driving whatever pager or
+// TUI session the run opens; text() strips colors and control sequences.
+const openTty = (argv: string[], cwd = FIXTURE) => {
+  const input = new PassThrough();
+  let raw = '';
+  const io = {
+    cols: 120,
+    input,
+    output: {
+      write: (text: string) => {
+        raw += text;
+        return true;
+      },
+    },
+    rows: 20,
+  };
+  return {
+    done: runCli(argv, { cwd, io, tty: true }),
+    raw: () => raw,
+    send: (keys: string) => void input.write(keys),
+    text: () => raw.replace(/\x1b\[[\d?;]*[a-zA-Z]/g, ''),
+  };
+};
+const waitFor = async (session: { text: () => string }, re: RegExp): Promise<void> => {
+  for (let i = 0; i < 300; i++) {
+    if (re.test(session.text())) return;
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  throw new Error(`timed out waiting for ${re}\n${session.text()}`);
+};
+
+it('bundle opens the pager on a terminal, any size, and exits clean', async () => {
   const prevExit = process.exitCode;
-  const res = await capture(() => runCli(['-b', 'index/add'], { cwd: FIXTURE, tty: true }));
-  deepStrictEqual(res.ok, true, res.stderr);
-  deepStrictEqual(process.exitCode, 1);
-  process.exitCode = prevExit;
+  // The pager session: alternate screen, the bundle's own text, a footer with
+  // the measured stats and the run's redirect spelling — and a success exit.
+  const session = openTty(['-b', 'index/add']);
+  await waitFor(session, /bismarTestPlainIndexAdd/);
+  deepStrictEqual(session.raw().includes('\x1b[?1049h'), true, 'expected the alternate screen');
+  deepStrictEqual(/index\.js\/add · \d+ lines/.test(session.text()), true, session.text());
   deepStrictEqual(
-    /warn: refusing to output to the terminal, use redirect: bismar -b index\/add > out\.js/.test(
-      res.stderr
-    ),
+    /[\d.]+kb min, [\d.]+kb gzip · bismar -b index\/add > out\.js/.test(session.text()),
     true,
-    res.stderr
+    session.text()
   );
-  const rows = res.stdout.trim().split('\n');
-  // Headerless machine rows, each value unit-tagged.
-  deepStrictEqual(/^index,add,\d+loc,\d+b,\d+b$/.test(rows[0] ?? ''), true, res.stdout);
-  // One row for the one refused artifact; and never the bundle bytes themselves.
-  deepStrictEqual(rows.length, 1, res.stdout);
-  deepStrictEqual(/var bismarTestPlainIndexAdd/.test(res.stdout), false, res.stdout);
+  session.send('q');
+  await session.done;
+  deepStrictEqual(process.exitCode, prevExit);
+  // With color forced, the paged bundle is syntax-highlighted.
+  process.env.FORCE_COLOR = '1';
+  try {
+    const lit = openTty(['-b', 'index/add']);
+    await waitFor(lit, /bismarTestPlainIndexAdd/);
+    deepStrictEqual(/\x1b\[3\dm/.test(lit.raw()), true, 'expected highlight colors');
+    lit.send('q');
+    await lit.done;
+  } finally {
+    delete process.env.FORCE_COLOR;
+  }
+  // -m pages the minified variant; the footer echoes -m.
+  const min = openTty(['-bm', 'index/add']);
+  await waitFor(min, /bismar -b -m index\/add > out\.js/);
+  min.send('q');
+  await min.done;
   // --list prints short text, not bundle bytes: fine on a TTY.
   const listed = await capture(() => runCli(['--list', 'index/add'], { cwd: FIXTURE, tty: true }));
   deepStrictEqual(listed.ok, true, listed.stderr);
@@ -180,13 +223,14 @@ it('bundle --minify emits the minified variant of the same artifact', async () =
   deepStrictEqual(min.stdout.length < plain.stdout.length, true);
 });
 
-it('-bs measures bundles and accepts redundant -m byte-for-byte', async () => {
+it('-bs measures lines + unminified bytes; -bms switches to min+gzip', async () => {
   const size = await capture(() => runCli(['-bs', 'index/add'], { cwd: FIXTURE, tty: false }));
   const min = await capture(() => runCli(['-bms', 'index/add'], { cwd: FIXTURE, tty: false }));
   deepStrictEqual(size.ok, true, size.stderr);
   deepStrictEqual(min.ok, true, min.stderr);
-  deepStrictEqual(min.stdout, size.stdout);
-  deepStrictEqual(/^index,add,\d+loc,\d+b,\d+b\n$/.test(size.stdout), true, size.stdout);
+  deepStrictEqual(/^index,add,\d+loc,\d+b\n$/.test(size.stdout), true, size.stdout);
+  deepStrictEqual(/^index,add,\d+b,\d+b\n$/.test(min.stdout), true, min.stdout);
+  deepStrictEqual(min.stdout !== size.stdout, true, min.stdout);
 });
 
 it('bundle defaults to the whole package and supports --list', async () => {
@@ -344,7 +388,7 @@ it('bundle --clear wipes bismar tmp caches, reports stats, runs alone', async ()
   rmSync(scratch, { force: true, recursive: true });
   // Documented in usage, but it refuses company.
   const help = await capture(() => runCli(['--help'], {}));
-  deepStrictEqual(/--clear {3}remove every bismar cache/.test(help.stdout), true, help.stdout);
+  deepStrictEqual(/--clear {3}clean-up bismar cache/.test(help.stdout), true, help.stdout);
   throws(() => parseArgs(['--clear', '--size']), /--clear runs alone/);
   throws(() => parseArgs(['--clear', 'index/add']), /--clear runs alone/);
   // --clean is the same hatch under its other, undocumented spelling.
@@ -365,4 +409,90 @@ it('fs-modify npm install prefers offline packages, skips audit/fund', () => {
     '--no-audit',
     '--no-fund',
   ]);
+});
+
+it('a piped flagless ref tail emits the shipped file verbatim', async () => {
+  // Seed a pinned machine-cache install by its documented layout: pinned refs
+  // hit the cache by existence alone, so the fake package works fully offline.
+  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-cat-9-9-9');
+  const pkgDir = join(refDir, 'node_modules', 'bismar-fake-cat');
+  rmSync(refDir, { force: true, recursive: true });
+  mkdirSync(join(pkgDir, 'src'), { recursive: true });
+  writeFileSync(
+    join(refDir, 'package.json'),
+    JSON.stringify({ dependencies: { 'bismar-fake-cat': '9.9.9' }, private: true })
+  );
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({ exports: { '.': './index.js' }, name: 'bismar-fake-cat', version: '9.9.9' })
+  );
+  writeFileSync(join(pkgDir, 'index.js'), 'export const twice = (n) => n * 2;\n');
+  writeFileSync(join(pkgDir, 'LICENSE'), 'MIT for bismar-fake-cat\n');
+  writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const twice = (n: number) => n * 2;\n');
+  try {
+    // Registry-cat: the shipped file's bytes, verbatim, nothing else.
+    const lic = await capture(() => runCli(['npm:bismar-fake-cat@9.9.9/LICENSE'], { tty: false }));
+    deepStrictEqual(lic.ok, true, lic.stderr);
+    deepStrictEqual(lic.stdout, 'MIT for bismar-fake-cat\n');
+    // A directory tail has no byte stream; the -s spelling lists it instead.
+    const dir = await capture(() => runCli(['npm:bismar-fake-cat@9.9.9/src'], { tty: false }));
+    deepStrictEqual(dir.ok, false);
+    deepStrictEqual(
+      /\/src is a directory; use -s npm:bismar-fake-cat@9\.9\.9\/src to list its files/.test(
+        dir.stderr
+      ),
+      true,
+      dir.stderr
+    );
+    // A miss errors like every scoped selector, never a silent no-op.
+    const miss = await capture(() => runCli(['npm:bismar-fake-cat@9.9.9/nope'], { tty: false }));
+    deepStrictEqual(miss.ok, false);
+    deepStrictEqual(
+      /no shipped file matches \/nope; use -s to list files/.test(miss.stderr),
+      true,
+      miss.stderr
+    );
+    // A bare piped ref still needs the terminal.
+    const bare = await capture(() => runCli(['npm:bismar-fake-cat@9.9.9'], { tty: false }));
+    deepStrictEqual(bare.ok, false);
+    deepStrictEqual(/interactive mode needs a terminal/.test(bare.stderr), true, bare.stderr);
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+  }
+});
+
+it('fixed-arity registry refs take /path tails: scoped -s, piped cat, -b guard', async () => {
+  // Seed a pinned crate extract by its cache layout: two top entries keep the
+  // sole-dir descent from collapsing the root, and the cache hits by existence.
+  const dir = join(tmpdir(), 'bismar-refs', 'v1', 'crate', 'bismar-fake-crate-0-1-0');
+  rmSync(dir, { force: true, recursive: true });
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  writeFileSync(join(dir, 'Cargo.toml'), '[package]\nname = "bismar-fake-crate"\n');
+  writeFileSync(join(dir, 'src', 'lib.rs'), 'pub fn twice(n: u32) -> u32 { n * 2 }\n');
+  try {
+    // A directory tail scopes the shipped-size listing, like npm tails.
+    const scopedLs = await capture(() =>
+      runCli(['-s', 'crate:bismar-fake-crate@0.1.0/src'], { tty: false })
+    );
+    deepStrictEqual(scopedLs.ok, true, scopedLs.stderr);
+    deepStrictEqual(/^src\/lib\.rs,\d+b\n$/.test(scopedLs.stdout), true, scopedLs.stdout);
+    // Piped flagless, a file tail emits the shipped bytes verbatim.
+    const cat = await capture(() =>
+      runCli(['crate:bismar-fake-crate@0.1.0/src/lib.rs'], { tty: false })
+    );
+    deepStrictEqual(cat.ok, true, cat.stderr);
+    deepStrictEqual(cat.stdout, 'pub fn twice(n: u32) -> u32 { n * 2 }\n');
+    // -b means the whole archive; a tail there points back at the flagless modes.
+    const guarded = await capture(() =>
+      runCli(['-b', 'crate:bismar-fake-crate@0.1.0/src/lib.rs'], { tty: false })
+    );
+    deepStrictEqual(guarded.ok, false);
+    deepStrictEqual(
+      /registry archives emit whole packages; drop \/src\/lib\.rs/.test(guarded.stderr),
+      true,
+      guarded.stderr
+    );
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
 });

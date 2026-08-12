@@ -22,7 +22,9 @@ const {
   BIG_ARCHIVE,
   guardBigArchive,
   jsHitStats,
+  parseProfileRef,
   parseRegistryRef,
+  profileHits,
   searchRegistry,
   setBigArchivePolicy,
 } = await import('../src/registries.ts');
@@ -62,7 +64,8 @@ const open = (selector: string | undefined, cwd: string = tmpdir()): Session => 
 };
 // A previous run's machine cache would skip the fetch path; start cold.
 const coldCache = (...slugs: string[]): void => {
-  for (const s of slugs) rmSync(join(tmpdir(), 'bismar-refs', s), { force: true, recursive: true });
+  for (const s of slugs)
+    rmSync(join(tmpdir(), 'bismar-refs', 'v1', s), { force: true, recursive: true });
 };
 const serve = async (
   routes: Record<string, () => { body: Buffer | string; json?: boolean }>
@@ -126,23 +129,27 @@ const zipOf = (files: [string, string][]): Buffer => {
 it('registry refs parse names and exact versions only', () => {
   deepStrictEqual(parseRegistryRef('crate:serde'), {
     name: 'serde',
+    path: '',
     prefix: 'crate:',
     version: '',
   });
   deepStrictEqual(parseRegistryRef('crate:once_cell@1.20.0'), {
     name: 'once_cell',
+    path: '',
     prefix: 'crate:',
     version: '1.20.0',
   });
   // Gem versions are dotted but not semver; pypi versions are PEP 440.
   deepStrictEqual(parseRegistryRef('gem:rails@7.1.3.4'), {
     name: 'rails',
+    path: '',
     prefix: 'gem:',
     version: '7.1.3.4',
   });
   deepStrictEqual(parseRegistryRef('gem:concurrent-ruby@1.2.0.rc1').version, '1.2.0.rc1');
   deepStrictEqual(parseRegistryRef('pypi:requests'), {
     name: 'requests',
+    path: '',
     prefix: 'pypi:',
     version: '',
   });
@@ -151,6 +158,7 @@ it('registry refs parse names and exact versions only', () => {
   // Language-name aliases normalize to the canonical prefix…
   deepStrictEqual(parseRegistryRef('rust:serde@1.0.219'), {
     name: 'serde',
+    path: '',
     prefix: 'crate:',
     version: '1.0.219',
   });
@@ -167,16 +175,52 @@ it('registry refs parse names and exact versions only', () => {
   // Multi-segment names: packagist vendor/name, github owner/repo, go import paths.
   deepStrictEqual(parseRegistryRef('composer:monolog/monolog'), {
     name: 'monolog/monolog',
+    path: '',
     prefix: 'composer:',
     version: '',
   });
   deepStrictEqual(parseRegistryRef('php:laravel/framework@v9.0.0').prefix, 'composer:');
   deepStrictEqual(parseRegistryRef('gh:paulmillr/noble-hashes@feature/x'), {
     name: 'paulmillr/noble-hashes',
+    path: '',
     prefix: 'gh:',
     version: 'feature/x',
   });
   deepStrictEqual(parseRegistryRef('github:octo/mini').prefix, 'gh:');
+  deepStrictEqual(parseRegistryRef('gitlab:inkscape/inkscape@master'), {
+    name: 'inkscape/inkscape',
+    path: '',
+    prefix: 'gitlab:',
+    version: 'master',
+  });
+  // GitLab allows nested subgroups in project paths.
+  deepStrictEqual(parseRegistryRef('gitlab:group/sub/proj').name, 'group/sub/proj');
+  throws(
+    () => parseRegistryRef('gitlab:justgroup'),
+    /invalid repository ref.*use gitlab:group\/project@ref/
+  );
+  // Fixed-arity refs take `/path` tails: the shipped file or directory the
+  // flagless modes open. Versions ride on the name, before the tail — except
+  // gh, whose refspecs may contain slashes, so there the version wins and only
+  // unversioned refs take a tail.
+  deepStrictEqual(parseRegistryRef('crate:serde@1.0.219/src/lib.rs'), {
+    name: 'serde',
+    path: 'src/lib.rs',
+    prefix: 'crate:',
+    version: '1.0.219',
+  });
+  deepStrictEqual(parseRegistryRef('gem:rails/lib').path, 'lib');
+  deepStrictEqual(parseRegistryRef('pypi:requests@2.32.0/README.md').path, 'README.md');
+  deepStrictEqual(parseRegistryRef('gh:paulmillr/qr/README.md'), {
+    name: 'paulmillr/qr',
+    path: 'README.md',
+    prefix: 'gh:',
+    version: '',
+  });
+  deepStrictEqual(parseRegistryRef('gh:paulmillr/qr@feature/x').path, '');
+  // Variable-arity names (go import paths, gitlab subgroups) take no tails.
+  deepStrictEqual(parseRegistryRef('go:golang.org/x/text/rate').path, '');
+  deepStrictEqual(parseRegistryRef('gitlab:group/sub/proj').path, '');
   deepStrictEqual(parseRegistryRef('golang:golang.org/x/text').prefix, 'go:');
   // go versions canonicalize to the proxy's v-prefixed spelling.
   deepStrictEqual(parseRegistryRef('go:golang.org/x/text@0.14.0').version, 'v0.14.0');
@@ -185,14 +229,26 @@ it('registry refs parse names and exact versions only', () => {
     () => parseRegistryRef('composer:monolog'),
     /invalid package ref.*use composer:vendor\/name@version/
   );
-  throws(() => parseRegistryRef('composer:a/b/c'), /invalid package ref/);
+  // Past the fixed vendor/name arity, extra segments are a shipped-path tail.
+  deepStrictEqual(parseRegistryRef('composer:a/b/c'), {
+    name: 'a/b',
+    path: 'c',
+    prefix: 'composer:',
+    version: '',
+  });
   throws(() => parseRegistryRef('gh:justowner'), /invalid repository ref.*use gh:owner\/repo@ref/);
   throws(
     () => parseRegistryRef('go:golang.org/x/text@latest'),
     /pin an exact version like go:golang\.org\/x\/text@v1\.0\.0/
   );
   throws(() => parseRegistryRef('crate:'), /invalid crate ref/);
-  throws(() => parseRegistryRef('crate:serde/de'), /invalid crate ref/);
+  // A slash past a one-segment name is a shipped-path tail now, not a typo.
+  deepStrictEqual(parseRegistryRef('crate:serde/de').path, 'de');
+  // `@user/repo` tolerates the profile sigil on a full ref; a bare `@user`
+  // stays a profile and never parses here.
+  deepStrictEqual(parseRegistryRef('gh:@octo/mini').name, 'octo/mini');
+  deepStrictEqual(parseRegistryRef('gitlab:@group/sub/proj').name, 'group/sub/proj');
+  throws(() => parseRegistryRef('gh:@octo'), /invalid repository ref/);
   throws(() => parseRegistryRef('gem:rails lib'), /invalid gem ref/);
   throws(() => parseRegistryRef('pypi:-requests'), /invalid package ref/);
   // Ranges and partial versions would need each ecosystem's resolver; refuse them.
@@ -242,17 +298,17 @@ it('archives at or past 100mb need consent before downloading', async () => {
 it('ref cache files one subdirectory per registry', () => {
   deepStrictEqual(
     refsCacheDir('crate:serde@1.0.219'),
-    join(tmpdir(), 'bismar-refs', 'crate', 'serde-1-0-219')
+    join(tmpdir(), 'bismar-refs', 'v1', 'crate', 'serde-1-0-219')
   );
   deepStrictEqual(
     refsCacheDir('gem:rails@7.1.3'),
-    join(tmpdir(), 'bismar-refs', 'gem', 'rails-7-1-3')
+    join(tmpdir(), 'bismar-refs', 'v1', 'gem', 'rails-7-1-3')
   );
   // Bare npm labels file under npm/; jsr labels keep their own shelf.
-  deepStrictEqual(refsCacheDir('qr@0.6.0'), join(tmpdir(), 'bismar-refs', 'npm', 'qr-0-6-0'));
+  deepStrictEqual(refsCacheDir('qr@0.6.0'), join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'qr-0-6-0'));
   deepStrictEqual(
     refsCacheDir('jsr:@std/bytes@1.0.5'),
-    join(tmpdir(), 'bismar-refs', 'jsr', 'std-bytes-1-0-5')
+    join(tmpdir(), 'bismar-refs', 'v1', 'jsr', 'std-bytes-1-0-5')
   );
 });
 
@@ -317,6 +373,10 @@ it('search parses hits from every registry api behind a browser agent', async ()
         { description: 'QR code generator', full_name: 'paulmillr/qr', stargazers_count: 123 },
       ],
     }),
+    '/projects?search=inkscape&order_by=last_activity_at&per_page=10': JSON.stringify([
+      { description: 'Vector editor', path_with_namespace: 'inkscape/inkscape', star_count: 42 },
+      { description: null, path_with_namespace: null },
+    ]),
   };
   const server = createServer((req, res) => {
     agents.push(req.headers['user-agent']);
@@ -335,6 +395,7 @@ it('search parses hits from every registry api behind a browser agent', async ()
     'BISMAR_CRATES_API',
     'BISMAR_GEMS_API',
     'BISMAR_GH_API',
+    'BISMAR_GITLAB_API',
   ];
   for (const key of bases)
     process.env[key] = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -358,10 +419,14 @@ it('search parses hits from every registry api behind a browser agent', async ()
     deepStrictEqual(await searchRegistry('gh:', 'qr'), [
       { desc: 'QR code generator', name: 'paulmillr/qr', version: '123★' },
     ]);
+    // Hits missing a path drop out instead of rendering blank rows.
+    deepStrictEqual(await searchRegistry('gitlab:', 'inkscape'), [
+      { desc: 'Vector editor', name: 'inkscape/inkscape', version: '42★' },
+    ]);
     // pypi retired its search api in 2021; the launcher opens exact names there.
     await rejects(() => searchRegistry('pypi:', 'requests'), /no search api behind pypi:/);
     // Every request went out as a mainstream browser, never as a bot.
-    deepStrictEqual(agents.length, 5, String(agents.length));
+    deepStrictEqual(agents.length, 6, String(agents.length));
     for (const ua of agents) {
       deepStrictEqual(ua?.startsWith('Mozilla/5.0 '), true, ua);
       deepStrictEqual(/ Chrome\/\d+/.test(ua ?? ''), true, ua);
@@ -376,7 +441,7 @@ it('search parses hits from every registry api behind a browser agent', async ()
 it('js hit stats find packed tarball bytes and dep counts, then cache', async () => {
   // Versions are deliberately unpublishable: the stats cache is machine-wide,
   // and a real pkg@version must never be seeded with stand-in numbers.
-  rmSync(join(tmpdir(), 'bismar-refs', '.stats'), { force: true, recursive: true });
+  rmSync(join(tmpdir(), 'bismar-refs', 'v1', '.stats'), { force: true, recursive: true });
   let base = '';
   const server = createServer((req, res) => {
     const url = req.url ?? '';
@@ -748,7 +813,7 @@ it('js garnish ignores a tarball url on an unexpected host', async () => {
   // A packument whose tarball points off-registry: the size garnish is dropped
   // (deps still count from the doc), never surfacing as an error. The version
   // is unpublishable so the machine stats cache is never seeded for a real one.
-  rmSync(join(tmpdir(), 'bismar-refs', '.stats'), { force: true, recursive: true });
+  rmSync(join(tmpdir(), 'bismar-refs', 'v1', '.stats'), { force: true, recursive: true });
   const server = createServer((req, res) => {
     if (req.url === '/preact/0.0.0-bismarhost') {
       res.setHeader('content-type', 'application/json');
@@ -803,14 +868,14 @@ it('interactive gh ref pins any refspec to a commit sha before caching', async (
     session.send('q');
     await session.done;
     const text = session.text();
-    deepStrictEqual(new RegExp(`gh:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:octo/mini@${short} · files`).test(text), true, text);
     deepStrictEqual(/README\.md {2}[\d.]+kb/.test(text), true, text);
     // Alias + explicit branch: same sha, same label, warm extract cache.
     const branch = open('github:octo/mini@dev');
     branch.send('q');
     await branch.done;
     deepStrictEqual(
-      new RegExp(`gh:octo/mini@${short} · files`).test(branch.text()),
+      new RegExp(`github:octo/mini@${short} · files`).test(branch.text()),
       true,
       branch.text()
     );
@@ -821,6 +886,58 @@ it('interactive gh ref pins any refspec to a commit sha before caching', async (
   } finally {
     delete process.env.BISMAR_GH_API;
     delete process.env.BISMAR_GH_CODELOAD;
+    await closeServer(server);
+    rmSync(fix, { force: true, recursive: true });
+  }
+});
+
+it('interactive gitlab ref pins any refspec to a commit sha before caching', async () => {
+  const sha = 'abcdef0123456789abcdef0123456789abcdef01';
+  const short = sha.slice(0, 12);
+  const fix = mkdtempSync(join(tmpdir(), 'bismar-gitlab-fix-'));
+  mkdirSync(join(fix, `mini-${short}`, 'src'), { recursive: true });
+  writeFileSync(join(fix, `mini-${short}`, 'README.md'), '# mini\n');
+  writeFileSync(join(fix, `mini-${short}`, 'src', 'index.js'), 'export const mini = 1;\n');
+  execFileSync('tar', ['-czf', join(fix, 'mini.tar.gz'), '-C', fix, `mini-${short}`]);
+  // Project paths reach the v4 api url-encoded; commits come back as JSON lists
+  // (no ref_name reads the default branch's tip, the HEAD case).
+  const commits = () => ({ body: JSON.stringify([{ id: sha }]), json: true });
+  const { port, server } = await serve({
+    [`/projects/octo%2Fmini/repository/archive.tar.gz?sha=${short}`]: () => ({
+      body: readFileSync(join(fix, 'mini.tar.gz')),
+    }),
+    '/projects/octo%2Fmini/repository/commits?per_page=1': commits,
+    '/projects/octo%2Fmini/repository/commits?ref_name=dev&per_page=1': commits,
+  });
+  try {
+    process.env.BISMAR_GITLAB_API = `http://127.0.0.1:${port}`;
+    coldCache(
+      join('gitlab', `octo-mini-${short}`),
+      join('.tags', 'gitlab-octo-mini.json'),
+      join('.tags', 'gitlab-octo-mini-dev.json')
+    );
+    // No ref means the default branch; the label pins to the immutable short sha.
+    const session = open('gitlab:octo/mini');
+    session.send('q');
+    await session.done;
+    const text = session.text();
+    deepStrictEqual(new RegExp(`gitlab:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(/README\.md {2}[\d.]+kb/.test(text), true, text);
+    // Explicit branch: same sha, same label, warm extract cache.
+    const branch = open('gitlab:octo/mini@dev');
+    branch.send('q');
+    await branch.done;
+    deepStrictEqual(
+      new RegExp(`gitlab:octo/mini@${short} · files`).test(branch.text()),
+      true,
+      branch.text()
+    );
+    await rejects(
+      () => runInteractive('gitlab:octo/nope', { cwd: tmpdir() }),
+      /repository or ref not found: gitlab:octo\/nope/
+    );
+  } finally {
+    delete process.env.BISMAR_GITLAB_API;
     await closeServer(server);
     rmSync(fix, { force: true, recursive: true });
   }
@@ -865,7 +982,7 @@ it('files view jumps to the github repo named by package.json and back', async (
     // The home files view advertises the jump, naming where it lands…
     deepStrictEqual(/· m mode \(bundles\) · r repo \(gh\)/.test(text), true, text);
     // …r lands in the pinned repo tree, with repo-only files on show…
-    deepStrictEqual(new RegExp(`gh:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:octo/mini@${short} · files`).test(text), true, text);
     deepStrictEqual(/▸ docs\//.test(text), true, text);
     // …where the hint names the way back by the package's own ecosystem.
     const repoFrame =
@@ -924,7 +1041,7 @@ it('files view jumps from a registry extract to the repo its manifest names', as
     // Files-only sessions have no mode toggle, so the jump stands alone…
     deepStrictEqual(/← up · r repo \(gh\) · q quit/.test(text), true, text);
     // …r lands in the pinned repo tree, with repo-only files on show…
-    deepStrictEqual(new RegExp(`gh:rusty/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:rusty/mini@${short} · files`).test(text), true, text);
     deepStrictEqual(/▸ benches\//.test(text), true, text);
     // …where the way back is labelled by the ecosystem that named the repo.
     const repoFrame =
@@ -1072,5 +1189,144 @@ it('interactive pypi ref prefers sdists and falls back to wheel zips', async () 
     delete process.env.BISMAR_PYPI_API;
     await closeServer(server);
     rmSync(fix, { force: true, recursive: true });
+  }
+});
+
+it('the wrapped fetch refuses hosts outside the registry allowlist', async () => {
+  // A registry answer that redirects off the known-host set must die at the
+  // fetch layer: allowedHosts re-checks the final post-redirect URL, a layer
+  // allowUrl (which only vets metadata-supplied URLs up front) cannot give.
+  const { port, server } = await (async () => {
+    const srv = createServer((_req, res) => {
+      res.statusCode = 302;
+      res.setHeader('location', 'https://example.com/steal');
+      res.end();
+    });
+    await new Promise<void>((res) => srv.listen(0, '127.0.0.1', res));
+    return { port: (srv.address() as AddressInfo).port, server: srv };
+  })();
+  const prev = process.env.BISMAR_CRATES_API;
+  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
+  try {
+    await rejects(() => searchRegistry('crate:', 'serde'), /host not allowed: example\.com/);
+  } finally {
+    if (prev === undefined) delete process.env.BISMAR_CRATES_API;
+    else process.env.BISMAR_CRATES_API = prev;
+    await closeServer(server);
+  }
+});
+
+it('profile refs parse, list via registry apis, and print piped', async () => {
+  // `prefix:@user` is a profile; only a bare user head qualifies.
+  deepStrictEqual(parseProfileRef('gh:@visionmedia'), { prefix: 'gh:', user: 'visionmedia' });
+  // Multi-segment-name registries read a bare single segment as a profile too.
+  deepStrictEqual(parseProfileRef('gh:visionmedia'), { prefix: 'gh:', user: 'visionmedia' });
+  deepStrictEqual(parseProfileRef('gitlab:inkscape'), { prefix: 'gitlab:', user: 'inkscape' });
+  deepStrictEqual(parseProfileRef('composer:monolog'), { prefix: 'composer:', user: 'monolog' });
+  // …while single-segment-name registries keep requiring the sigil.
+  deepStrictEqual(parseProfileRef('crate:serde'), undefined);
+  deepStrictEqual(parseProfileRef('npm:qr'), undefined);
+  deepStrictEqual(parseProfileRef('rs:@dtolnay'), { prefix: 'crate:', user: 'dtolnay' });
+  deepStrictEqual(parseProfileRef('npm:@noble'), { prefix: 'npm:', user: 'noble' });
+  deepStrictEqual(parseProfileRef('jsr:@std'), { prefix: 'jsr:', user: 'std' });
+  deepStrictEqual(parseProfileRef('npm:@scope/name'), undefined);
+  deepStrictEqual(parseProfileRef('gh:@a@main'), undefined);
+  deepStrictEqual(parseProfileRef('gh:@'), undefined);
+  deepStrictEqual(parseProfileRef('lodash'), undefined);
+  // pypi parses as a namespace but has no profile api behind it.
+  await rejects(() => profileHits('pypi:', 'x'), /no profile listing behind pypi:/);
+  const { port, server } = await serve({
+    '/api/v1/users/vision': () => ({ body: JSON.stringify({ user: { id: 7 } }), json: true }),
+    '/api/v1/crates?user_id=7&per_page=25&sort=recent-updates': () => ({
+      body: JSON.stringify({
+        crates: [
+          { description: 'QR toolkit', max_stable_version: '1.2.3', name: 'vision-qr' },
+          { description: null, max_version: '0.1.0', name: 'vision-x' },
+        ],
+      }),
+      json: true,
+    }),
+    '/-/v1/search?text=maintainer%3Anoble&size=25': () => ({
+      body: JSON.stringify({ objects: [] }),
+      json: true,
+    }),
+    // gh profiles go through the search api: star-sorted in one request.
+    '/search/repositories?q=user%3Avision&sort=stars&per_page=25': () => ({
+      body: JSON.stringify({
+        items: [
+          { description: 'Popular', full_name: 'vision/big', stargazers_count: 900 },
+          { description: null, full_name: 'vision/small', stargazers_count: 3 },
+        ],
+      }),
+      json: true,
+    }),
+    '/-/v1/search?text=%40noble%2F&size=250': () => ({
+      body: JSON.stringify({
+        objects: [
+          { package: { name: '@noble/hashes', version: '2.3.0' } },
+          { package: { name: 'noble-other', version: '1.0.0' } },
+        ],
+      }),
+      json: true,
+    }),
+  });
+  const csApi = process.env.BISMAR_CRATES_API;
+  const npmApi = process.env.BISMAR_NPM_API;
+  const ghApi = process.env.BISMAR_GH_API;
+  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
+  process.env.BISMAR_NPM_API = `http://127.0.0.1:${port}`;
+  process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
+  try {
+    deepStrictEqual(await profileHits('gh:', 'vision'), [
+      { desc: 'Popular', name: 'vision/big', version: '900★' },
+      { desc: '', name: 'vision/small', version: '3★' },
+    ]);
+    // BISMAR_LOG appends one line per network request, read per call.
+    const logFile = join(tmpdir(), 'bismar-test-net-log.txt');
+    rmSync(logFile, { force: true });
+    process.env.BISMAR_LOG = logFile;
+    try {
+      await profileHits('crate:', 'vision');
+      const logged = readFileSync(logFile, 'utf8');
+      deepStrictEqual(
+        /^\S+ GET http:\/\/127\.0\.0\.1:\d+\/api\/v1\/users\/vision$/m.test(logged),
+        true,
+        logged
+      );
+      deepStrictEqual(/GET .*crates\?user_id=7/.test(logged), true, logged);
+    } finally {
+      delete process.env.BISMAR_LOG;
+      rmSync(logFile, { force: true });
+    }
+    // crates.io keys listings by numeric user id: two hops, one listing.
+    deepStrictEqual(await profileHits('crate:', 'vision'), [
+      { desc: 'QR toolkit', name: 'vision-qr', version: '1.2.3' },
+      { desc: '', name: 'vision-x', version: '0.1.0' },
+    ]);
+    // npm `@x`: maintained packages first; a scope with no such maintainer
+    // falls back to a text search filtered to exact scope members.
+    deepStrictEqual(await profileHits('npm:', 'noble'), [
+      { desc: '', name: '@noble/hashes', version: '2.3.0' },
+    ]);
+    // Piped, the flagless profile prints bounded name,version,desc rows.
+    const prevLog = console.log;
+    let out = '';
+    console.log = (...args: unknown[]) => {
+      out += `${args.join(' ')}\n`;
+    };
+    try {
+      await runCli(['crate:@vision'], { tty: false });
+    } finally {
+      console.log = prevLog;
+    }
+    deepStrictEqual(out, 'vision-qr,1.2.3,QR toolkit\nvision-x,0.1.0,\n');
+  } finally {
+    if (csApi === undefined) delete process.env.BISMAR_CRATES_API;
+    else process.env.BISMAR_CRATES_API = csApi;
+    if (npmApi === undefined) delete process.env.BISMAR_NPM_API;
+    else process.env.BISMAR_NPM_API = npmApi;
+    if (ghApi === undefined) delete process.env.BISMAR_GH_API;
+    else process.env.BISMAR_GH_API = ghApi;
+    await closeServer(server);
   }
 });

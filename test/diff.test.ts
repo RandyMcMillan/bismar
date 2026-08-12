@@ -297,6 +297,34 @@ it('-db diffs bundle text and -dbs reports per-export size deltas', async () => 
   deepStrictEqual(sameSize, `no bundle size changes: ${a} and ${a} measure identical\n`);
 });
 
+it('-db on a terminal pages the rendered diff instead of dumping it', async () => {
+  const a = './test/vectors/plain';
+  const b = './test/vectors/documented';
+  const input = new PassThrough();
+  let raw = '';
+  const io = {
+    cols: 120,
+    input,
+    output: {
+      write: (text: string) => {
+        raw += text;
+        return true;
+      },
+    },
+    rows: 20,
+  };
+  const done = runCli(['-db', a, b], { io, tty: true });
+  const text = () => raw.replace(/\x1b\[[\d?;]*[a-zA-Z]/g, '');
+  for (let i = 0; i < 300 && !/bismarTestPlain/.test(text()); i++)
+    await new Promise((res) => setTimeout(res, 50));
+  // Alternate screen, the two labels as the title, diff text in the window.
+  deepStrictEqual(raw.includes('\x1b[?1049h'), true, 'expected the alternate screen');
+  match(text(), /\.\/test\/vectors\/plain → \.\/test\/vectors\/documented · \d+ lines/);
+  match(text(), /-var bismarTestPlain =/);
+  input.write('q');
+  await done;
+});
+
 it('measured sides install tarballs and leave local dirs in place', async () => {
   const { npmPack, rmTempDir, tempDir } = await import('../src/fs-modify.ts');
   put('mpkg/package.json', JSON.stringify({ name: 'bismar-test-mside', version: '1.0.0' }));

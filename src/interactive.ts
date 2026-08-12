@@ -21,18 +21,23 @@ import {
   type DiffEntry,
   type DiffSide,
   fileDiffLines,
+  scoped,
   statSummary,
   statTail,
   type TreeDiff,
+  walkFiles,
 } from './diff.ts';
 import { color, paint, progressOff, stripAnsi, wantColor } from './env.ts';
 import { rmTempDir, tempDir } from './fs-modify.ts';
 import { bad, err, explicitPath, firstModule, fmtBytes, kb, ONLY_EXT, paintId } from './public.ts';
 import {
+  canProfile,
   canSearch,
+  displayLabel,
   isRegistrySelector,
   jsHitStats,
   parseRegistryRef,
+  profileHits,
   registryContext,
   type RegistryRef,
   type SearchHit,
@@ -77,7 +82,14 @@ export type InteractiveIo = {
   output?: { write: (text: string) => boolean };
   rows?: number;
 };
-export type InteractiveOpts = { cwd?: string; io?: InteractiveIo; menu?: boolean };
+export type InteractiveOpts = {
+  cwd?: string;
+  io?: InteractiveIo;
+  menu?: boolean;
+  // Pre-fetched profile hits (`bismar gh:@user`): the launcher opens directly
+  // on its results stage, listing them like a search that already ran.
+  profile?: { hits: SearchHit[]; prefix: string; user: string };
+};
 type Stats = { gz: number; loc: number; min: number };
 // 'failed' keeps broken selectors out of the auto-measure queue; `s` retries them.
 type Cell = Stats | 'failed' | 'pending';
@@ -248,12 +260,31 @@ const SEARCHES: { example: string; label: string; prefix: string }[] = [
   { example: 'railties', label: 'Ruby/Gems', prefix: 'gem:' },
   { example: 'requests', label: 'Python/PyPi', prefix: 'pypi:' },
   { example: 'paulmillr/qr', label: 'GitHub', prefix: 'gh:' },
+  { example: 'inkscape/inkscape', label: 'GitLab', prefix: 'gitlab:' },
 ];
+// The SEARCHES row for a prefix; ecosystems without a search box (composer)
+// synthesize a row so profile listings can still name themselves.
+const whichOf = (prefix: string): (typeof SEARCHES)[number] =>
+  SEARCHES.find((reg) => reg.prefix === prefix) ?? {
+    example: '',
+    label: prefix.slice(0, -1),
+    prefix,
+  };
 // State the launcher parks between opens: ← from a session root reopens the
 // menu exactly where it was left — same option, query, and hits listing.
 export type LauncherState = {
   cursor?: number;
-  results?: { cursor: number; hits: SearchHit[]; which: (typeof SEARCHES)[number] };
+  // `root` marks a CLI-seeded profile listing (`bismar gh:@user`): the session
+  // began here, so there is no menu or prompt behind it to back into. `title`
+  // is a profile listing's crumb (`github:@veorq`), doubling as the head of
+  // the session crumb once a hit opens.
+  results?: {
+    cursor: number;
+    hits: SearchHit[];
+    root?: boolean;
+    title?: string;
+    which: (typeof SEARCHES)[number];
+  };
   search?: { note: string; text: string; which: (typeof SEARCHES)[number] };
 };
 // Returns the chosen selector ('' means the current directory) plus whatever
@@ -266,7 +297,7 @@ export const chooseTarget = async (
   io: InteractiveIo = {},
   state: LauncherState = {},
   typeahead: string[] = []
-): Promise<{ leftover: string[]; selector: string } | undefined> => {
+): Promise<{ leftover: string[]; selector: string; via?: string } | undefined> => {
   const input = io.input ?? process.stdin;
   const output = io.output ?? process.stdout;
   const colorOn = wantColor();
@@ -294,9 +325,17 @@ export const chooseTarget = async (
   };
   const draw = (): void => {
     if (results) {
+      // Profile listings crumb as the profile itself (`github:@veorq`);
+      // searches keep their query framing.
       const lines = [
-        paint(`search ${results.which.label}`, color.bold, colorOn) +
-          paint(` · ${results.hits.length} matches`, color.dim, colorOn),
+        (results.title
+          ? paintId(results.title, colorOn, 'module')
+          : paint(`search ${results.which.label}`, color.bold, colorOn)) +
+          paint(
+            ` · ${results.hits.length} ${results.title ? 'listed' : 'matches'}`,
+            color.dim,
+            colorOn
+          ),
         '',
       ];
       for (const [i, found] of results.hits.entries()) {
@@ -316,7 +355,14 @@ export const chooseTarget = async (
           `${i === results.cursor ? paint('▸ ', color.bold, colorOn) : '  '}${paint(found.name, color.yellow, colorOn)}${tail}`
         );
       }
-      lines.push('', paint('↑↓ move · enter open · esc back', color.dim, colorOn));
+      lines.push(
+        '',
+        paint(
+          results.root ? '↑↓ move · enter open · q quit' : '↑↓ move · enter open · esc back',
+          color.dim,
+          colorOn
+        )
+      );
       render(lines);
       return;
     }
@@ -331,7 +377,9 @@ export const chooseTarget = async (
         `name: ${search.text}`,
         search.note ? paint(search.note, color.red, colorOn) : '',
         paint(
-          `${searchable ? 'enter search' : 'enter open'} · esc back · e.g. ${search.which.example}`,
+          `${searchable ? 'enter search' : 'enter open'} · esc back · e.g. ${search.which.example}${
+            canProfile(search.which.prefix) ? ' or @user' : ''
+          }`,
           color.dim,
           colorOn
         ),
@@ -401,6 +449,10 @@ export const chooseTarget = async (
           case 'quit':
           case 'esc':
           case 'back':
+            // A CLI-seeded profile listing is the session root: no menu or
+            // prompt lies behind it, so backing out of the root is exiting —
+            // exactly like esc at every other root view.
+            if (picks.root) return undefined;
             // Back to the prompt with the query kept for refining; stop the
             // garnish requests still in flight for the dropped listing.
             picks.abort.abort();
@@ -421,7 +473,12 @@ export const chooseTarget = async (
           case 'enter': {
             const picked = picks.hits[picks.cursor];
             if (picked)
-              return { leftover: pending.splice(0), selector: picks.which.prefix + picked.name };
+              return {
+                leftover: pending.splice(0),
+                selector: picks.which.prefix + picked.name,
+                // A profile listing heads the session crumb it opens into.
+                via: picks.title,
+              };
             break;
           }
         }
@@ -437,16 +494,28 @@ export const chooseTarget = async (
           const bare = name.startsWith(box.which.prefix)
             ? name.slice(box.which.prefix.length)
             : name;
+          // A bare `@user` lists that profile — repos, scope, or owned
+          // packages — instead of running a name search.
+          const profileUser =
+            /^@[\w.-]+$/.test(bare) && canProfile(box.which.prefix) ? bare.slice(1) : '';
           // A version pin opens directly — search apis know nothing about
           // versions; so does a registry without a search api (pypi).
-          if (!canSearch(box.which.prefix) || bare.lastIndexOf('@') > 0)
+          if (!profileUser && (!canSearch(box.which.prefix) || bare.lastIndexOf('@') > 0))
             return { leftover: pending.splice(0), selector: box.which.prefix + bare };
           box.note = '';
           render([paint(`searching ${box.which.label} for ${bare}…`, color.dim, colorOn)]);
           try {
-            const hits = await searchRegistry(box.which.prefix, bare);
+            const hits = profileUser
+              ? await profileHits(box.which.prefix, profileUser)
+              : await searchRegistry(box.which.prefix, bare);
             if (hits.length) {
-              const picks = { abort: new AbortController(), cursor: 0, hits, which: box.which };
+              const picks = {
+                abort: new AbortController(),
+                cursor: 0,
+                hits,
+                title: profileUser ? displayLabel(`${box.which.prefix}@${profileUser}`) : undefined,
+                which: box.which,
+              };
               results = picks;
               garnish(picks);
             } else box.note = `no matches for ${bare}`;
@@ -501,7 +570,13 @@ export const chooseTarget = async (
     // Park the stage for the next open (← from the session that follows).
     state.cursor = cursor;
     state.search = search;
-    state.results = results && { cursor: results.cursor, hits: results.hits, which: results.which };
+    state.results = results && {
+      cursor: results.cursor,
+      hits: results.hits,
+      root: results.root,
+      title: results.title,
+      which: results.which,
+    };
     output.write(MOUSE_OFF + ALT_OFF);
     input.off('data', onData);
     input.setRawMode?.(false);
@@ -731,6 +806,187 @@ export const runDiff = async (
   }
 };
 
+// Standalone pager session: one text on the alternate screen with the full
+// vim-flavored pager — scroll, `/` search (n/N repeat), `:` line jump. The
+// terminal face for payloads that would otherwise dump into scrollback: bundle
+// text (-b) and bundle diffs (-db); pipes get the raw text, never this. No
+// mouse reporting, so native text selection (copying source) keeps working.
+export const runPager = async (
+  title: string,
+  text: string,
+  opts: { footer?: string; io?: InteractiveIo } = {}
+): Promise<void> => {
+  const io = opts.io ?? {};
+  const input = io.input ?? process.stdin;
+  const output = io.output ?? process.stdout;
+  const colorOn = wantColor();
+  const term = () => ({
+    cols: io.cols ?? (process.stdout.columns || 80),
+    rows: io.rows ?? (process.stdout.rows || 24),
+  });
+  const render = (lines: string[]): void => {
+    const max = term().cols - 1;
+    output.write(`\x1b[H${lines.map((line) => truncAnsi(line, max)).join('\x1b[K\r\n')}\x1b[J`);
+  };
+  const page: Pager = { lines: displayText(text).split('\n'), offset: 0, title };
+  let ask: { kind: ':' | '/'; text: string } | undefined;
+  let lastSearch = '';
+  // The logical line currently at the top of the pager window.
+  const topLineOf = (): number => {
+    const starts = page.wrap?.starts ?? [0];
+    let at = 0;
+    for (const [i, start] of starts.entries())
+      if (start <= page.offset) at = i;
+      else break;
+    return at;
+  };
+  // 0-based logical line -> wrapped-row offset; the draw clamp handles the end.
+  const gotoLine = (line: number): void => {
+    const starts = page.wrap?.starts ?? [0];
+    page.offset = starts[Math.max(0, Math.min(starts.length - 1, line))] ?? 0;
+  };
+  // Case-sensitive substring over the text itself (colors stripped), wrapping
+  // around either way like vim.
+  const findNext = (dir: 1 | -1): void => {
+    if (!lastSearch) return;
+    const total = page.lines.length;
+    const from = topLineOf();
+    for (let step = 1; step <= total; step++) {
+      const i = (((from + dir * step) % total) + total) % total;
+      if (stripAnsi(page.lines[i]).includes(lastSearch)) return gotoLine(i);
+    }
+  };
+  const submitAsk = (): void => {
+    if (!ask) return;
+    if (ask.kind === ':') {
+      const line = Number.parseInt(ask.text, 10);
+      if (Number.isFinite(line) && line > 0) gotoLine(line - 1);
+    } else {
+      // A bare `/` repeats the previous pattern, like vim.
+      if (ask.text) lastSearch = ask.text;
+      findNext(1);
+    }
+    ask = undefined;
+  };
+  const draw = (): void => {
+    const { cols, rows } = term();
+    const visible = Math.max(3, rows - 3);
+    const max = Math.max(1, cols - 1);
+    if (page.wrap?.cols !== max) {
+      const wrapRows: string[] = [];
+      const starts: number[] = [];
+      for (const line of page.lines) {
+        starts.push(wrapRows.length);
+        wrapRows.push(...wrapAnsi(line, max));
+      }
+      page.wrap = { cols: max, rows: wrapRows, starts };
+    }
+    const wrapped = page.wrap.rows;
+    const maxOffset = Math.max(0, wrapped.length - visible);
+    page.offset = Math.max(0, Math.min(page.offset, maxOffset));
+    const pct = maxOffset ? Math.round((page.offset / maxOffset) * 100) : 100;
+    const foot = ask
+      ? `${ask.kind}${ask.text}`
+      : paint(
+          `${pct}%${opts.footer ? ` · ${opts.footer}` : ''} · ↑↓/space scroll · / search · q quit`,
+          color.dim,
+          colorOn
+        );
+    render([
+      paintId(page.title, colorOn, 'module') +
+        paint(` · ${page.lines.length} lines`, color.dim, colorOn),
+      ...wrapped.slice(page.offset, page.offset + visible),
+      // A highlight color may span past the window's last line; close it.
+      (colorOn ? color.reset : '') + foot,
+    ]);
+  };
+  const pending: string[] = [];
+  let wake: (() => void) | undefined;
+  const onData = (chunk: unknown): void => {
+    pending.push(...tokenize(String(chunk)));
+    const cont = wake;
+    wake = undefined;
+    cont?.();
+  };
+  input.setRawMode?.(true);
+  input.on('data', onData);
+  input.resume();
+  // The TUI owns the terminal from here; mute the startup progress line.
+  progressOff();
+  output.write(ALT_ON);
+  try {
+    for (;;) {
+      draw();
+      while (!pending.length)
+        await new Promise<void>((res) => {
+          wake = res;
+        });
+      const unit = pending.shift();
+      const key = unit ? KEYMAP[unit] : undefined;
+      // Ctrl-C/Ctrl-D close from anywhere, prompt open or not.
+      if (key === 'exit') return;
+      // An open `/`/`:` prompt eats raw characters, not their bindings.
+      if (ask) {
+        if (unit === '\r' || unit === '\n') submitAsk();
+        else if (unit === '\x1b') ask = undefined;
+        else if (unit === '\x7f' || unit === '\b') ask.text = ask.text.slice(0, -1);
+        else if (unit && unit.length === 1 && unit >= ' ' && unit !== '\x7f') ask.text += unit;
+        continue;
+      }
+      const jump = Math.max(3, term().rows - 3);
+      switch (key) {
+        case 'quit':
+        case 'back':
+        case 'esc':
+          return;
+        case 'down':
+        case 'enter':
+          page.offset += 1;
+          break;
+        case 'up':
+          page.offset -= 1;
+          break;
+        case 'pgdn':
+          page.offset += jump;
+          break;
+        case 'pgup':
+          page.offset -= jump;
+          break;
+        case 'halfdn':
+          page.offset += Math.ceil(jump / 2);
+          break;
+        case 'halfup':
+          page.offset -= Math.ceil(jump / 2);
+          break;
+        case 'top':
+          page.offset = 0;
+          break;
+        case 'bottom':
+          // Wrapping can make more rows than lines; the draw clamp finds the end.
+          page.offset = Infinity;
+          break;
+        case 'search':
+          ask = { kind: '/', text: '' };
+          break;
+        case 'goto':
+          ask = { kind: ':', text: '' };
+          break;
+        case 'next':
+          findNext(1);
+          break;
+        case 'prev':
+          findNext(-1);
+          break;
+      }
+    }
+  } finally {
+    output.write(ALT_OFF);
+    input.off('data', onData);
+    input.setRawMode?.(false);
+    input.pause();
+  }
+};
+
 export const runInteractive = async (
   selector: string | undefined,
   opts: InteractiveOpts = {}
@@ -739,17 +995,35 @@ export const runInteractive = async (
   // The launcher runs before any context resolves: its choice is the selector.
   // Menu sessions loop: ← from a session's root reopens the launcher on the
   // parked stage (same option, query, and hits), so picks can be compared.
-  const menu = opts.menu && selector === undefined ? ({} as LauncherState) : undefined;
+  // Profile sessions (`bismar gh:@user`) seed the launcher directly on its
+  // results stage, pre-filled with the profile's packages.
+  const menu =
+    (opts.menu || opts.profile) && selector === undefined
+      ? opts.profile
+        ? ({
+            results: {
+              cursor: 0,
+              hits: opts.profile.hits,
+              root: true,
+              title: displayLabel(`${opts.profile.prefix}@${opts.profile.user}`),
+              which: whichOf(opts.profile.prefix),
+            },
+          } as LauncherState)
+        : ({} as LauncherState)
+      : undefined;
   let backChain: string[] = [];
   for (;;) {
     let chosen = selector;
     let dirOnly = false;
     let handoff: string[] = [];
+    // A profile listing's crumb heads the session crumb of whatever it opens.
+    let via = '';
     if (menu) {
       const picked = await chooseTarget(basename(baseDir) || baseDir, opts.io, menu, backChain);
       if (!picked) return;
       backChain = [];
       handoff = picked.leftover;
+      via = picked.via ?? '';
       if (picked.selector) chosen = picked.selector;
       // Package-less directories still browse: their files are the surface.
       else dirOnly = !existsSync(join(baseDir, 'package.json'));
@@ -766,6 +1040,9 @@ export const runInteractive = async (
       let refSel = '';
       // Non-empty for filesystem selectors: the file's own spelling measures it.
       let fileMode = '';
+      // Non-empty for npm/jsr refs with a `/path` tail: a deep link into the
+      // shipped files view, resolved by diff's scoped rule once the tree exists.
+      let refFocus = '';
       // Navigator-only ecosystems (crates.io, rubygems, pypi, packagist, github,
       // the go proxy): fetch + extract, then browse shipped files. There is no JS
       // to enumerate or weigh, so the modules view, size measurement, and bundling
@@ -780,6 +1057,9 @@ export const runInteractive = async (
         const got = await registryContext(tmp, regRef);
         label = got.label;
         pkgRoot = got.pkgDir;
+        // Fixed-arity registry refs deep-link like npm ones (parseRegistryRef
+        // keeps variable-arity names — go:, gitlab: — whole, path '').
+        refFocus = regRef.path;
       } else if (dirOnly) {
         // Current directory chosen from the launcher, no package.json around:
         // browse the tree like a registry extract — files only, nothing to
@@ -829,8 +1109,9 @@ export const runInteractive = async (
               }
             } else {
               const ref = parseNpmRef(asRef(sel));
-              if (ref.path)
-                err(`interactive mode expects a bare package; drop /${ref.path} from ${bad(sel)}`);
+              // A `/path` tail deep-links the files view; the package itself
+              // still browses whole (refContext ignores the path).
+              refFocus = ref.path;
               const got = refContext(ctx.outDir, ref);
               mods = readModules(got.refCtx);
               pkgRoot = got.refCtx.pkgDir;
@@ -866,9 +1147,20 @@ export const runInteractive = async (
           await fillExports(build, mods);
         }
       }
+      // Breadcrumbs, one grammar: labels display with the long registry name
+      // (`github:veorq/oee@6b9abbad7dac`), and a session opened from a profile
+      // listing keeps the profile as its head with the redundant owner/scope
+      // collapsed (`github:@veorq · oee@6b9abbad7dac`). Selectors and row ids
+      // keep their canonical spellings; only the crumb is prettified — into a
+      // spelling that is still a valid selector.
+      if (via) {
+        const slash = label.indexOf('/');
+        const colon = label.indexOf(':');
+        label = `${via} · ${slash >= 0 ? label.slice(slash + 1) : colon >= 0 ? label.slice(colon + 1) : label}`;
+      } else label = displayLabel(label);
       // `r` target: the github repo the browsed package's own manifest advertises
       // — package.json for JS, Cargo.toml/composer.json/core metadata/gemspec or
-      // the import path itself for registry extracts. gh: is already the repo.
+      // the import path itself for registry extracts. gh:/gitlab: are the repo.
       // The ecosystem that named it labels the way back.
       const home = ghRepoOf(pkgRoot, regRef?.prefix, regRef?.name);
       const ghRepo = home.repo;
@@ -1279,6 +1571,8 @@ export const runInteractive = async (
       // bundled or executed. Binary content gets a stub instead of escape soup.
       type PreviewLang =
         | ''
+        | 'bash'
+        | 'c'
         | 'go'
         | 'html'
         | 'js'
@@ -1294,6 +1588,8 @@ export const runInteractive = async (
       const LANGS: [RegExp, PreviewLang][] = [
         [/\.[mc]?jsx?$/i, 'js'],
         [/\.[mc]?tsx?$/i, 'ts'],
+        [/\.sh$/i, 'bash'],
+        [/\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/i, 'c'],
         [/\.json$/i, 'json'],
         [/\.(md|markdown)$/i, 'md'],
         [/\.html?$/i, 'html'],
@@ -1325,7 +1621,10 @@ export const runInteractive = async (
           lines = text.split('\n');
           fileViews.set(ent.path, lines);
         }
-        pager = { lines, offset: 0, title: fileRel ? `${fileRel}/${ent.name}` : ent.name };
+        // In-file view: the full previous path — session crumb, then the
+        // file's own path — so the pager header reads as one address.
+        const side = repoMode && repo ? repo.label : label;
+        pager = { lines, offset: 0, title: `${side}/${fileRel ? `${fileRel}/` : ''}${ent.name}` };
       };
       const toRoot = (): void => {
         current = undefined;
@@ -1341,6 +1640,34 @@ export const runInteractive = async (
         wake = undefined;
         cont?.();
       };
+      // Deep link: a ref tail focuses the files view before the first draw — an
+      // exact shipped file opens with its preview up, a directory opens on its
+      // listing. A tail matching nothing is a typo'd path, never a silently
+      // whole-package browse; erroring here leaves the terminal untouched (the
+      // TUI is not up yet).
+      if (refFocus) {
+        const files = scoped(walkFiles(pkgRoot), refFocus);
+        if (!files.size) {
+          // The tail may have meant a module (`/decode`); its file is the
+          // shipped spelling (`/decode.js`) — bridge the two grammars.
+          const asMod = mods.find((mod) => mod.module === refFocus.replace(ONLY_EXT, ''));
+          err(
+            `no shipped file matches /${bad(refFocus)}; ` +
+              (asMod ? `the module's file ships as /${fileBase(asMod)}` : 'drop the tail to browse')
+          );
+        }
+        if (files.has(refFocus)) {
+          const slash = refFocus.lastIndexOf('/');
+          fileRel = slash < 0 ? '' : refFocus.slice(0, slash);
+          const name = slash < 0 ? refFocus : refFocus.slice(slash + 1);
+          const listing = filesOf(fileRel);
+          const at = listing.findIndex((ent) => !ent.dir && ent.name === name);
+          if (at >= 0) {
+            fileCursor = at;
+            await openFile(listing[at]);
+          }
+        } else fileRel = refFocus.replace(/\/+$/, '');
+      }
       input.setRawMode?.(true);
       input.on('data', onData);
       input.resume();
@@ -1474,7 +1801,7 @@ export const runInteractive = async (
                     render([paint(`fetching gh:${ghRepo}…`, color.dim, colorOn)]);
                     try {
                       const got = await registryContext(tmp, parseRegistryRef(`gh:${ghRepo}`));
-                      repo = { dir: got.pkgDir, label: got.label };
+                      repo = { dir: got.pkgDir, label: displayLabel(got.label) };
                     } catch {
                       // Stay put: rate limits and vanished repos must not kill
                       // the session.

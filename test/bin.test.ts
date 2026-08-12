@@ -63,9 +63,10 @@ it('bismar --help documents the single command, every flag and its alias', async
   // No subcommands and no other binaries: positionals are always selectors.
   deepStrictEqual(/bismar (bundle|size) |jsbt-check|<command>/.test(out), false, out);
   // Combined shorts and the namespace table are documented too.
-  deepStrictEqual(out.includes('short flags combine: bismar -bm == bismar -b -m'), true, out);
-  deepStrictEqual(out.includes('namespaces (long aliases like npm: crate: work too):'), true, out);
-  deepStrictEqual(out.includes('rs:   crates.io   gh:   github'), true, out);
+  deepStrictEqual(out.includes('-bsm'), true, out);
+  deepStrictEqual(out.includes('namespaces ("short: long"; both versions work):'), true, out);
+  deepStrictEqual(out.includes('rs:   crate       gh:   github'), true, out);
+  deepStrictEqual(out.includes('gitlab: gitlab'), true, out);
 });
 
 it('bismar refuses unknown selector namespaces with the full listing', async () => {

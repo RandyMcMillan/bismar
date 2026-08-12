@@ -3,6 +3,8 @@
  * One command, two outputs.
  * @module
  */
+import { readFileSync, statSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import {
   bundleStatCsv,
   bundleStatHuman,
@@ -14,9 +16,11 @@ import {
   packLocalSides,
   renderTextUnified,
   renderUnified,
+  scoped,
   statCsv,
   statHuman,
   statNames,
+  walkFiles,
 } from './diff.ts';
 import {
   color,
@@ -29,16 +33,19 @@ import {
   wantColor,
 } from './env.ts';
 import { clearTempCaches, rmTempDir, tempDir } from './fs-modify.ts';
-import { bad, err, explicitPath, fmtBytes, runSelf } from './public.ts';
-import { readFileSync, statSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import type { InteractiveIo } from './interactive.ts';
+import { bad, err, explicitPath, fmtBytes, kb, runSelf } from './public.ts';
+import { asRef, explicitRef, type ExternalRef, installedRef, parseNpmRef } from './refs.ts';
 import {
   canonSelector,
   isRegistrySelector,
+  parseProfileRef,
   parseRegistryRef,
+  profileHits,
   registryArchive,
+  registryContext,
 } from './registries.ts';
-import { buildFirst, measureRows, runSize } from './size.ts';
+import { buildFirst, type Built, measureRows, type RowData, runSize } from './size.ts';
 import { fileSizesCsv, fileSizesHuman, registrySurface, sizesCsv, sizesHuman } from './surface.ts';
 
 export type CliArgs = {
@@ -53,44 +60,59 @@ export type CliArgs = {
   size: boolean;
 };
 const usage = `usage:
-  bismar [<selector>] [--bundle] [--size] [--minify] [--list]
+  bismar [<selector>] [--bundle] [--minify] [--size] [--list]
+  bismar [-bms] [<selector>]
   bismar --diff <a> <b>
 
-opens the interactive package navigator by default; without a selector it asks
-what to open — the current directory, or a registry search.
-
 flags:
-  -b, --bundle  emit a single-file IIFE bundle on stdout; non-JS refs emit
-                the saved registry archive verbatim
-  -m, --minify  emit the minified bundle (JS only)
-  -s, --size    list shipped file sizes for every ecosystem; never bundles
-      -bs       min+gzip bundle stats per export (JS); archive stat (non-JS)
-  -l, --list    every public export as an import statement; non-JS refs list
-                their import surface (rs:/gh: their files)
-  -d, --diff    compare two packages recursively (refs, dirs, .tgz tarballs;
-                a dir vs a package is npm-packed first): navigator on a
-                terminal, unified diff piped; -ds file sizes, -dl names,
-                -db bundle text, -dbs unminified bundle-size deltas, -dbms
-                min+gzip ones (JS only; refs may pick one module/export:
-                -db npm:qr@0.6.0/index)
-      --clear   remove every bismar cache (ref installs, extracts, archives)
+  <no flag>     open interactive navigator
+  -b, --bundle  emit a single-file bundle (JS) / archive (non-JS)
+  -m, --minify  (JS only) emit the minified bundle
+  -s, --size    list shipped file size stats
+      -bs       (JS) bundle sizes
+      -bsm      (JS) bundle sizes, minified+gzipped
+  -d, --diff    interactive comparison between 2 selectors
+      -ds       non-interactive size stats for all files
+      -dbs      (JS) diff of bundle sizes
+      -dbsm     (JS) diff of bundle sizes, minified+gzipped 
+  -l, --list    list all public exports
+      --clear   clean-up bismar cache
 
-short flags combine: bismar -bm == bismar -b -m
+selectors (package / ref / dir / archive):
+  npm:qr, npm:qr@0.6, gem:sinatra, ../sinatra, ./qr.tar.bz2
 
-namespaces (long aliases like npm: crate: work too):
+namespaces ("short: long"; both versions work):
   js:   npm         py:   pypi
   jsr:  jsr         php:  packagist
-  rs:   crates.io   gh:   github
-  rb:   rubygems    go:   go proxy
+  rs:   crate       gh:   github
+  rb:   gem         go:   go proxy
+  gitlab: gitlab
 
 examples:
-  bismar js:@noble/curves
+  bismar js:@noble/hashes           # vim-like pager
   bismar rs:serde
-  bismar js:@scure/base -b > scure-base.js
-  bismar go:golang.org/x/time --list
-  bismar -s js:preact
-  bismar -bs js:preact | sort -t, -k5 -rn
-  bismar -d js:qr@0.5.0 js:qr@0.6.0`;
+  bismar gem:sinatra/README.md
+  bismar gh:@paulmillr              # user repos
+  bismar gem:sinatra/lib/sinatra.rb > s.rb
+
+  bismar -l npm:micro-ftch
+
+  bismar -b js:qr > qr.js
+  bismar -b cargo:serde > serde.cargo
+  bismar -bm js:qr > qr.min.js
+
+  bismar -s js:chokidar
+  bismar -bs npm:micro-ftch
+  bismar -bsm npm:micro-ftch
+
+  bismar -d js:qr@0.5 js:qr@0.6
+  bismar -ds npm:readdirp@{4,5}
+  bismar -dbs npm:readdirp@{4,5}
+  bismar -dbsm npm:readdirp@{4,5}
+
+  # hint: non-terminal (non-TTY) emits DIFFERENT, machine-friendly output
+  bismar -d npm:micro-ftch@{1.0,1.1} | head
+  bismar -bsm npm:react | sort -t, -k4 -rn`;
 
 // Short aliases resolve to the canonical long flag before anything looks at them.
 // --clean is --clear's undocumented second spelling.
@@ -142,7 +164,9 @@ export const parseArgs = (argv: string[]): CliArgs => {
     diff: flags.has('--diff'),
     help,
     // Interactive is the default mode: any output-shaping flag opts out of it
-    // (--clear is maintenance, not output — the only flag that doesn't).
+    // (--clear is maintenance, not output — the only flag that doesn't). Like
+    // -d, the flagless default is TTY-dual: piped, a ref `/path` tail emits
+    // that shipped file's bytes instead of a TUI (see runCli).
     interactive: ![...flags].some((flag) => flag !== '--clear'),
     list: flags.has('--list'),
     minify: flags.has('--minify'),
@@ -169,8 +193,9 @@ export const parseArgs = (argv: string[]): CliArgs => {
   return args;
 };
 
-// `tty` is injectable for tests; real runs read the ambient stdout.
-type Opts = { cwd?: string; tty?: boolean };
+// `tty` is injectable for tests; real runs read the ambient stdout. `io` rides
+// through to every TUI/pager session the run may open, for headless tests.
+type Opts = { cwd?: string; io?: InteractiveIo; tty?: boolean };
 const archiveName = (file: string, label: string): string => {
   const base = basename(file);
   return label.slice(label.indexOf(':') + 1).replace(/[/@]/g, '-') + base.slice(base.indexOf('.'));
@@ -182,6 +207,11 @@ const noBundle = (selector: string, hint: '-d' | '-ds'): never => {
 };
 const decoder = new TextDecoder();
 const tarballSelector = /\.(?:tgz|tar\.gz)$/i;
+// Terminals never receive payload dumps: bundles and bundle diffs open in the
+// pager at any size (pipes always get the raw text, ungated). Only syntax
+// highlighting is capped — past this many bytes the pager shows plain text, so
+// a multi-megabyte bundle opens without a highlight stall.
+const HIGHLIGHT_MAX = 1024 * 1024;
 
 export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => {
   const args = parseArgs(argv);
@@ -256,6 +286,12 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           b.label,
           stdoutColor(undefined, opts.tty)
         );
+        // Same TTY duality as -d and -b: a terminal pages the rendered diff
+        // (it can dwarf the bundles themselves), a pipe gets the text.
+        if (opts.tty ?? !!process.stdout.isTTY) {
+          const { runPager } = await import('./interactive.ts');
+          return await runPager(`${a.label} → ${b.label}`, lines.join('\n'), { io: opts.io });
+        }
         return console.log(lines.join('\n'));
       }
       // A tail on one side mirrors onto the other: a one-file scope against a
@@ -275,7 +311,7 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       // or with -l just the changed file names.
       if (!args.size && !args.list && (opts.tty ?? !!process.stdout.isTTY)) {
         const { runDiff } = await import('./interactive.ts');
-        return await runDiff(a, b, tree);
+        return await runDiff(a, b, tree, opts.io);
       }
       // Size stats already list every changed file, so -dls reads as -ds.
       const lines = args.size
@@ -293,13 +329,69 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
   if (args.interactive) {
     if (args.paths.length > 1)
       err('interactive mode takes at most one package selector; add -b to bundle several');
-    if (!(opts.tty ?? !!process.stdout.isTTY))
-      err('interactive mode needs a terminal; add -b to bundle or -s for shipped sizes');
+    const sel = args.paths[0];
+    const tty = opts.tty ?? !!process.stdout.isTTY;
+    // Profile refs (`gh:@visionmedia`, `npm:@noble`) list a person, org,
+    // scope, or vendor: on a terminal the launcher opens directly on the
+    // listing (enter opens a package, ← backs out to the menu); piped, the
+    // rows print — a bounded line-per-package table.
+    const prof = sel ? parseProfileRef(sel) : undefined;
+    if (prof) {
+      const hits = await profileHits(prof.prefix, prof.user);
+      progressDone();
+      if (!tty) {
+        const csv = csvEnabled(undefined, opts.tty);
+        for (const hit of hits)
+          console.log(
+            csv
+              ? csvRow([hit.name, hit.version, hit.desc])
+              : hit.name +
+                  (hit.version ? `  ${hit.version}` : '') +
+                  (hit.desc ? `  ${hit.desc}` : '')
+          );
+        return;
+      }
+      const { runInteractive } = await import('./interactive.ts');
+      return runInteractive(undefined, {
+        cwd: opts.cwd,
+        io: opts.io,
+        profile: { hits, prefix: prof.prefix, user: prof.user },
+      });
+    }
+    // The flagless command shares -d's dual nature: a terminal gets the
+    // interactive rendering (the navigator, deep-linked by a `/path` tail), a
+    // pipe gets bytes — a ref tail naming a shipped file emits it verbatim,
+    // registry-cat style (`bismar npm:qr/LICENSE > lic.txt`). Directories and
+    // misses have no byte stream; error with the listing spelling instead of
+    // guessing. No size gate: pipes always get everything, like -b.
+    if (!tty && sel) {
+      const regRef = isRegistrySelector(sel) ? parseRegistryRef(sel) : undefined;
+      const npmRef = !regRef && explicitRef(sel) ? parseNpmRef(asRef(sel)) : undefined;
+      const path = regRef?.path || npmRef?.path || '';
+      if (path) {
+        const tmp = tempDir('bundle');
+        try {
+          // entryOptional: emitting a shipped file must not require a JS entry.
+          const pkgDir = regRef
+            ? (await registryContext(tmp, regRef)).pkgDir
+            : installedRef(tmp, npmRef as ExternalRef, true).pkgDir;
+          const files = scoped(walkFiles(pkgDir), path);
+          if (!files.size) err(`no shipped file matches /${bad(path)}; use -s to list files`);
+          if (!files.has(path)) err(`/${path} is a directory; use -s ${sel} to list its files`);
+          progressDone();
+          process.stdout.write(readFileSync(join(pkgDir, path)));
+          return;
+        } finally {
+          rmTempDir(tmp);
+        }
+      }
+    }
+    if (!tty) err('interactive mode needs a terminal; add -b to bundle or -s for shipped sizes');
     // Loaded on demand: normal runs never pay for the TUI or its syntax highlighter.
     const { runInteractive } = await import('./interactive.ts');
     // A bare `bismar` opens the launcher menu first: browse the current
     // directory, or search a registry by exact package name.
-    return runInteractive(args.paths[0], { cwd: opts.cwd, menu: !args.paths.length });
+    return runInteractive(sel, { cwd: opts.cwd, io: opts.io, menu: !args.paths.length });
   }
 
   // Bare -s is one operation in every ecosystem: list the exact tree that
@@ -321,9 +413,17 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
             : await (async (): Promise<string[]> => {
                 const sideDir = join(tmp, `listing-${i}`);
                 const side = packLocalSide(sideDir, await diffTarget(sideDir, sel, cwd));
+                // A `/path` ref tail scopes the listing like it scopes a diff;
+                // the packed-archive footer only describes the whole package,
+                // so a scoped listing drops it and totals the scope alone.
                 return csv
-                  ? sizesCsv(side.dir)
-                  : sizesHuman(side.dir, stdoutColor(undefined, opts.tty), side.archiveBytes);
+                  ? sizesCsv(side.dir, side.sel)
+                  : sizesHuman(
+                      side.dir,
+                      stdoutColor(undefined, opts.tty),
+                      side.sel ? undefined : side.archiveBytes,
+                      side.sel
+                    );
               })();
         progressDone();
         if (i && !csv) console.log('');
@@ -347,7 +447,12 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           js.push(sel);
           continue;
         }
-        const got = await registryArchive(tmp, parseRegistryRef(sel));
+        const ref = parseRegistryRef(sel);
+        if (ref.path)
+          err(
+            `registry archives emit whole packages; drop /${bad(ref.path)}, or drop the flags to open the file`
+          );
+        const got = await registryArchive(tmp, ref);
         const name = archiveName(got.file, got.label);
         const bytes = statSync(got.file).size;
         progressDone();
@@ -358,7 +463,8 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
                 paint(`  ${fmtBytes(bytes)}`, color.dim, stdoutColor(undefined, opts.tty))
         );
       }
-      if (js.length || !args.paths.length) await runSize({ cwd: opts.cwd, only: js, outDir: tmp });
+      if (js.length || !args.paths.length)
+        await runSize({ cwd: opts.cwd, minify: args.minify, only: js, outDir: tmp });
       return;
     } finally {
       rmTempDir(tmp);
@@ -391,7 +497,12 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
   if (regSel) {
     const tmp = tempDir('bundle');
     try {
-      const got = await registryArchive(tmp, parseRegistryRef(regSel));
+      const regRef = parseRegistryRef(regSel);
+      if (regRef.path)
+        err(
+          `registry archives emit whole packages; drop /${bad(regRef.path)}, or drop the flags to open the file`
+        );
+      const got = await registryArchive(tmp, regRef);
       progressDone();
       if (opts.tty ?? !!process.stdout.isTTY) {
         process.exitCode = 1;
@@ -417,41 +528,58 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
       rmTempDir(tmp);
     }
   }
-  let statsFallback = false;
-  if (opts.tty ?? !!process.stdout.isTTY) {
-    // Terminals get the bundle's size stats instead of its bytes: the single stat
-    // row builds exactly the bundle that was refused (plain+min, in memory), so
-    // the fallback costs one gzip pass over erroring out. Still an error exit:
-    // the requested output was never produced. The command echoes the run's own
-    // flags and selectors, so it's copy-pasteable as typed.
-    statsFallback = true;
-    process.exitCode = 1;
-    const cmd = ['bismar', '-b', ...(args.minify ? ['-m'] : []), ...args.paths].join(' ');
-    const on = wantColor();
-    console.error(
-      paint('warn: refusing to output to the terminal, use redirect: ', color.gray, on) +
-        paint(`${cmd} > out.js — or -bs for size stats`, color.white, on)
-    );
-  }
   // The temp dir only hosts npm ref installs; bundling and measurement are in-memory.
-  const tmp = tempDir(statsFallback ? 'size' : 'bundle');
+  const tmp = tempDir('bundle');
   try {
-    if (statsFallback)
-      return await runSize({
+    if (!(opts.tty ?? !!process.stdout.isTTY)) {
+      const bundle = await buildFirst({
         cwd: opts.cwd,
         only: args.paths,
         outDir: tmp,
-        // The fallback mirrors what bundling would have emitted: one artifact, one
-        // row — never the full browse table, which would measure every export.
-        single: statsFallback,
       });
-    const bundle = await buildFirst({
+      if (!bundle) return err('no bundles found');
+      process.stdout.write(args.minify ? bundle.min : bundle.plain);
+      return;
+    }
+    // Terminals: the bundle opens in the pager — any size, a successful exit;
+    // built once, in memory, never rebuilt for the footer stats. Only syntax
+    // highlighting is capped (HIGHLIGHT_MAX), so huge bundles open plain
+    // instead of stalling. The footer answers "how do I save this": the run's
+    // own flags and selectors as a redirect, copy-pasteable as typed.
+    let built: Built | undefined;
+    let row: RowData | undefined;
+    await runSize({
       cwd: opts.cwd,
+      minify: args.minify,
+      onBuilt: (out) => {
+        built ??= out;
+      },
+      onRow: (data) => {
+        row ??= data;
+      },
       only: args.paths,
       outDir: tmp,
+      silent: true,
+      // One artifact, one pager — never the full browse table, which would
+      // measure every export.
+      single: true,
     });
-    if (!bundle) return err('no bundles found');
-    process.stdout.write(args.minify ? bundle.min : bundle.plain);
+    if (!built || !row) return err('no bundles found');
+    const bytes = args.minify ? built.min : built.plain;
+    let text = decoder.decode(bytes);
+    if (stdoutColor(undefined, opts.tty) && bytes.length <= HIGHLIGHT_MAX) {
+      // Same highlighter as the navigator's file previews; a highlight failure
+      // falls back to the plain text, never to an error.
+      const { highlightText } = await import('./vendor/speed-highlight/terminal.js');
+      text = await highlightText(text, 'js').catch(() => text);
+    }
+    const cmd = ['bismar', '-b', ...(args.minify ? ['-m'] : []), ...args.paths].join(' ');
+    const { runPager } = await import('./interactive.ts');
+    return await runPager(row.label, text, {
+      // No LOC here: the pager header already counts the lines.
+      footer: `${kb(row.minBytes)}kb min, ${kb(row.gzBytes)}kb gzip · ${cmd} > out.js`,
+      io: opts.io,
+    });
   } finally {
     // Content goes to stdout; the temp work dir has nothing left to offer.
     rmTempDir(tmp);

@@ -64,8 +64,15 @@ export const diffTarget = async (
   bundle = false
 ): Promise<DiffSide> => {
   if (isRegistrySelector(raw)) {
-    const got = await registryContext(outDir, parseRegistryRef(raw));
-    return { archiveBytes: got.archiveBytes, dir: got.pkgDir, label: got.label };
+    const ref = parseRegistryRef(raw);
+    const got = await registryContext(outDir, ref);
+    return {
+      archiveBytes: got.archiveBytes,
+      dir: got.pkgDir,
+      // A `/path` tail scopes the walk, exactly like an npm ref tail below.
+      label: ref.path ? `${got.label}/${ref.path}` : got.label,
+      sel: ref.path || undefined,
+    };
   }
   if (TGZ.test(raw)) {
     const file = resolve(cwd, raw);
@@ -174,7 +181,9 @@ export const walkFiles = (root: string): Map<string, number> => {
 // A `/path` ref tail scopes a side's walk: the exact shipped file, or a
 // directory's whole subtree. Filtering the maps (not the merged entries)
 // keeps the footer totals honest — they weigh the scope, not the package.
-const scoped = (files: Map<string, number>, sel?: string): Map<string, number> => {
+// Shared with the bare `-s` listing (surface.ts), so a tail means the same
+// files whether the tree is being listed or diffed.
+export const scoped = (files: Map<string, number>, sel?: string): Map<string, number> => {
   if (!sel) return files;
   const dir = `${sel.replace(/\/+$/, '')}/`;
   const out = new Map<string, number>();

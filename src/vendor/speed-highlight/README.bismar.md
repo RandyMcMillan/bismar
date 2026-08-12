@@ -5,7 +5,9 @@ This is a source snapshot of
 `4a00a9432bb30c84c32134b3d7fb22458c318d17` (upstream version `1.2.23`).
 
 Bismar's copy adds Ruby (`rb`) and PHP (`php`) language definitions. Rust (`rs`)
-and Go (`go`) are retained from upstream.
+and Go (`go`) are retained from upstream. Markdown fences also normalize common
+language names to the bundled ids, including `cpp` to `c`, `sh` to `bash`, and
+the long names for JavaScript, TypeScript, Python, Ruby, Rust, and Go.
 
 These are the unbuilt upstream sources, consumed by a plain relative import
 (`./vendor/speed-highlight/terminal.js`) rather than a package name. There is no
