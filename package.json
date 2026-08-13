@@ -1,6 +1,6 @@
 {
   "name": "bismar",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Browse, weigh, and diff packages from npm, jsr, crates.io, rubygems, pypi, packagist, github",
   "files": [
     "*.js",
