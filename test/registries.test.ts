@@ -1192,27 +1192,35 @@ it('interactive pypi ref prefers sdists and falls back to wheel zips', async () 
   }
 });
 
-it('the wrapped fetch refuses hosts outside the registry allowlist', async () => {
-  // A registry answer that redirects off the known-host set must die at the
-  // fetch layer: allowedHosts re-checks the final post-redirect URL, a layer
-  // allowUrl (which only vets metadata-supplied URLs up front) cannot give.
-  const { port, server } = await (async () => {
-    const srv = createServer((_req, res) => {
-      res.statusCode = 302;
-      res.setHeader('location', 'https://example.com/steal');
-      res.end();
-    });
-    await new Promise<void>((res) => srv.listen(0, '127.0.0.1', res));
-    return { port: (srv.address() as AddressInfo).port, server: srv };
-  })();
+it('the wrapped fetch refuses hosts outside the registry allowlist pre-send', async () => {
+  // A registry answer that redirects off the known-host set must die BEFORE
+  // any request leaves: redirects are followed hop by hop (follow()), so the
+  // allowedHosts check runs pre-send on every hop. The victim listens on an
+  // unlisted port and must see zero requests — erroring after contacting it
+  // would pass a naive error assert while still leaking the probe.
+  let victimHits = 0;
+  const victim = createServer((_req, res) => {
+    victimHits++;
+    res.end('leaked');
+  });
+  await new Promise<void>((res) => victim.listen(0, '127.0.0.1', res));
+  const victimUrl = `http://127.0.0.1:${(victim.address() as AddressInfo).port}/steal`;
+  const bouncer = createServer((_req, res) => {
+    res.statusCode = 302;
+    res.setHeader('location', victimUrl);
+    res.end();
+  });
+  await new Promise<void>((res) => bouncer.listen(0, '127.0.0.1', res));
   const prev = process.env.BISMAR_CRATES_API;
-  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
+  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${(bouncer.address() as AddressInfo).port}`;
   try {
-    await rejects(() => searchRegistry('crate:', 'serde'), /host not allowed: example\.com/);
+    await rejects(() => searchRegistry('crate:', 'serde'), /host not allowed: 127\.0\.0\.1:/);
+    deepStrictEqual(victimHits, 0, 'the disallowed host must never be contacted');
   } finally {
     if (prev === undefined) delete process.env.BISMAR_CRATES_API;
     else process.env.BISMAR_CRATES_API = prev;
-    await closeServer(server);
+    await closeServer(bouncer);
+    await closeServer(victim);
   }
 });
 

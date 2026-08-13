@@ -47,42 +47,37 @@ const UA =
 // Built on first use so BISMAR_RPS can tune the budget; 0 drops the spacing
 // entirely — local test stand-ins and trusted proxies, where politeness only
 // buys latency. Unset or garbage keeps the default.
-// Defense in depth atop allowUrl: micro-ftch's allowedHosts makes the wrapped
-// fetch itself refuse any host outside the known-registry set (the README's
-// host table), and re-checks the final post-redirect URL — a layer allowUrl
-// cannot provide. Hosts derive from the configured bases, so an overridden
-// BISMAR_* base admits its own host instead of the default's.
-const hostOf = (baseUrl: string): string => {
-  try {
-    return new URL(baseUrl).host;
-  } catch {
-    return '';
-  }
-};
-const allowedHosts = (): string[] =>
+// Defense in depth atop allowUrl: micro-ftch 1.2 allowedHosts makes the
+// wrapped fetch itself refuse any origin outside the known-registry set (the
+// README's host table) BEFORE a request is sent, and follows redirects one
+// hop at a time with the same pre-send check per hop — a layer allowUrl
+// cannot provide. Entries are exact origins (a bare hostname means https), so
+// http test stand-ins carry their scheme; an overridden BISMAR_* base admits
+// its own origin instead of the default's.
+const allowedOrigins = (): string[] =>
   [
-    hostOf(crates()),
+    originOf(crates()),
     // crates.io download redirect target.
     'static.crates.io',
-    hostOf(gems()),
-    hostOf(pypi()),
+    originOf(gems()),
+    originOf(pypi()),
     'files.pythonhosted.org',
-    hostOf(composer()),
-    hostOf(packagist()),
-    hostOf(ghApi()),
-    hostOf(ghCodeload()),
-    hostOf(gitlabApi()),
-    hostOf(goProxy()),
-    hostOf(npmApi()),
-    hostOf(jsrApi()),
-    hostOf(jsrNpm()),
+    originOf(composer()),
+    originOf(packagist()),
+    originOf(ghApi()),
+    originOf(ghCodeload()),
+    originOf(gitlabApi()),
+    originOf(goProxy()),
+    originOf(npmApi()),
+    originOf(jsrApi()),
+    originOf(jsrNpm()),
   ].filter(Boolean);
 let lazyNet: FetchFn | undefined;
 let lazyHosts = '';
 const net = (): FetchFn => {
   // Rebuilt when the effective host set changes (env-overridden bases vary
   // per test); a stable environment builds exactly once.
-  const hosts = allowedHosts();
+  const hosts = allowedOrigins();
   const key = hosts.join(',');
   if (!lazyNet || key !== lazyHosts) {
     lazyHosts = key;

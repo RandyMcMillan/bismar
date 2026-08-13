@@ -1,19 +1,17 @@
 # bismar
 
-> Weigh, browse, and diff packages from any registry — and bundle JS ones into single-file IIFEs with size stats per export
+> Browse, weigh, and diff packages from any registry
 
-A bismar is the old Viking hand balance for weighing goods. This one:
+A bismar is the old Viking hand scale for weighing goods. This one works with
+npm, jsr, crates.io, rubygems, pypi, packagist, github, gitlab, and
+the go proxy; allowing to:
 
-- `bismar <selector>` opens an fs-style package navigator — npm, jsr,
-  crates.io, rubygems, pypi, packagist, github, gitlab, and the go proxy
-- `bismar <selector> --bundle` packs the selection into a single-file IIFE
-- `bismar <selector> --size` lists the files and bytes that ship
-- `bismar <selector> -bs` prints per-export bundle measurements (lines +
-  unminified size; `-bsm` for min+gzip)
-- `bismar --diff <a> <b>` compares two packages recursively
+1. Browse code in interactive keyboard-friendly navigator
+2. Compare diffs between different versions
+3. Download files
+4. Easily use tool output in machine-friendly non-TTY env
 
-Non-JS ecosystems are browse/diff/download-only: their code is never executed
-or bundled.
+For JS, bismar can also bundle and minify specific exports, with tree shaking.
 
 Used by [noble cryptography](https://paulmillr.com/noble/) to ensure bundles stay small.
 
@@ -88,35 +86,36 @@ namespaces ("short: long"; both versions work):
 
 ## Security
 
-`npm install --prefer-offline` is used to preferably fetch bundles from cache.
+```mermaid
+flowchart LR
+  B[bismar] --> W["micro-ftch: host allowlist, per redirect hop, GET/HEAD only, rate-limited, BISMAR_LOG"]
+  W -->|allowed hosts, table below| R[registries]
+  W x--x|refused before send| X[any other host]
+  B --> N["npm subprocess (npm/jsr) --ignore-scripts --prefer-offline"]
+  N -->|npm's own traffic, honors npm config| NR[npm registry]
+  R --> C["$TMPDIR/bismar-* caches; removed on reboot or --clear"]
+  NR --> C
+```
 
-Downloads at or past 100mb ask for confirmation first — a `gh:` ref can
-casually name a 200mb monorepo tarball; off a terminal they are refused, and
-`BISMAR_BIG=1` waves them through (scripts, CI).
-
-Cache entries are created in OS temp dir, which OS auto-cleans after reboot;
-`bismar --clear` removes them all immediately and reports the reclaimed bytes.
-`@noble/hashes@2.2.0` is cached until reboot; `@noble/hashes` resolves to a version
-for 15 mins.
-
-Registry requests (downloads, version resolution, searches, profiles) share
-one wrapped fetch — [micro-ftch](https://github.com/paulmillr/micro-ftch) with
-a concurrency cap, a requests-per-second budget (`BISMAR_RPS` tunes it, `0`
-disables), and retries that honor Retry-After — so anonymous rate limits stay
-unprovoked; github's anonymous search quota (10/minute) surfaces as a plain
-one-line hint. `BISMAR_LOG=file.txt` appends one line per request
-(`timestamp method url`) for auditing.
-
-All requests are read-only: GET, plus one HEAD (tarball size garnish, with a
-one-byte range GET fallback). bismar never POSTs — and the npm subprocess it
-spawns for installs runs with `--no-audit`, which removes npm's one routine
-POST, leaving its traffic GET-only too.
-
-The complete list of hosts that fetch can reach — enforced at the fetch layer
-(micro-ftch `allowedHosts`): any other host is refused outright, and the check
-re-runs on the final post-redirect URL, so a registry answer can't bounce a
-request elsewhere. Each base is overridable by its `BISMAR_*` env var;
-overriding admits that host instead:
+- **Read-only traffic**: GET, plus one HEAD (tarball-size garnish, one-byte
+  range-GET fallback). bismar never POSTs; `--no-audit` removes npm's one
+  routine POST too.
+- **Host allowlist, enforced pre-send**: only the origins below are reachable.
+  Redirects are followed one checked hop at a time, so a registry answer can't
+  bounce a request elsewhere — not even as a probe the blocked host would see.
+  Download URLs read from registry metadata are origin-confined besides:
+  packagist dists must be github zipballs, pypi artifacts must live on
+  pythonhosted.
+- **No code execution**: npm runs `--ignore-scripts`; bundling and measuring
+  are static esbuild work; non-JS packages are never executed or bundled.
+- **Big downloads ask first**: 100mb+ needs a terminal confirmation
+  (`BISMAR_BIG=1` for scripts and CI); off a terminal it is refused.
+- **Disposable caches**: everything lives under `$TMPDIR/bismar-*`, OS-cleaned
+  after reboot; `bismar --clear` wipes it now. Pinned versions cache until
+  reboot, floating "latest" for 15 minutes.
+- **Knobs**: `BISMAR_LOG=file.txt` logs every request, one line each;
+  `BISMAR_RPS` tunes the polite request budget (`0` disables); overriding a
+  `BISMAR_*` base admits that origin in place of the default.
 
 | host                           | used for                                            |
 | ------------------------------ | --------------------------------------------------- |
@@ -133,19 +132,6 @@ overriding admits that host instead:
 | codeload.github.com            | gh archive downloads; composer dist zipballs        |
 | gitlab.com                     | gitlab api, search, profiles, archives              |
 | proxy.golang.org               | go module metadata + zips                           |
-
-`npm:`/`jsr:` ref installs additionally run through the npm CLI, which talks
-to its configured registry (registry.npmjs.org and npm.jsr.io by default,
-honoring your npm config) — those requests are npm's own and bypass the
-wrapped fetch and its log.
-
-Download URLs taken from registry metadata (packagist dist zips, PyPI
-artifacts, npm/jsr tarballs) are confined to a known-registry origin before
-they are fetched, so a hostile package can't redirect a request at an arbitrary
-host — packagist dists must be github zipballs, PyPI artifacts must live on
-pythonhosted, and tarball garnish must come from the configured registry. The
-default allowlists are https-only; an overridden `BISMAR_*` base (offline
-tests, mirrors) admits its own origin.
 
 Three deps are used: esbuild and micro-ftch are pinned, and the syntax
 highlighter is vendored and bundled with the package, so none can update
