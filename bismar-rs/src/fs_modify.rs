@@ -275,15 +275,11 @@ const NPM_INSTALL_ARGS: &[&str] = &[
 /// Run `npm install` in `dir`. Pass `online = true` to skip `--prefer-offline`.
 pub fn npm_install(dir: &Path, online: bool) -> Result<()> {
     progress_show(&format!("npm install {}", dir.display()));
-    let mut args: Vec<&str> = NPM_INSTALL_ARGS
+    let args: Vec<&str> = NPM_INSTALL_ARGS
         .iter()
         .filter(|&&a| !online || a != "--prefer-offline")
         .copied()
         .collect();
-    if online {
-        // remove --prefer-offline
-        args.retain(|&a| a != "--prefer-offline");
-    }
     let status = Command::new("npm")
         .args(&args)
         .current_dir(dir)

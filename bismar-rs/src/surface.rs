@@ -4,9 +4,22 @@
 use crate::diff::{scoped, walk_files};
 use crate::env::{csv_row, Color};
 use crate::public::{fmt_bytes, kb, read_json, resolve_inside, sorted};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+static RE_GO_MODULE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?m)^module\s+(\S+)").unwrap());
+static RE_GO_PACKAGE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?m)^package\s+([A-Za-z_]\w*)").unwrap());
+static RE_IDENT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+static RE_DIST_INFO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\.(dist|egg)-info$").unwrap());
+static RE_CARGO_NAME: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?m)^name\s*=\s*"([^"]+)""#).unwrap());
 
 // ── Go surface ────────────────────────────────────────────────────────────────
 
@@ -21,10 +34,7 @@ fn go_skip(rel: &str) -> bool {
 fn go_module(pkg_dir: &Path, ref_name: &str) -> String {
     let go_mod = pkg_dir.join("go.mod");
     if let Ok(text) = fs::read_to_string(&go_mod) {
-        if let Some(cap) = regex::Regex::new(r"(?m)^module\s+(\S+)")
-            .ok()
-            .and_then(|re| re.captures(&text))
-        {
+        if let Some(cap) = RE_GO_MODULE.captures(&text) {
             return cap[1].to_string();
         }
     }
@@ -55,10 +65,7 @@ pub fn go_surface(pkg_dir: &Path, ref_name: &str) -> Vec<String> {
     for (rel, dir_files) in &by_dir {
         for file in dir_files {
             let content = fs::read_to_string(pkg_dir.join(file)).unwrap_or_default();
-            if let Some(cap) = regex::Regex::new(r"(?m)^package\s+([A-Za-z_]\w*)")
-                .ok()
-                .and_then(|re| re.captures(&content))
-            {
+            if let Some(cap) = RE_GO_PACKAGE.captures(&content) {
                 let pkg = &cap[1];
                 if pkg != "main" {
                     paths.push(if rel.is_empty() {
@@ -141,7 +148,7 @@ pub fn pypi_surface(pkg_dir: &Path) -> Vec<String> {
                     if let Ok(content) = fs::read_to_string(&top) {
                         for line in content.lines() {
                             let t = line.trim();
-                            if !t.is_empty() && regex::Regex::new(r"^[A-Za-z_]\w*$").map(|re| re.is_match(t)).unwrap_or(false) {
+                            if !t.is_empty() && RE_IDENT.is_match(t) {
                                 names.insert(t.to_string());
                             }
                         }
@@ -189,12 +196,7 @@ pub fn crate_surface(pkg_dir: &Path) -> Vec<String> {
     let cargo = pkg_dir.join("Cargo.toml");
     let name = fs::read_to_string(&cargo)
         .ok()
-        .and_then(|t| {
-            regex::Regex::new(r#"(?m)^name\s*=\s*"([^"]+)""#)
-                .ok()?
-                .captures(&t)
-                .map(|c| c[1].to_string())
-        })
+        .and_then(|t| RE_CARGO_NAME.captures(&t).map(|c| c[1].to_string()))
         .unwrap_or_default();
     if name.is_empty() { return vec![]; }
     sorted(vec![name])

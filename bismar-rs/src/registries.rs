@@ -216,15 +216,15 @@ pub struct RegistryContext {
     pub pkg_dir: PathBuf,
 }
 
-pub async fn registry_context(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+pub fn registry_context(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     match r.prefix.as_str() {
-        "crate" => fetch_crate(out_dir, r).await,
-        "gem" => fetch_gem(out_dir, r).await,
-        "pypi" => fetch_pypi(out_dir, r).await,
-        "packagist" => fetch_packagist(out_dir, r).await,
-        "github" => fetch_github(out_dir, r).await,
-        "gitlab" => fetch_gitlab(out_dir, r).await,
-        "go" => fetch_go(out_dir, r).await,
+        "crate" => fetch_crate(out_dir, r),
+        "gem" => fetch_gem(out_dir, r),
+        "pypi" => fetch_pypi(out_dir, r),
+        "packagist" => fetch_packagist(out_dir, r),
+        "github" => fetch_github(out_dir, r),
+        "gitlab" => fetch_gitlab(out_dir, r),
+        "go" => fetch_go(out_dir, r),
         p => bail!("unknown registry prefix: {}", p),
     }
 }
@@ -294,7 +294,7 @@ struct CrateInfo {
     newest_version: String,
 }
 
-async fn fetch_crate(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_crate(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let version = if r.version.is_empty() {
         let label = format!("crate:{}", r.name);
         if let Some(v) = read_version_tag(&label, 1) {
@@ -327,7 +327,7 @@ struct GemMeta {
     gem_uri: Option<String>,
 }
 
-async fn fetch_gem(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_gem(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let url = format!("{}/api/v1/gems/{}.json", gems(), r.name);
     let meta: GemMeta = get_json(&url)?;
     let version = if r.version.is_empty() {
@@ -363,7 +363,7 @@ struct PypiUrl {
     packagetype: String,
 }
 
-async fn fetch_pypi(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_pypi(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let url = if r.version.is_empty() {
         format!("{}/pypi/{}/json", pypi(), r.name)
     } else {
@@ -395,7 +395,7 @@ struct P2Dist {
     url: String,
 }
 
-async fn fetch_packagist(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_packagist(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let url = format!("{}/p2/{}.json", composer(), r.name);
     let meta: serde_json::Value = get_json(&url)?;
     let packages = meta["packages"][&r.name]
@@ -421,7 +421,7 @@ async fn fetch_packagist(out_dir: &Path, r: &RegistryRef) -> Result<RegistryCont
 
 // ── GitHub ────────────────────────────────────────────────────────────────────
 
-async fn fetch_github(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_github(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let (owner, repo_name) = r.name.split_once('/').unwrap_or((&r.name, ""));
     if repo_name.is_empty() {
         bail!("github ref must be owner/repo: {}", r.name);
@@ -449,7 +449,7 @@ async fn fetch_github(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext
 
 // ── GitLab ────────────────────────────────────────────────────────────────────
 
-async fn fetch_gitlab(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_gitlab(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let encoded = r.name.replace('/', "%2F");
     let git_ref = if r.version.is_empty() {
         let url = format!("{}/api/v4/projects/{}", gitlab_api(), encoded);
@@ -473,7 +473,7 @@ async fn fetch_gitlab(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext
 
 // ── Go proxy ─────────────────────────────────────────────────────────────────
 
-async fn fetch_go(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
+fn fetch_go(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let version = if r.version.is_empty() {
         let label = format!("go:{}", r.name);
         if let Some(v) = read_version_tag(&label, 1) {
@@ -742,7 +742,7 @@ pub fn profile_hits(prefix: &str, user: &str) -> Result<Vec<SearchHit>> {
 
 /// Get tgz size and version for npm/jsr hits (used in diff footer garnish).
 pub fn js_hit_stats(prefix: &str, hit: &SearchHit) -> Result<Option<HitStats>> {
-    let url = if prefix == "jsr:" {
+    let url = if prefix == "jsr:" || prefix == "jsr" {
         format!("{}/{}", jsr_npm(), hit.name)
     } else {
         format!("{}/{}", npm_api(), hit.name)

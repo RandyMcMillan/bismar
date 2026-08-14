@@ -126,10 +126,7 @@ fn extracted_tgz(out_dir: &Path, file: &Path, label: &str) -> Result<DiffSide> {
 pub fn diff_target(out_dir: &Path, raw: &str, cwd: &Path, bundle: bool) -> Result<DiffSide> {
     if is_registry_selector(raw) {
         let r = parse_registry_ref(raw);
-        // blocking call — use tokio runtime
-        let got = tokio::runtime::Handle::current().block_on(async {
-            registry_context(out_dir, &r).await
-        })?;
+        let got = registry_context(out_dir, &r)?;
         let label = if r.path.is_empty() {
             got.label.clone()
         } else {

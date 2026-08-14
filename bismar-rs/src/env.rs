@@ -72,22 +72,13 @@ pub fn csv_enabled() -> bool {
 }
 
 fn stderr_is_tty() -> bool {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: isatty(2) is always safe to call with a valid fd.
-    unsafe { libc_isatty(std::io::stderr().as_raw_fd()) }
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
 }
 
 fn stdout_is_tty() -> bool {
-    use std::os::unix::io::AsRawFd;
-    unsafe { libc_isatty(std::io::stdout().as_raw_fd()) }
-}
-
-extern "C" {
-    fn isatty(fd: i32) -> i32;
-}
-
-fn libc_isatty(fd: i32) -> bool {
-    unsafe { isatty(fd) != 0 }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
 }
 
 // ── ANSI palette ─────────────────────────────────────────────────────────────

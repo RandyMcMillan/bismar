@@ -36,6 +36,17 @@ use crate::surface::{
 use anyhow::{bail, Result};
 use std::io::{self, Write};
 
+/// Call the blocking `registry_context` from an async context without
+/// blocking the Tokio executor thread.
+async fn fetch_registry(
+    out_dir: std::path::PathBuf,
+    r: crate::registries::RegistryRef,
+) -> Result<crate::registries::RegistryContext> {
+    tokio::task::spawn_blocking(move || registry_context(&out_dir, &r))
+        .await
+        .map_err(|e| anyhow::anyhow!("registry context panicked: {}", e))?
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -176,7 +187,7 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
     if args.size && !args.bundle {
         if is_registry_selector(raw) {
             let r = parse_registry_ref(raw);
-            let ctx = registry_context(&out_dir, &r).await?;
+            let ctx = fetch_registry(out_dir.clone(), r.clone()).await?;
             let sel = if r.path.is_empty() { None } else { Some(r.path.as_str()) };
             if csv_enabled() {
                 println!("{}", file_sizes_csv(&ctx.pkg_dir, sel, &ctx.label));
@@ -238,7 +249,7 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
     // Interactive navigator (default for a selector with no flag).
     if is_registry_selector(raw) {
         let r = parse_registry_ref(raw);
-        let ctx = registry_context(&out_dir, &r).await?;
+        let ctx = fetch_registry(out_dir.clone(), r.clone()).await?;
         if stdout_color() {
             run_interactive(ctx.pkg_dir, ctx.label)?;
         } else {
