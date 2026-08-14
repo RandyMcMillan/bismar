@@ -22,6 +22,7 @@ const {
   BIG_ARCHIVE,
   guardBigArchive,
   jsHitStats,
+  MAX_METADATA_BYTES,
   parseProfileRef,
   parseRegistryRef,
   profileHits,
@@ -29,7 +30,9 @@ const {
   setBigArchivePolicy,
 } = await import('../src/registries.ts');
 const { parseArgs, runCli } = await import('../src/bismar.ts');
-const { refsCacheDir } = await import('../src/refs.ts');
+const { cacheKey, readVersionTag, refsCacheDir, refsRoot, refsTagFile, TAG_TTL_MS } = await import(
+  '../src/refs.ts'
+);
 const { extractZip, tempDir } = await import('../src/fs-modify.ts');
 const { runInteractive } = await import('../src/interactive.ts');
 
@@ -42,7 +45,7 @@ type Session = {
   send: (keys: string) => void;
   text: () => string;
 };
-const open = (selector: string | undefined, cwd: string = tmpdir()): Session => {
+const open = (selector: string | undefined, cwd: string = tmpdir(), cols?: number): Session => {
   const input = new PassThrough();
   let raw = '';
   const io = {
@@ -53,6 +56,7 @@ const open = (selector: string | undefined, cwd: string = tmpdir()): Session => 
         return true;
       },
     },
+    cols,
     rows: 16,
   };
   return {
@@ -63,9 +67,13 @@ const open = (selector: string | undefined, cwd: string = tmpdir()): Session => 
   };
 };
 // A previous run's machine cache would skip the fetch path; start cold.
-const coldCache = (...slugs: string[]): void => {
-  for (const s of slugs)
-    rmSync(join(tmpdir(), 'bismar-refs', 'v1', s), { force: true, recursive: true });
+const coldCache = (...labels: string[]): void => {
+  for (const label of labels) {
+    rmSync(refsCacheDir(label), { force: true, recursive: true });
+    for (const ext of ['.crate', '.gem', '.tar.gz', '.zip', '.whl'])
+      rmSync(`${refsCacheDir(label)}${ext}`, { force: true });
+    rmSync(refsTagFile(label.replace(/@[^@]*$/, '')), { force: true });
+  }
 };
 const serve = async (
   routes: Record<string, () => { body: Buffer | string; json?: boolean }>
@@ -295,21 +303,55 @@ it('archives at or past 100mb need consent before downloading', async () => {
   }
 });
 
+it('registry metadata is aborted at its streaming body limit', async () => {
+  let sent = 0;
+  const server = createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    const chunk = Buffer.alloc(64 * 1024, 0x20);
+    const write = (): void => {
+      while (sent <= MAX_METADATA_BYTES + chunk.length) {
+        sent += chunk.length;
+        if (!res.write(chunk)) return void res.once('drain', write);
+      }
+      res.end();
+    };
+    write();
+  });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  process.env.BISMAR_CRATES_API = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    await rejects(
+      () => searchRegistry('crate:', 'oversized'),
+      /refusing oversized registry response.*limit is 16\.0mb/
+    );
+    // The wrapper cancelled near the configured cap; it did not buffer an
+    // arbitrary server stream before applying policy.
+    deepStrictEqual(sent <= MAX_METADATA_BYTES + 256 * 1024, true, String(sent));
+  } finally {
+    delete process.env.BISMAR_CRATES_API;
+    await closeServer(server);
+  }
+});
+
 it('ref cache files one subdirectory per registry', () => {
   deepStrictEqual(
     refsCacheDir('crate:serde@1.0.219'),
-    join(tmpdir(), 'bismar-refs', 'v1', 'crate', 'serde-1-0-219')
+    join(refsRoot(), 'crate', cacheKey('serde@1.0.219'))
   );
   deepStrictEqual(
     refsCacheDir('gem:rails@7.1.3'),
-    join(tmpdir(), 'bismar-refs', 'v1', 'gem', 'rails-7-1-3')
+    join(refsRoot(), 'gem', cacheKey('rails@7.1.3'))
   );
   // Bare npm labels file under npm/; jsr labels keep their own shelf.
-  deepStrictEqual(refsCacheDir('qr@0.6.0'), join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'qr-0-6-0'));
+  deepStrictEqual(refsCacheDir('qr@0.6.0'), join(refsRoot(), 'npm', cacheKey('qr@0.6.0')));
   deepStrictEqual(
     refsCacheDir('jsr:@std/bytes@1.0.5'),
-    join(tmpdir(), 'bismar-refs', 'v1', 'jsr', 'std-bytes-1-0-5')
+    join(refsRoot(), 'jsr', cacheKey('@std/bytes@1.0.5'))
   );
+  // Lossy display slugs no longer alias distinct cache identities.
+  deepStrictEqual(refsCacheDir('npm:a+b@1.0.0') === refsCacheDir('npm:a-b@1.0.0'), false);
+  deepStrictEqual(refsCacheDir('a+b@1.0.0') === refsCacheDir('a-b@1.0.0'), false);
+  deepStrictEqual(refsTagFile('gh:a+b') === refsTagFile('gh:a-b'), false);
 });
 
 it('registry refs take every output mode except minify', () => {
@@ -441,7 +483,7 @@ it('search parses hits from every registry api behind a browser agent', async ()
 it('js hit stats find packed tarball bytes and dep counts, then cache', async () => {
   // Versions are deliberately unpublishable: the stats cache is machine-wide,
   // and a real pkg@version must never be seeded with stand-in numbers.
-  rmSync(join(tmpdir(), 'bismar-refs', 'v1', '.stats'), { force: true, recursive: true });
+  rmSync(join(refsRoot(), '.stats'), { force: true, recursive: true });
   let base = '';
   const server = createServer((req, res) => {
     const url = req.url ?? '';
@@ -555,7 +597,7 @@ it('zip reader extracts members and refuses traversal', () => {
 
 it('interactive crate ref downloads, extracts, and browses files only', async () => {
   // A minimal `.crate`: gzipped tar with the standard `name-version/` top dir,
-  // built by the same system tar the extractor shells out to.
+  // built by system tar as an interoperability fixture for the internal parser.
   const fix = mkdtempSync(join(tmpdir(), 'bismar-crate-fix-'));
   mkdirSync(join(fix, 'mini-0.1.0', 'src'), { recursive: true });
   writeFileSync(
@@ -578,11 +620,12 @@ it('interactive crate ref downloads, extracts, and browses files only', async ()
   });
   try {
     process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
-    coldCache(join('crate', 'mini-0-1-0'), join('.tags', 'crate-mini.json'));
+    coldCache('crate:mini@0.1.0');
 
-    // Pinned ref: enter src/, preview lib.rs, climb back, m is a no-op, esc exits.
+    // Pinned ref: enter src/, preview lib.rs, esc closes the pager, h climbs
+    // back, m is a no-op, esc exits from the root.
     const session = open('crate:mini@0.1.0');
-    session.send('\r\rqhm\x1b');
+    session.send('\r\r\x1bhm\x1b');
     await session.done;
     const text = session.text();
     // The session opens straight into the files view under the pinned label,
@@ -595,7 +638,7 @@ it('interactive crate ref downloads, extracts, and browses files only', async ()
     deepStrictEqual(/measuring|LOC/.test(text), false, text);
     // A crate naming its repository in Cargo.toml offers the same `r` jump JS
     // packages get; the extract has no package.json to read it from.
-    deepStrictEqual(/← up · r repo \(gh\) · q quit/.test(text), true, text);
+    deepStrictEqual(/← up · r github · q quit/.test(text), true, text);
     // Enter descends into src/ and previews the Rust source as plain text.
     deepStrictEqual(/crate:mini@0\.1\.0\/src · files/.test(text), true, text);
     deepStrictEqual(/src\/lib\.rs · 4 lines/.test(text), true, text);
@@ -697,7 +740,7 @@ it('interactive gem ref unwraps the data layer of the gem shell', async () => {
   });
   try {
     process.env.BISMAR_GEMS_API = `http://127.0.0.1:${port}`;
-    coldCache(join('gem', 'minigem-0-2-0'), join('.tags', 'gem-minigem.json'));
+    coldCache('gem:minigem@0.2.0');
     // Versionless: resolve latest, download, unwrap; then browse lib/mini.rb.
     const session = open('gem:minigem');
     session.send('\r\rq\x1b\x1b');
@@ -740,7 +783,7 @@ it('interactive composer ref resolves via p2 and extracts the dist zip', async (
   });
   try {
     process.env.BISMAR_COMPOSER_API = `http://127.0.0.1:${port}`;
-    coldCache(join('composer', 'mini-pkg-1-1-0'), join('.tags', 'composer-mini-pkg.json'));
+    coldCache('composer:mini/pkg@1.1.0');
     // php: alias in, canonical composer: label out; newest version wins.
     const session = open('php:mini/pkg');
     session.send('\r\rq\x1b\x1b');
@@ -788,12 +831,7 @@ it('registry dist urls are confined to allowlisted hosts', async () => {
   });
   try {
     process.env.BISMAR_COMPOSER_API = `http://127.0.0.1:${port}`;
-    coldCache(
-      join('composer', 'evil-pkg-1-0-0'),
-      join('composer', 'ok-pkg-1-0-0'),
-      join('.tags', 'composer-evil-pkg.json'),
-      join('.tags', 'composer-ok-pkg.json')
-    );
+    coldCache('composer:evil/pkg@1.0.0', 'composer:ok/pkg@1.0.0');
     await rejects(
       () => runInteractive('composer:evil/pkg', { cwd: tmpdir() }),
       /refusing download from unexpected host: evil\.example/
@@ -813,7 +851,7 @@ it('js garnish ignores a tarball url on an unexpected host', async () => {
   // A packument whose tarball points off-registry: the size garnish is dropped
   // (deps still count from the doc), never surfacing as an error. The version
   // is unpublishable so the machine stats cache is never seeded for a real one.
-  rmSync(join(tmpdir(), 'bismar-refs', 'v1', '.stats'), { force: true, recursive: true });
+  rmSync(join(refsRoot(), '.stats'), { force: true, recursive: true });
   const server = createServer((req, res) => {
     if (req.url === '/preact/0.0.0-bismarhost') {
       res.setHeader('content-type', 'application/json');
@@ -844,40 +882,63 @@ it('js garnish ignores a tarball url on an unexpected host', async () => {
 it('interactive gh ref pins any refspec to a commit sha before caching', async () => {
   const sha = '1a2b3c4d5e6f7890123456789abcdef012345678';
   const short = sha.slice(0, 12);
+  const sha256ShapedRef = 'a'.repeat(64);
   const fix = mkdtempSync(join(tmpdir(), 'bismar-gh-fix-'));
   mkdirSync(join(fix, `mini-${short}`, 'src'), { recursive: true });
   writeFileSync(join(fix, `mini-${short}`, 'README.md'), '# mini\n');
   writeFileSync(join(fix, `mini-${short}`, 'src', 'index.js'), 'export const mini = 1;\n');
   execFileSync('tar', ['-czf', join(fix, 'mini.tar.gz'), '-C', fix, `mini-${short}`]);
   const { port, server } = await serve({
-    [`/octo/mini/tar.gz/${short}`]: () => ({ body: readFileSync(join(fix, 'mini.tar.gz')) }),
+    [`/octo/mini/tar.gz/${sha}`]: () => ({ body: readFileSync(join(fix, 'mini.tar.gz')) }),
     // The api returns a bare sha under the vnd.github.sha accept type.
     '/repos/octo/mini/commits/dev': () => ({ body: sha }),
+    [`/repos/octo/mini/commits/${short}`]: () => ({ body: sha }),
+    [`/repos/octo/mini/commits/${sha256ShapedRef}`]: () => ({ body: sha }),
     '/repos/octo/mini/commits/HEAD': () => ({ body: sha }),
   });
   try {
     process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
     process.env.BISMAR_GH_CODELOAD = `http://127.0.0.1:${port}`;
-    coldCache(
-      `gh-octo-mini-${short}`,
-      join('.tags', 'gh-octo-mini.json'),
-      join('.tags', 'gh-octo-mini-dev.json')
-    );
-    // No ref means HEAD; the label pins to the immutable short sha.
+    coldCache(`gh:octo/mini@${sha}`);
+    rmSync(refsTagFile('gh:octo/mini'), { force: true });
+    rmSync(refsTagFile('gh:octo/mini@dev'), { force: true });
+    // No ref means HEAD; the label retains the immutable full commit id.
     const session = open('gh:octo/mini');
     session.send('q');
     await session.done;
     const text = session.text();
-    deepStrictEqual(new RegExp(`github:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:octo/mini@${sha} · files`).test(text), true, text);
     deepStrictEqual(/README\.md {2}[\d.]+kb/.test(text), true, text);
     // Alias + explicit branch: same sha, same label, warm extract cache.
     const branch = open('github:octo/mini@dev');
     branch.send('q');
     await branch.done;
     deepStrictEqual(
-      new RegExp(`github:octo/mini@${short} · files`).test(branch.text()),
+      new RegExp(`github:octo/mini@${sha} · files`).test(branch.text()),
       true,
       branch.text()
+    );
+    // A user-supplied abbreviated SHA is still mutable/ambiguous input: resolve
+    // it through the API and retain the canonical 40-character commit id.
+    rmSync(refsTagFile(`gh:octo/mini@${short}`), { force: true });
+    const abbreviated = open(`gh:octo/mini@${short}`);
+    abbreviated.send('q');
+    await abbreviated.done;
+    deepStrictEqual(
+      new RegExp(`github:octo/mini@${sha} · files`).test(abbreviated.text()),
+      true,
+      abbreviated.text()
+    );
+    // GitHub is SHA-1-only today: a 64-hex spelling is still resolved as a
+    // refspec instead of being trusted as an immutable GitHub object id.
+    rmSync(refsTagFile(`gh:octo/mini@${sha256ShapedRef}`), { force: true });
+    const sha256Shaped = open(`gh:octo/mini@${sha256ShapedRef}`);
+    sha256Shaped.send('q');
+    await sha256Shaped.done;
+    deepStrictEqual(
+      new RegExp(`github:octo/mini@${sha} · files`).test(sha256Shaped.text()),
+      true,
+      sha256Shaped.text()
     );
     await rejects(
       () => runInteractive('gh:octo/nope', { cwd: tmpdir() }),
@@ -891,8 +952,33 @@ it('interactive gh ref pins any refspec to a commit sha before caching', async (
   }
 });
 
+it('version tags stretch to double life under ttlScale (gh ref→commit pins)', () => {
+  const tagFile = refsTagFile('gh:octo/ttl');
+  mkdirSync(join(refsRoot(), '.tags'), { recursive: true });
+  // Backdated between 1× and 2× the TTL: expired at the normal scale, still
+  // live at gh's doubled one.
+  writeFileSync(
+    tagFile,
+    JSON.stringify({
+      at: Date.now() - Math.round(TAG_TTL_MS * 1.5),
+      label: 'gh:octo/ttl',
+      v: 2,
+      version: 'abc123def4567890abc123def4567890abc123de',
+    })
+  );
+  try {
+    deepStrictEqual(readVersionTag('gh:octo/ttl'), undefined);
+    deepStrictEqual(readVersionTag('gh:octo/ttl', 2), 'abc123def4567890abc123def4567890abc123de');
+  } finally {
+    rmSync(tagFile, { force: true });
+  }
+});
+
 it('interactive gitlab ref pins any refspec to a commit sha before caching', async () => {
   const sha = 'abcdef0123456789abcdef0123456789abcdef01';
+  // gitlab.com/paulmillr/git-sha256-repo-test, captured from the commits API.
+  const sha256 = 'cf2cb382e176c7ff84175ec1ec0095fa7db513cda27c13ed587dd12e6e77b112';
+  const short256 = sha256.slice(0, 8);
   const short = sha.slice(0, 12);
   const fix = mkdtempSync(join(tmpdir(), 'bismar-gitlab-fix-'));
   mkdirSync(join(fix, `mini-${short}`, 'src'), { recursive: true });
@@ -902,35 +988,71 @@ it('interactive gitlab ref pins any refspec to a commit sha before caching', asy
   // Project paths reach the v4 api url-encoded; commits come back as JSON lists
   // (no ref_name reads the default branch's tip, the HEAD case).
   const commits = () => ({ body: JSON.stringify([{ id: sha }]), json: true });
+  const commits256 = () => ({ body: JSON.stringify([{ id: sha256 }]), json: true });
   const { port, server } = await serve({
-    [`/projects/octo%2Fmini/repository/archive.tar.gz?sha=${short}`]: () => ({
+    [`/projects/octo%2Fmini/repository/archive.tar.gz?sha=${sha}`]: () => ({
       body: readFileSync(join(fix, 'mini.tar.gz')),
     }),
     '/projects/octo%2Fmini/repository/commits?per_page=1': commits,
     '/projects/octo%2Fmini/repository/commits?ref_name=dev&per_page=1': commits,
+    [`/projects/paulmillr%2Fgit-sha256-repo-test/repository/archive.tar.gz?sha=${sha256}`]: () => ({
+      body: readFileSync(join(fix, 'mini.tar.gz')),
+    }),
+    '/projects/paulmillr%2Fgit-sha256-repo-test/repository/commits?per_page=1': commits256,
+    [`/projects/paulmillr%2Fgit-sha256-repo-test/repository/commits?ref_name=${short256}&per_page=1`]:
+      commits256,
   });
   try {
     process.env.BISMAR_GITLAB_API = `http://127.0.0.1:${port}`;
-    coldCache(
-      join('gitlab', `octo-mini-${short}`),
-      join('.tags', 'gitlab-octo-mini.json'),
-      join('.tags', 'gitlab-octo-mini-dev.json')
-    );
-    // No ref means the default branch; the label pins to the immutable short sha.
+    coldCache(`gitlab:octo/mini@${sha}`);
+    coldCache(`gitlab:paulmillr/git-sha256-repo-test@${sha256}`);
+    rmSync(refsTagFile('gitlab:octo/mini'), { force: true });
+    rmSync(refsTagFile('gitlab:octo/mini@dev'), { force: true });
+    // No ref means the default branch; the label retains the immutable full commit id.
     const session = open('gitlab:octo/mini');
     session.send('q');
     await session.done;
     const text = session.text();
-    deepStrictEqual(new RegExp(`gitlab:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`gitlab:octo/mini@${sha} · files`).test(text), true, text);
     deepStrictEqual(/README\.md {2}[\d.]+kb/.test(text), true, text);
     // Explicit branch: same sha, same label, warm extract cache.
     const branch = open('gitlab:octo/mini@dev');
     branch.send('q');
     await branch.done;
     deepStrictEqual(
-      new RegExp(`gitlab:octo/mini@${short} · files`).test(branch.text()),
+      new RegExp(`gitlab:octo/mini@${sha} · files`).test(branch.text()),
       true,
       branch.text()
+    );
+    // GitLab supports both Git object formats. A canonical SHA-256 id is
+    // already immutable and goes straight to the archive endpoint; a default
+    // branch whose API pin returns the same 64-character id is accepted too.
+    const exact256 = open(`gitlab:paulmillr/git-sha256-repo-test@${sha256}`, tmpdir(), 160);
+    exact256.send('q');
+    await exact256.done;
+    deepStrictEqual(
+      new RegExp(`gitlab:paulmillr/git-sha256-repo-test@${sha256} · files`).test(exact256.text()),
+      true,
+      exact256.text()
+    );
+    const head256 = open('gitlab:paulmillr/git-sha256-repo-test', tmpdir(), 160);
+    head256.send('q');
+    await head256.done;
+    deepStrictEqual(
+      new RegExp(`gitlab:paulmillr/git-sha256-repo-test@${sha256} · files`).test(head256.text()),
+      true,
+      head256.text()
+    );
+    rmSync(refsTagFile(`gitlab:paulmillr/git-sha256-repo-test@${short256}`), { force: true });
+    const abbreviated256 = open(`gitlab:paulmillr/git-sha256-repo-test@${short256}`, tmpdir(), 160);
+    abbreviated256.send('q');
+    await abbreviated256.done;
+    deepStrictEqual(
+      new RegExp(`gitlab:paulmillr/git-sha256-repo-test@${sha256} · files`).test(
+        abbreviated256.text()
+      ),
+      true,
+      abbreviated256.text()
     );
     await rejects(
       () => runInteractive('gitlab:octo/nope', { cwd: tmpdir() }),
@@ -968,21 +1090,21 @@ it('files view jumps to the github repo named by package.json and back', async (
   writeFileSync(join(fix, `mini-${short}`, 'docs', 'notes.md'), 'repo-only notes\n');
   execFileSync('tar', ['-czf', join(fix, 'repo.tar.gz'), '-C', fix, `mini-${short}`]);
   const { port, server } = await serve({
-    [`/octo/mini/tar.gz/${short}`]: () => ({ body: readFileSync(join(fix, 'repo.tar.gz')) }),
+    [`/octo/mini/tar.gz/${sha}`]: () => ({ body: readFileSync(join(fix, 'repo.tar.gz')) }),
     '/repos/octo/mini/commits/HEAD': () => ({ body: sha }),
   });
   try {
     process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
     process.env.BISMAR_GH_CODELOAD = `http://127.0.0.1:${port}`;
-    coldCache(join('gh', `octo-mini-${short}`), join('.tags', 'gh-octo-mini.json'));
+    coldCache(`gh:octo/mini@${sha}`);
     const session = open(undefined, pkgDir);
     session.send('r\x1bq');
     await session.done;
     const text = session.text();
     // The home files view advertises the jump, naming where it lands…
-    deepStrictEqual(/· m mode \(bundles\) · r repo \(gh\)/.test(text), true, text);
+    deepStrictEqual(/· m mode \(bundles\) · r github/.test(text), true, text);
     // …r lands in the pinned repo tree, with repo-only files on show…
-    deepStrictEqual(new RegExp(`github:octo/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:octo/mini@${sha} · files`).test(text), true, text);
     deepStrictEqual(/▸ docs\//.test(text), true, text);
     // …where the hint names the way back by the package's own ecosystem.
     const repoFrame =
@@ -991,7 +1113,7 @@ it('files view jumps to the github repo named by package.json and back', async (
         .split('\x1b[H')
         .map(strip)
         .find((f) => /▸ docs\//.test(f)) ?? '';
-    deepStrictEqual(/· m mode \(bundles\) · r repo \(npm\)/.test(repoFrame), true, repoFrame);
+    deepStrictEqual(/· m mode \(bundles\) · r get back to npm/.test(repoFrame), true, repoFrame);
     // …and esc at the repo root returns to the package side, not out of the app.
     const last = strip(session.raw().split('\x1b[H').pop() ?? '');
     deepStrictEqual(/@bismar-test\/repo-jump · files/.test(last), true, last);
@@ -1023,25 +1145,21 @@ it('files view jumps from a registry extract to the repo its manifest names', as
   const { port, server } = await serve({
     '/api/v1/crates/mini/0.2.0/download': () => ({ body: readFileSync(join(fix, 'mini.crate')) }),
     '/repos/rusty/mini/commits/HEAD': () => ({ body: sha }),
-    [`/rusty/mini/tar.gz/${short}`]: () => ({ body: readFileSync(join(fix, 'repo.tar.gz')) }),
+    [`/rusty/mini/tar.gz/${sha}`]: () => ({ body: readFileSync(join(fix, 'repo.tar.gz')) }),
   });
   try {
     process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
     process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
     process.env.BISMAR_GH_CODELOAD = `http://127.0.0.1:${port}`;
-    coldCache(
-      join('crate', 'mini-0-2-0'),
-      join('gh', `rusty-mini-${short}`),
-      join('.tags', 'gh-rusty-mini.json')
-    );
+    coldCache('crate:mini@0.2.0', `gh:rusty/mini@${sha}`);
     const session = open('crate:mini@0.2.0');
     session.send('r\x1bq');
     await session.done;
     const text = session.text();
     // Files-only sessions have no mode toggle, so the jump stands alone…
-    deepStrictEqual(/← up · r repo \(gh\) · q quit/.test(text), true, text);
+    deepStrictEqual(/← up · r github · q quit/.test(text), true, text);
     // …r lands in the pinned repo tree, with repo-only files on show…
-    deepStrictEqual(new RegExp(`github:rusty/mini@${short} · files`).test(text), true, text);
+    deepStrictEqual(new RegExp(`github:rusty/mini@${sha} · files`).test(text), true, text);
     deepStrictEqual(/▸ benches\//.test(text), true, text);
     // …where the way back is labelled by the ecosystem that named the repo.
     const repoFrame =
@@ -1050,7 +1168,8 @@ it('files view jumps from a registry extract to the repo its manifest names', as
         .split('\x1b[H')
         .map(strip)
         .find((f) => /▸ benches\//.test(f)) ?? '';
-    deepStrictEqual(/← up · r repo \(crate\) · q quit/.test(repoFrame), true, repoFrame);
+    // On the repo side q ≡ esc backs to the crate side, so the hint says so.
+    deepStrictEqual(/← up · r get back to crate · q back/.test(repoFrame), true, repoFrame);
     // …and esc at the repo root returns to the crate side, not out of the app.
     const last = strip(session.raw().split('\x1b[H').pop() ?? '');
     deepStrictEqual(/crate:mini@0\.2\.0 · files/.test(last), true, last);
@@ -1079,7 +1198,7 @@ it('interactive go ref unwinds the nested import path of module zips', async () 
   });
   try {
     process.env.BISMAR_GO_PROXY = `http://127.0.0.1:${port}`;
-    coldCache(join('go', 'golang-org-x-mini-v0-5-0'), join('.tags', 'go-golang-org-x-mini.json'));
+    coldCache('go:golang.org/x/mini@v0.5.0');
     const session = open('go:golang.org/x/mini');
     session.send('\rq\x1b');
     await session.done;
@@ -1160,11 +1279,7 @@ it('interactive pypi ref prefers sdists and falls back to wheel zips', async () 
   });
   try {
     process.env.BISMAR_PYPI_API = `http://127.0.0.1:${port}`;
-    coldCache(
-      join('pypi', 'mini-py-0-3-0'),
-      join('pypi', 'mini-py-0-4-0'),
-      join('.tags', 'pypi-mini-py.json')
-    );
+    coldCache('pypi:mini-py@0.3.0', 'pypi:mini-py@0.4.0');
 
     // Versionless resolves to 0.3.0 and lands in the sdist tree (PKG-INFO at root).
     const sdist = open('pypi:mini-py');
@@ -1243,6 +1358,7 @@ it('profile refs parse, list via registry apis, and print piped', async () => {
   deepStrictEqual(parseProfileRef('lodash'), undefined);
   // pypi parses as a namespace but has no profile api behind it.
   await rejects(() => profileHits('pypi:', 'x'), /no profile listing behind pypi:/);
+  let ghProfileFetches = 0;
   const { port, server } = await serve({
     '/api/v1/users/vision': () => ({ body: JSON.stringify({ user: { id: 7 } }), json: true }),
     '/api/v1/crates?user_id=7&per_page=25&sort=recent-updates': () => ({
@@ -1259,15 +1375,18 @@ it('profile refs parse, list via registry apis, and print piped', async () => {
       json: true,
     }),
     // gh profiles go through the search api: star-sorted in one request.
-    '/search/repositories?q=user%3Avision&sort=stars&per_page=25': () => ({
-      body: JSON.stringify({
-        items: [
-          { description: 'Popular', full_name: 'vision/big', stargazers_count: 900 },
-          { description: null, full_name: 'vision/small', stargazers_count: 3 },
-        ],
-      }),
-      json: true,
-    }),
+    '/search/repositories?q=user%3Avision&sort=stars&per_page=25': () => {
+      ghProfileFetches++;
+      return {
+        body: JSON.stringify({
+          items: [
+            { description: 'Popular', full_name: 'vision/big', stargazers_count: 900 },
+            { description: null, full_name: 'vision/small', stargazers_count: 3 },
+          ],
+        }),
+        json: true,
+      };
+    },
     '/-/v1/search?text=%40noble%2F&size=250': () => ({
       body: JSON.stringify({
         objects: [
@@ -1284,11 +1403,32 @@ it('profile refs parse, list via registry apis, and print piped', async () => {
   process.env.BISMAR_CRATES_API = `http://127.0.0.1:${port}`;
   process.env.BISMAR_NPM_API = `http://127.0.0.1:${port}`;
   process.env.BISMAR_GH_API = `http://127.0.0.1:${port}`;
+  rmSync(join(refsRoot(), '.profiles'), { force: true, recursive: true });
   try {
-    deepStrictEqual(await profileHits('gh:', 'vision'), [
+    const ghHits = [
       { desc: 'Popular', name: 'vision/big', version: '900★' },
       { desc: '', name: 'vision/small', version: '3★' },
-    ]);
+    ];
+    deepStrictEqual(await profileHits('gh:', 'vision'), ghHits);
+    deepStrictEqual(ghProfileFetches, 1);
+    // gh listings cache machine-wide: a repeat within the TTL skips the api.
+    deepStrictEqual(await profileHits('gh:', 'vision'), ghHits);
+    deepStrictEqual(ghProfileFetches, 1);
+    // An expired stamp (past 2× the version-tag TTL) refetches...
+    const profileFile = join(refsRoot(), '.profiles', `${cacheKey('gh:vision')}.json`);
+    writeFileSync(
+      profileFile,
+      JSON.stringify({ at: Date.now() - 31 * 60_000, hits: ghHits, label: 'gh:vision', v: 2 })
+    );
+    deepStrictEqual(await profileHits('gh:', 'vision'), ghHits);
+    deepStrictEqual(ghProfileFetches, 2);
+    // ...and so does any mangled row: surprises are cache misses, never errors.
+    writeFileSync(
+      profileFile,
+      JSON.stringify({ at: Date.now(), hits: [{ name: 5 }], label: 'gh:vision', v: 2 })
+    );
+    deepStrictEqual(await profileHits('gh:', 'vision'), ghHits);
+    deepStrictEqual(ghProfileFetches, 3);
     // BISMAR_LOG appends one line per network request, read per call.
     const logFile = join(tmpdir(), 'bismar-test-net-log.txt');
     rmSync(logFile, { force: true });

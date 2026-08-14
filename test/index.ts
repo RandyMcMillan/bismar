@@ -6,6 +6,7 @@ import './bin.test.ts';
 import './bundle.test.ts';
 import './camel-parts.test.ts';
 import './diff.test.ts';
+import './fs-modify.test.ts';
 import './interactive.test.ts';
 import './public.test.ts';
 import './registries.test.ts';

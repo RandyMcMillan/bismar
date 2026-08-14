@@ -18,10 +18,13 @@ const {
   diffTarget,
   diffTrees,
   fileDiffLines,
+  highlightedFileDiffLines,
   hunksOf,
   measuredSide,
   packLocalSides,
+  renderTextUnified,
   statHuman,
+  statNames,
   statSummary,
 } = await import('../src/diff.ts');
 const { runCli } = await import('../src/bismar.ts');
@@ -81,6 +84,40 @@ it('diffLines yields minimal ops with common context intact', () => {
     { kind: ' ', text: 'a' },
     { kind: ' ', text: 'b' },
   ]);
+});
+
+it('diff text, paths, and bundle labels render terminal controls visibly', () => {
+  const hostile = 'x\x1b[31mred\x1b[2J\x1b]52;c;eA==\x07\nrow';
+  const lines = renderTextUnified(`${hostile}\nold\n`, `${hostile}\nnew\n`, 'a', 'b', false);
+  deepStrictEqual(
+    lines.some((line) => line.includes('\x1b')),
+    false,
+    lines.join('\n')
+  );
+  deepStrictEqual(
+    lines.some((line) => line.includes('\u241b[31mred')),
+    true,
+    lines.join('\n')
+  );
+
+  const tree = {
+    aTotal: 1,
+    bTotal: 0,
+    entries: [{ aBytes: 1, bBytes: 0, path: hostile, status: 'removed' as const }],
+    same: 0,
+  };
+  for (const output of [...statHuman(tree, false), ...statNames(tree, false)]) {
+    deepStrictEqual(output.includes('\x1b'), false, output);
+    deepStrictEqual(output.includes('\n'), false, output);
+  }
+
+  const stat = diffBundleRows(
+    [{ export: hostile, gzBytes: 1, module: hostile, plainBytes: 1 }],
+    []
+  );
+  const human = bundleStatHuman(stat, false).join('\n');
+  deepStrictEqual(human.includes('\x1b'), false, human);
+  deepStrictEqual(human.includes('\u241b[31mred'), true, human);
 });
 
 it('hunksOf groups changes with context and 1-based line numbers', () => {
@@ -193,6 +230,31 @@ it('binary diffs hexdump small files and summarize big ones', () => {
     fileDiffLines(join(base, 'biga'), join(base, 'bigb'), gone, false)[1],
     'Binary files a/huge.bin and b/huge.bin differ (68.4 → 0.00kb)'
   );
+});
+
+it('colored source diffs combine diff markers with filename-language syntax', async () => {
+  put('syntax-a/example.ts', '/* old value */\nexport const value: number = 1;\n');
+  put('syntax-b/example.ts', '/* new value */\nexport const value: number = 2;\n');
+  const entry = {
+    aBytes: 49,
+    bBytes: 49,
+    path: 'example.ts',
+    status: 'modified',
+  } as const;
+  const plain = fileDiffLines(join(base, 'syntax-a'), join(base, 'syntax-b'), entry, false);
+  const highlighted = await highlightedFileDiffLines(
+    join(base, 'syntax-a'),
+    join(base, 'syntax-b'),
+    entry,
+    true
+  );
+  const out = highlighted.join('\n');
+  // Diff identity is untouched; only ANSI presentation was added.
+  deepStrictEqual(out.replace(/\x1b\[[\d;]+m/g, ''), plain.join('\n'));
+  // The marker has the side color, then TypeScript tokens get their own colors.
+  match(out, /\x1b\[31m-\x1b\[0m.*\x1b\[31mexport\x1b\[0m/);
+  match(out, /\x1b\[32m\+\x1b\[0m.*\x1b\[34m: number\x1b\[0m/);
+  match(out, /\x1b\[33m2\x1b\[0m/);
 });
 
 it('bismar -ds prints stat rows: CSV piped, painted table for humans', async () => {
@@ -513,9 +575,9 @@ it('diff navigator lists changed files and pages through a line diff', async () 
     tree,
     io
   );
-  // Down to mod.txt, open its diff, close the pager, quit the navigator.
+  // Down to mod.txt, open its diff, close the pager (esc), quit (q).
   input.write('\x1b[B\x1b[B\r');
-  input.write('qq');
+  input.write('\x1bq');
   await done;
   const text = strip(raw);
   // The summary is a footer in -ds's shape — counts, then sizes — between the
@@ -527,4 +589,54 @@ it('diff navigator lists changed files and pages through a line diff', async () 
   match(text, /@@ -1,3 \+1,3 @@/);
   match(text, /-two/);
   match(text, /\+2/);
+});
+
+it('diff navigator deep-links a one-file scope straight into its diff pager', async () => {
+  // `-d npm:pkg@{1,2}/index.js`: the scope names one exact changed file, so
+  // the session opens with that file's diff pager already up — the session
+  // root, per the navigator's deep-link grammar.
+  const openScoped = (keys: string) => {
+    const input = new PassThrough();
+    let raw = '';
+    const io = {
+      cols: 100,
+      input,
+      output: {
+        write: (text: string) => {
+          raw += text;
+          return true;
+        },
+      },
+      rows: 16,
+    };
+    const tree = diffTrees(join(base, 'a'), join(base, 'b'), 'mod.txt', 'mod.txt');
+    const done = runDiff(
+      { dir: join(base, 'a'), label: './a', sel: 'mod.txt' },
+      { dir: join(base, 'b'), label: './b', sel: 'mod.txt' },
+      tree,
+      io
+    );
+    input.write(keys);
+    return { done, raw: () => raw };
+  };
+  // The pager is up before any key, and its root footer says q quits while ←
+  // climbs into the one-row listing.
+  const quit = openScoped('q');
+  await quit.done;
+  const text = strip(quit.raw());
+  // The header carries the file's own length and how much of it changed —
+  // one replaced line out of mod.txt's three.
+  match(text, /mod\.txt · 3 lines · 1 line changed \(33%\)/);
+  match(text, /-two/);
+  match(text, /← files · q quit/);
+  // esc from the root pager exits the session too…
+  const esc = openScoped('\x1b');
+  await esc.done;
+  match(strip(esc.raw()), /← files · q quit/);
+  // …while ← climbs into the listing beneath; q then quits from there.
+  const climb = openScoped('hq');
+  await climb.done;
+  const last = strip(climb.raw().split('\x1b[H').pop() ?? '');
+  match(last, /\.\/a → \.\/b · diff/);
+  match(last, /▸ M mod\.txt/);
 });

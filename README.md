@@ -97,19 +97,23 @@ flowchart LR
   NR --> C
 ```
 
-- **Read-only traffic**: GET, plus one HEAD (tarball-size garnish, one-byte
-  range-GET fallback). bismar never POSTs; `--no-audit` removes npm's one
+- **GET+HEAD only traffic**: no POSTs; `--no-audit` removes npm's one
   routine POST too.
 - **Host allowlist, enforced pre-send**: only the origins below are reachable.
-  Redirects are followed one checked hop at a time, so a registry answer can't
-  bounce a request elsewhere — not even as a probe the blocked host would see.
-  Download URLs read from registry metadata are origin-confined besides:
-  packagist dists must be github zipballs, pypi artifacts must live on
-  pythonhosted.
+  Same with download URLs, except packagist (github zipballs) and pypi (pythonhosted).
 - **No code execution**: npm runs `--ignore-scripts`; bundling and measuring
   are static esbuild work; non-JS packages are never executed or bundled.
-- **Big downloads ask first**: 100mb+ needs a terminal confirmation
-  (`BISMAR_BIG=1` for scripts and CI); off a terminal it is refused.
+- **Inert terminal output**: registry text, paths, source, diffs, errors, and
+  CSV have controls neutralized; only bismar's own color sequences survive.
+- **Bounded, link-free archives**: metadata and downloads have streaming hard
+  limits; extraction rejects traversal, links, special files, unsafe Windows
+  names, and expansion/member/path bombs before trusting the resulting tree.
+- **Confined packages, verified caches**: downloaded manifest paths, generated
+  entries, and imports stay inside their install root. Private atomic caches use
+  SHA-256 identities/digests; git pins retain full GitHub SHA-1 and GitLab
+  SHA-1/SHA-256 commit IDs.
+- **Big downloads ask first**: 100mb+ needs a terminal confirmation; plain refusal
+  in scripts and CI (use `BISMAR_BIG=1`)
 - **Disposable caches**: everything lives under `$TMPDIR/bismar-*`, OS-cleaned
   after reboot; `bismar --clear` wipes it now. Pinned versions cache until
   reboot, floating "latest" for 15 minutes.

@@ -14,8 +14,8 @@ import {
   measuredSide,
   packLocalSide,
   packLocalSides,
-  renderTextUnified,
-  renderUnified,
+  renderTextUnifiedHighlighted,
+  renderUnifiedHighlighted,
   scoped,
   statCsv,
   statHuman,
@@ -30,6 +30,7 @@ import {
   progressDone,
   progressUpdate,
   stdoutColor,
+  terminalText,
   wantColor,
 } from './env.ts';
 import { clearTempCaches, rmTempDir, tempDir } from './fs-modify.ts';
@@ -262,7 +263,9 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
         const stat = diffBundleRows(aRows, bRows, args.minify ? 'gzBytes' : 'plainBytes');
         progressDone();
         if (!stat.entries.length)
-          return console.log(`no bundle size changes: ${a.label} and ${b.label} measure identical`);
+          return console.log(
+            `no bundle size changes: ${terminalText(a.label)} and ${terminalText(b.label)} measure identical`
+          );
         const lines = csvEnabled(undefined, opts.tty)
           ? bundleStatCsv(stat)
           : bundleStatHuman(stat, stdoutColor(undefined, opts.tty));
@@ -278,8 +281,10 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
         const bBytes = args.minify ? bBundle.min : bBundle.plain;
         progressDone();
         if (Buffer.from(aBytes).equals(Buffer.from(bBytes)))
-          return console.log(`no bundle changes: ${a.label} and ${b.label} bundle identical`);
-        const lines = renderTextUnified(
+          return console.log(
+            `no bundle changes: ${terminalText(a.label)} and ${terminalText(b.label)} bundle identical`
+          );
+        const lines = await renderTextUnifiedHighlighted(
           decoder.decode(aBytes),
           decoder.decode(bBytes),
           a.label,
@@ -290,7 +295,10 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
         // (it can dwarf the bundles themselves), a pipe gets the text.
         if (opts.tty ?? !!process.stdout.isTTY) {
           const { runPager } = await import('./interactive.ts');
-          return await runPager(`${a.label} → ${b.label}`, lines.join('\n'), { io: opts.io });
+          return await runPager(`${a.label} → ${b.label}`, lines.join('\n'), {
+            ansi: stdoutColor(undefined, opts.tty),
+            io: opts.io,
+          });
         }
         return console.log(lines.join('\n'));
       }
@@ -303,8 +311,10 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
         // path, not sameness; `same` counts scoped-but-unchanged files.
         const sel = a.sel ?? b.sel;
         if (sel && !tree.same)
-          err(`no shipped file matches /${sel} on either side; use -s to list files`);
-        return console.log(`no differences: ${a.label} and ${b.label} ship identical files`);
+          err(`no shipped file matches /${bad(sel)} on either side; use -s to list files`);
+        return console.log(
+          `no differences: ${terminalText(a.label)} and ${terminalText(b.label)} ship identical files`
+        );
       }
       // Same split as the base command: a terminal gets the navigator, a pipe
       // gets text — the unified diff, or with -s the changed-file stat rows,
@@ -320,7 +330,7 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           : statHuman(tree, stdoutColor(undefined, opts.tty), a, b)
         : args.list
           ? statNames(tree, stdoutColor(undefined, opts.tty))
-          : renderUnified(a.dir, b.dir, tree, stdoutColor(undefined, opts.tty));
+          : await renderUnifiedHighlighted(a.dir, b.dir, tree, stdoutColor(undefined, opts.tty));
       return console.log(lines.join('\n'));
     } finally {
       rmTempDir(tmp);
@@ -345,9 +355,11 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
           console.log(
             csv
               ? csvRow([hit.name, hit.version, hit.desc])
-              : hit.name +
-                  (hit.version ? `  ${hit.version}` : '') +
-                  (hit.desc ? `  ${hit.desc}` : '')
+              : terminalText(
+                  hit.name +
+                    (hit.version ? `  ${hit.version}` : '') +
+                    (hit.desc ? `  ${hit.desc}` : '')
+                )
           );
         return;
       }
@@ -576,6 +588,7 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     const cmd = ['bismar', '-b', ...(args.minify ? ['-m'] : []), ...args.paths].join(' ');
     const { runPager } = await import('./interactive.ts');
     return await runPager(row.label, text, {
+      ansi: stdoutColor(undefined, opts.tty) && bytes.length <= HIGHLIGHT_MAX,
       // No LOC here: the pager header already counts the lines.
       footer: `${kb(row.minBytes)}kb min, ${kb(row.gzBytes)}kb gzip · ${cmd} > out.js`,
       io: opts.io,

@@ -7,6 +7,54 @@
  * @typedef {import('./index.js').ShjLanguage} ShjLanguage
  */
 
+/** @type {[RegExp, ShjLanguage][]} */
+const filenames = [
+	[/^(dockerfile|containerfile)$/i, 'docker'],
+	[/^(gnu)?makefile$/i, 'make'],
+	[/^(gemfile|guardfile|rakefile|vagrantfile)$/i, 'rb'],
+	[/\.(asm|s)$/i, 'asm'],
+	[/\.(bash|sh|zsh)$/i, 'bash'],
+	[/\.bf$/i, 'bf'],
+	[/\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/i, 'c'],
+	[/\.css$/i, 'css'],
+	[/\.csv$/i, 'csv'],
+	[/\.diff$|\.patch$/i, 'diff'],
+	[/\.dockerfile$/i, 'docker'],
+	[/\.go$/i, 'go'],
+	[/\.html?$/i, 'html'],
+	[/\.http$/i, 'http'],
+	[/\.(cfg|conf|ini)$/i, 'ini'],
+	[/\.java$/i, 'java'],
+	[/\.(cjs|js|jsx|mjs)$/i, 'js'],
+	[/\.json$/i, 'json'],
+	[/\.log$/i, 'log'],
+	[/\.(md|markdown)$/i, 'md'],
+	[/\.(mk|make)$/i, 'make'],
+	[/\.php$/i, 'php'],
+	[/\.(pl|pm)$/i, 'pl'],
+	[/\.py$/i, 'py'],
+	[/\.rb$/i, 'rb'],
+	[/\.rs$/i, 'rs'],
+	[/\.sql$/i, 'sql'],
+	[/\.toml$/i, 'toml'],
+	[/\.(cts|ts|tsx|mts)$/i, 'ts'],
+	[/\.(svg|xml)$/i, 'xml'],
+	[/\.(yaml|yml)$/i, 'yaml']
+]
+
+/**
+ * Infer a bundled language from a path. Unlike content detection this is
+ * deterministic for short snippets, which is what source previews and diff
+ * hunks usually contain.
+ *
+ * @param {string} filename
+ * @returns {ShjLanguage|undefined}
+ */
+export const languageFromFilename = filename => {
+	const base = filename.replaceAll('\\', '/').split('/').pop() || filename
+	return filenames.find(([pattern]) => pattern.test(base))?.[1]
+}
+
 /**
  * @type {[ShjLanguage, [RegExp, Number]][]}
  */

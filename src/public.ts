@@ -7,9 +7,9 @@ itself. Pure reads only; nothing here writes.
  */
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { color, paint, progressDone, wantColor } from './env.ts';
+import { color, paint, progressDone, stripAnsi, terminalText, wantColor } from './env.ts';
 
 declare const __BISMAR_BUNDLE__: boolean | undefined;
 export type PkgTarget = { cwd: string; pkgFile: string };
@@ -38,7 +38,13 @@ export const runSelf = (metaUrl: string, fn: (argv: string[]) => Promise<void>):
     } catch (error) {
       // A shown progress line would otherwise prefix the error on the same row.
       progressDone();
-      console.error((error as Error).message);
+      // Error details can include package names, paths, manifest text, and
+      // subprocess diagnostics. At this final trust boundary an exact SGR from
+      // package input is indistinguishable from bismar's paint, so discard all
+      // colors and render every remaining control visibly.
+      console.error(
+        terminalText(stripAnsi((error as Error).message), { multiline: true, tabs: 2 })
+      );
       process.exitCode = 1;
     }
   })();
@@ -86,7 +92,7 @@ export type IdLeaf = 'auto' | 'export' | 'module';
 // painting needs no copy of the registry table (registries.ts validates names).
 const REF_PREFIX = /^[a-z]+:/;
 export const paintId = (id: string, on: boolean = wantColor(), leaf: IdLeaf = 'auto'): string => {
-  if (!on) return id;
+  if (!on) return paint(id, '', false);
   const pre = REF_PREFIX.exec(id)?.[0] ?? '';
   const segs = id.slice(pre.length).split('/');
   const scoped = segs[0].startsWith('@') && segs.length > 1;
@@ -145,6 +151,32 @@ export const normalizeOnlyPath = (pkgName: string, raw: string): string => {
 };
 export const firstModule = (pkgName: string, path: string): string =>
   normalizeOnlyPath(pkgName, path).split('/')[0].replace(ONLY_EXT, '');
+const isWithin = (root: string, file: string): boolean => {
+  const rel = relative(root, file);
+  return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+};
+// Package manifests are untrusted input. Resolve an existing path only when both
+// its lexical spelling and its real target stay under `root`: the first check stops
+// `../` and absolute escapes, while the second catches an in-tree symlink pointing
+// elsewhere. `undefined` also covers missing entries, which lets callers keep their
+// existing "skip broken optional entry" behavior.
+export const resolveInside = (root: string, candidate: string): string | undefined => {
+  const lexicalRoot = resolve(root);
+  const lexical = resolve(lexicalRoot, candidate);
+  if (!isWithin(lexicalRoot, lexical)) return undefined;
+  let base: string;
+  try {
+    base = realpathSync(lexicalRoot);
+  } catch {
+    return undefined;
+  }
+  try {
+    const real = realpathSync(lexical);
+    return isWithin(base, real) ? real : undefined;
+  } catch {
+    return undefined;
+  }
+};
 export const guardChild = (cwd: string, file: string, label: string): void => {
   const rel = relative(cwd, file);
   if (!rel || rel === '.' || rel.startsWith('..') || isAbsolute(rel))

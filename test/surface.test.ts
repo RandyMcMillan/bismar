@@ -3,7 +3,7 @@
 // that now lets registry refs through --list, and the manifest repo lookup
 // behind the navigator's `r` jump.
 import { deepStrictEqual, throws } from 'node:assert';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test as it } from 'node:test';
@@ -54,6 +54,29 @@ it('composer surface expands PSR-4 namespaces to one class per file', () => {
   deepStrictEqual(surfaceOf('composer:', 'monolog/monolog', join(base, 'php'), false), [
     'use Monolog\\Handler\\StreamHandler;',
     'use Monolog\\Logger;',
+  ]);
+});
+
+it('composer surface confines PSR-4 targets to the extracted package', () => {
+  put('php-escape/pkg/src/Safe.php', '<?php\n');
+  put('php-escape/outside/LexicalSecret.php', '<?php\n');
+  put('php-escape/outside/LinkedSecret.php', '<?php\n');
+  symlinkSync(join(base, 'php-escape/outside'), join(base, 'php-escape/pkg/linked'), 'dir');
+  put(
+    'php-escape/pkg/composer.json',
+    JSON.stringify({
+      autoload: {
+        'psr-4': {
+          'Linked\\': 'linked',
+          'Outside\\': '../outside',
+          'Safe\\': 'src',
+        },
+      },
+    })
+  );
+
+  deepStrictEqual(surfaceOf('composer:', 'vendor/unsafe', join(base, 'php-escape/pkg'), false), [
+    'use Safe\\Safe;',
   ]);
 });
 
@@ -114,6 +137,15 @@ it('registry sizes list every shipped file and close with a total', () => {
     '0.01kb unpacked · 123kb packed · 2 files'
   );
   deepStrictEqual(sizesCsv(join(base, 'sz')), ['Cargo.toml,9b', 'src/lib.rs,5b']);
+  if (process.platform !== 'win32') {
+    put('sz-hostile/evil\n\x1b[31m.txt', 'x');
+    const [row] = sizesHuman(join(base, 'sz-hostile'), false);
+    deepStrictEqual(row.includes('\x1b'), false, row);
+    deepStrictEqual(row.startsWith('evil\u240a\u241b[31m.txt'), true, row);
+    const [listed] = surfaceOf('crate:', 'hostile', join(base, 'sz-hostile'), false);
+    deepStrictEqual(listed.includes('\x1b'), false, listed);
+    deepStrictEqual(listed, 'evil\u240a\u241b[31m.txt');
+  }
 });
 
 it('every ecosystem manifest yields the github repo it advertises', () => {

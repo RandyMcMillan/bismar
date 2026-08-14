@@ -6,6 +6,7 @@ import { PassThrough } from 'node:stream';
 import { test as it } from 'node:test';
 import { parseArgs, runCli } from '../src/bismar.ts';
 import { __TEST as FS_TEST, promoteTemp } from '../src/fs-modify.ts';
+import { refsCacheDir, refsMetaFile, writeCacheIdentity } from '../src/refs.ts';
 
 // Error offenders and listings paint by ambient TTY; pin machine mode for asserts.
 process.env.NO_COLOR = '1';
@@ -412,9 +413,10 @@ it('fs-modify npm install prefers offline packages, skips audit/fund', () => {
 });
 
 it('a piped flagless ref tail emits the shipped file verbatim', async () => {
-  // Seed a pinned machine-cache install by its documented layout: pinned refs
-  // hit the cache by existence alone, so the fake package works fully offline.
-  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-cat-9-9-9');
+  // Seed a pinned machine-cache install and its exact identity marker so the
+  // fake package works fully offline.
+  const label = 'bismar-fake-cat@9.9.9';
+  const refDir = refsCacheDir(label);
   const pkgDir = join(refDir, 'node_modules', 'bismar-fake-cat');
   rmSync(refDir, { force: true, recursive: true });
   mkdirSync(join(pkgDir, 'src'), { recursive: true });
@@ -429,6 +431,7 @@ it('a piped flagless ref tail emits the shipped file verbatim', async () => {
   writeFileSync(join(pkgDir, 'index.js'), 'export const twice = (n) => n * 2;\n');
   writeFileSync(join(pkgDir, 'LICENSE'), 'MIT for bismar-fake-cat\n');
   writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const twice = (n: number) => n * 2;\n');
+  writeCacheIdentity(label);
   try {
     // Registry-cat: the shipped file's bytes, verbatim, nothing else.
     const lic = await capture(() => runCli(['npm:bismar-fake-cat@9.9.9/LICENSE'], { tty: false }));
@@ -458,17 +461,20 @@ it('a piped flagless ref tail emits the shipped file verbatim', async () => {
     deepStrictEqual(/interactive mode needs a terminal/.test(bare.stderr), true, bare.stderr);
   } finally {
     rmSync(refDir, { force: true, recursive: true });
+    rmSync(refsMetaFile(label), { force: true });
   }
 });
 
 it('fixed-arity registry refs take /path tails: scoped -s, piped cat, -b guard', async () => {
-  // Seed a pinned crate extract by its cache layout: two top entries keep the
-  // sole-dir descent from collapsing the root, and the cache hits by existence.
-  const dir = join(tmpdir(), 'bismar-refs', 'v1', 'crate', 'bismar-fake-crate-0-1-0');
+  // Seed a pinned crate extract with its exact identity marker: two top entries
+  // keep sole-dir descent from collapsing the root.
+  const label = 'crate:bismar-fake-crate@0.1.0';
+  const dir = refsCacheDir(label);
   rmSync(dir, { force: true, recursive: true });
   mkdirSync(join(dir, 'src'), { recursive: true });
   writeFileSync(join(dir, 'Cargo.toml'), '[package]\nname = "bismar-fake-crate"\n');
   writeFileSync(join(dir, 'src', 'lib.rs'), 'pub fn twice(n: u32) -> u32 { n * 2 }\n');
+  writeCacheIdentity(label);
   try {
     // A directory tail scopes the shipped-size listing, like npm tails.
     const scopedLs = await capture(() =>
@@ -494,5 +500,6 @@ it('fixed-arity registry refs take /path tails: scoped -s, piped cat, -b guard',
     );
   } finally {
     rmSync(dir, { force: true, recursive: true });
+    rmSync(refsMetaFile(label), { force: true });
   }
 });

@@ -1,5 +1,5 @@
 import { deepStrictEqual, throws } from 'node:assert';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -8,15 +8,27 @@ process.env.NO_COLOR = '1';
 
 import { test as it } from 'node:test';
 import {
+  color,
+  csvCell,
   csvEnabled,
+  paint,
   progressDone,
   progressOff,
   progressReset,
   progressShow,
   progressUpdate,
   stdoutColor,
+  terminalAnsi,
+  terminalText,
 } from '../src/env.ts';
-import { dtsPath, exportPath, jsPath, publicEntries, readPkg } from '../src/public.ts';
+import {
+  dtsPath,
+  exportPath,
+  jsPath,
+  publicEntries,
+  readPkg,
+  resolveInside,
+} from '../src/public.ts';
 
 it('csvEnabled keys off stdout alone, not the still-attached stderr tty', () => {
   // `bismar -s pkg | sort` pipes stdout while stderr stays on the terminal:
@@ -39,6 +51,39 @@ it('stdoutColor keys off stdout alone, not the still-attached stderr tty', () =>
   // Force flags win either way — this is how `| less -R` gets its color back.
   deepStrictEqual(stdoutColor({ FORCE_COLOR: '1' }, false), true);
   deepStrictEqual(stdoutColor({ CLICOLOR_FORCE: '1' }, false), true);
+});
+
+it('terminal text makes C0/C1 and escape protocols visible', () => {
+  const hostile = `a\0\t\n\r\x1b\x7f\u0085b`;
+  deepStrictEqual(terminalText(hostile), 'a\u2400\u2409\u240a\u240d\u241b\u2421\\u0085b');
+  deepStrictEqual(terminalText('a\r\n\tb\rc', { multiline: true, tabs: 2 }), 'a\n  b\u240dc');
+
+  const composed =
+    `${color.red}owned${color.reset}` +
+    '\x1b[2J\x1b]8;;https://evil.example\x07link\x1b]8;;\x07' +
+    '\x1b]52;c;Y2xpcGJvYXJk\x1b\\\x1bX\u009b2J';
+  const safe = terminalAnsi(composed);
+  deepStrictEqual(safe.startsWith(`${color.red}owned${color.reset}`), true, safe);
+  deepStrictEqual(safe.includes('\x1b[2J'), false, safe);
+  deepStrictEqual(safe.includes('\x1b]'), false, safe);
+  deepStrictEqual(safe.includes('\x1bX'), false, safe);
+  deepStrictEqual(safe.includes('\u009b'), false, safe);
+  deepStrictEqual(safe.includes('\u241b[2J'), true, safe);
+  deepStrictEqual(safe.includes('\\u009b2J'), true, safe);
+
+  // Even an SGR-looking sequence supplied as paint payload is inert. Only the
+  // wrapper introduced by paint remains an actual escape sequence.
+  deepStrictEqual(
+    paint('before\x1b[31mafter', color.blue),
+    `${color.blue}before\u241b[31mafter${color.reset}`
+  );
+
+  // Forced CSV can still target a TTY: colors are stripped, payload controls
+  // are visible, and an owned newline keeps its ordinary CSV quoting semantics.
+  deepStrictEqual(
+    csvCell(`${color.red}red${color.reset}\x1b]52;c;eA==\x07\nnext`),
+    '"red\u241b]52;c;eA==\u2407\nnext"'
+  );
 });
 
 it('public path helpers walk nested export condition objects', () => {
@@ -101,6 +146,31 @@ it('readPkg tolerates entryless binary packages only when asked', () => {
     });
   } finally {
     rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+it('resolveInside rejects lexical and symlink escapes from package roots', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'bismar-inside-'));
+  try {
+    const root = join(parent, 'pkg');
+    const outside = join(parent, 'outside.js');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'index.js'), 'export {}\n');
+    writeFileSync(outside, 'export const secret = 1;\n');
+    symlinkSync(outside, join(root, 'linked.js'));
+    symlinkSync(root, join(parent, 'pkg-alias'), 'dir');
+
+    deepStrictEqual(resolveInside(root, './src/../src/index.js'), join(root, 'src', 'index.js'));
+    deepStrictEqual(
+      resolveInside(join(parent, 'pkg-alias'), './src/index.js'),
+      join(root, 'src', 'index.js')
+    );
+    deepStrictEqual(resolveInside(root, '../outside.js'), undefined);
+    deepStrictEqual(resolveInside(root, outside), undefined);
+    deepStrictEqual(resolveInside(root, './linked.js'), undefined);
+    deepStrictEqual(resolveInside(root, './missing.js'), undefined);
+  } finally {
+    rmSync(parent, { force: true, recursive: true });
   }
 });
 
@@ -172,6 +242,17 @@ it('progress line appears after a silent second, updates in place, clears', asyn
     // Known-slow sync work (npm install) shows immediately, no delay to wait out.
     progressShow('installing y');
     deepStrictEqual(out.endsWith('\r\x1b[KLoading… installing y'), true, out);
+    progressDone();
+    // Package labels flow through this line. OSC clipboard/hyperlink commands,
+    // CSI erases, malformed ESC, line breaks, and C1 CSI are all visible text.
+    progressShow('x\x1b[2J\x1b]52;c;YQ==\x07\n\x1bX\u009b2J');
+    deepStrictEqual(out.includes('\x1b]52'), false, out);
+    deepStrictEqual(out.includes('\x1b[2J'), false, out);
+    deepStrictEqual(
+      out.endsWith('x\u241b[2J\u241b]52;c;YQ==\u2407\u240a\u241bX\\u009b2J'),
+      true,
+      out
+    );
     progressDone();
     // Muted (TUI) and non-TTY runs write nothing at all.
     out = '';

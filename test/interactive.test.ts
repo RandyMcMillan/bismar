@@ -14,8 +14,13 @@ process.env.NO_COLOR = '1';
 // Politeness waits only add latency against the local search stand-in here.
 process.env.BISMAR_RPS = '0';
 
-const { chooseTarget, runInteractive } = await import('../src/interactive.ts');
-const { highlightText } = await import('../src/vendor/speed-highlight/terminal.js');
+const { chooseTarget, runInteractive, runPager } = await import('../src/interactive.ts');
+const { refsCacheDir, refsMetaFile, refsTagFile, writeCacheIdentity, writeVersionTag } =
+  await import('../src/refs.ts');
+const { highlightDiffText, highlightText } = await import(
+  '../src/vendor/speed-highlight/terminal.js'
+);
+const { languageFromFilename } = await import('../src/vendor/speed-highlight/detect.js');
 
 const FIXTURE = resolve('test/vectors/plain');
 
@@ -87,6 +92,28 @@ const openMenu = (dirLabel: string, state: Record<string, unknown> = {}) => {
     done: chooseTarget(dirLabel, io, state),
     send: (keys: string) => void input.write(keys),
     raw: () => raw,
+    text: () => strip(raw),
+  };
+};
+
+const openPager = (text: string, ansi = false): Session => {
+  const input = new PassThrough();
+  let raw = '';
+  const io = {
+    cols: 240,
+    input,
+    output: {
+      write: (chunk: string) => {
+        raw += chunk;
+        return true;
+      },
+    },
+    rows: 16,
+  };
+  return {
+    done: runPager('source', text, { ansi, io }),
+    raw: () => raw,
+    send: (keys: string) => void input.write(keys),
     text: () => strip(raw),
   };
 };
@@ -244,6 +271,59 @@ it('launcher searches a registry and opens the picked hit', async () => {
   }
 });
 
+it('launcher hit listings window and page like every other listing', async () => {
+  // 30 hits on a 16-row screen: the listing scrolls behind the cursor instead
+  // of overflowing the frame, and PgDn jumps a window like the other views.
+  const hits = Array.from({ length: 30 }, (_, i) => ({
+    desc: '',
+    name: `pkg-${String(i).padStart(2, '0')}`,
+    version: '',
+  }));
+  const state: Record<string, unknown> = {
+    results: { cursor: 0, hits, which: { example: 'x', label: 'JS/NPM', prefix: 'npm:' } },
+  };
+  const menu = openMenu('x', state);
+  await waitFor(menu, /pkg-00/);
+  deepStrictEqual(/pkg-29/.test(menu.text()), false, menu.text());
+  menu.send('\x1b[6~');
+  await waitFor(menu, /▸ pkg-12/);
+  menu.send('G');
+  await waitFor(menu, /▸ pkg-29/);
+  // q ≡ esc: the first backs out of the hits (to the menu here — this
+  // parked listing has no prompt), the second quits from the menu root.
+  menu.send('qq');
+  deepStrictEqual(await menu.done, undefined);
+});
+
+it('launcher renders hostile registry metadata as inert visible text', async () => {
+  const state: Record<string, unknown> = {
+    results: {
+      cursor: 0,
+      hits: [
+        {
+          desc: 'd\x1b]52;c;eA==\x07\u009b2J',
+          name: 'pkg\x1b[31mred\nrow',
+          version: '1\x1b[2J',
+        },
+      ],
+      root: true,
+      title: 'gh:@x\x1b]8;;https://evil.example\x07',
+      which: { example: 'x', label: 'GitHub', prefix: 'gh:' },
+    },
+  };
+  const menu = openMenu('x', state);
+  await waitFor(menu, /pkg\u241b\[31mred\u240arow/);
+  menu.send('\x1b');
+  await menu.done;
+  const raw = menu.raw();
+  deepStrictEqual(raw.includes('\x1b[31mred'), false, raw);
+  deepStrictEqual(raw.includes('\x1b[2J'), false, raw);
+  deepStrictEqual(raw.includes('\x1b]8'), false, raw);
+  deepStrictEqual(raw.includes('\x1b]52'), false, raw);
+  deepStrictEqual(raw.includes('\u009b'), false, raw);
+  deepStrictEqual(menu.text().includes('d\u241b]52;c;eA==\u2407\\u009b2J'), true, menu.text());
+});
+
 it('search hits paint a zero dep count green, others dim', async () => {
   // A clean, dependency-free install is worth flagging: 0 deps shows green,
   // any other count stays dim like the rest of the garnish.
@@ -323,7 +403,7 @@ it('launcher browses a package-less directory as plain files', async () => {
 });
 
 it('interactive mode navigates modules and exports like a filesystem', async () => {
-  const res = await drive(undefined, 'mj\rq');
+  const res = await drive(undefined, 'mj\rqq');
   // Root frame: package crumb, the `.` package row, and the module row.
   deepStrictEqual(/@bismar-test\/plain/.test(res.text), true, res.text);
   deepStrictEqual(/▸ \./.test(res.text), true, res.text);
@@ -347,7 +427,7 @@ it('interactive mode measures every row by itself, without s', async () => {
   // …and so do export rows after descending.
   session.send('j\r');
   await waitFor(session, /add {2}\d+ LOC, [\d.]+kb min, [\d.]+kb gzip/);
-  session.send('q');
+  session.send('qq');
   await session.done;
 });
 
@@ -359,7 +439,7 @@ it('interactive mode navigates a filesystem selector as its own package', async 
   await waitFor(session, /index\.js {2}\d+ LOC, [\d.]+kb min, [\d.]+kb gzip/);
   session.send('\r');
   await waitFor(session, /add {2}\d+ LOC, [\d.]+kb min, [\d.]+kb gzip/);
-  session.send('q');
+  session.send('qq');
   await session.done;
   const text = session.text();
   // The file is the package: its slug is the crumb, no `.` package row.
@@ -426,7 +506,7 @@ it('interactive mode climbs back up via the .. entry and via h', async () => {
 });
 
 it('interactive mode pages through bundled source on enter', async () => {
-  const res = await drive(undefined, 'mj\r\rqq');
+  const res = await drive(undefined, 'mj\r\rqqq');
   // The pager header names the selector; the body is the plain bundle.
   deepStrictEqual(/index\/add · \d+ lines/.test(res.text), true, res.text);
   deepStrictEqual(/var bismarTestPlainIndexAdd = /.test(res.text), true, res.text);
@@ -440,7 +520,7 @@ it('interactive mode pages through bundled source on enter', async () => {
 it('interactive mode syntax-highlights paged source when colors are on', async () => {
   process.env.FORCE_COLOR = '1';
   try {
-    const res = await drive(undefined, 'mj\r\rqq');
+    const res = await drive(undefined, 'mj\r\rqqq');
     // Highlight tokens: the `var` keyword painted magenta by the terminal theme.
     deepStrictEqual(res.frames.includes('\x1b[31mvar\x1b[0m'), true);
     // Stripped content stays byte-identical to the plain bundle text.
@@ -469,6 +549,69 @@ it('vendored highlighter supports Python, Ruby, Rust, Go, PHP, HTML, C, and Bash
       `${lang} was not highlighted: ${JSON.stringify(highlighted)}`
     );
   }
+});
+
+it('vendored diff highlighting keeps multiline language colors row-local', async () => {
+  const source = [
+    '@@ -1,3 +1,3 @@',
+    '-/* old',
+    '- * value */',
+    '+/* new',
+    '+ * value */',
+    ' const answer = 42;',
+  ].join('\n');
+  const highlighted = await highlightDiffText(source, 'js');
+  deepStrictEqual(highlighted.replace(/\x1b\[[\d;]+m/g, ''), source);
+  // Each body line restarts gray after its independently colored diff marker;
+  // no multiline comment color is left to bleed into the next rendered row.
+  assert.match(highlighted, /\x1b\[31m-\x1b\[0m\x1b\[90m\/\* old\x1b\[0m/);
+  assert.match(highlighted, /\x1b\[32m\+\x1b\[0m\x1b\[90m \* value \*\/\x1b\[0m/);
+});
+
+it('vendored highlighting never echoes terminal commands from source or diffs', async () => {
+  const payload =
+    'const x = "\x1b[2J"; // \x1b]8;;https://evil.example\x07link\x1b]8;;\x07 ' +
+    '\x1b]52;c;Y2xpcGJvYXJk\x1b\\ \x1bX \u009b2J \x01\n';
+  for (const highlighted of [
+    await highlightText(payload, 'js'),
+    await highlightDiffText(`@@ -1,1 +1,1 @@\n-${payload.trimEnd()}\n+safe`, 'js'),
+  ]) {
+    deepStrictEqual(highlighted.includes('\x1b[2J'), false, highlighted);
+    deepStrictEqual(highlighted.includes('\x1b]8'), false, highlighted);
+    deepStrictEqual(highlighted.includes('\x1b]52'), false, highlighted);
+    deepStrictEqual(highlighted.includes('\x1bX'), false, highlighted);
+    deepStrictEqual(highlighted.includes('\u009b'), false, highlighted);
+    // Controls remain inspectable instead of silently disappearing.
+    deepStrictEqual(highlighted.includes('\u241b[2J'), true, highlighted);
+    deepStrictEqual(highlighted.includes('\\u009b2J'), true, highlighted);
+    deepStrictEqual(highlighted.includes('\u2401'), true, highlighted);
+  }
+});
+
+it('standalone pager distinguishes raw text from trusted highlighted ANSI', async () => {
+  const raw = openPager('before\x1b[31mred\x1b[0m\x1b[2Jafter');
+  raw.send('q');
+  await raw.done;
+  deepStrictEqual(raw.raw().includes('\x1b[31mred'), false, raw.raw());
+  deepStrictEqual(raw.raw().includes('\x1b[2J'), false, raw.raw());
+  deepStrictEqual(
+    raw.text().includes('before\u241b[31mred\u241b[0m\u241b[2Jafter'),
+    true,
+    raw.text()
+  );
+
+  const highlighted = openPager('\x1b[31mvar\x1b[0m x = 1;', true);
+  highlighted.send('q');
+  await highlighted.done;
+  deepStrictEqual(highlighted.raw().includes('\x1b[31mvar\x1b[0m'), true, highlighted.raw());
+});
+
+it('vendored filename detection covers source extensions and conventional names', () => {
+  deepStrictEqual(languageFromFilename('src/component.tsx'), 'ts');
+  deepStrictEqual(languageFromFilename('native/main.cpp'), 'c');
+  deepStrictEqual(languageFromFilename('Dockerfile'), 'docker');
+  deepStrictEqual(languageFromFilename('Rakefile'), 'rb');
+  deepStrictEqual(languageFromFilename('notes.txt'), undefined);
 });
 
 it('vendored Markdown highlighter highlights common fenced-code language names', async () => {
@@ -525,7 +668,7 @@ it('interactive mode syntax-highlights Python, Rakefile, C, C++, and shell previ
 });
 
 it('interactive mode starts in the package-files view with text previews', async () => {
-  const res = await drive(undefined, '\rqmq');
+  const res = await drive(undefined, '\rhmq');
   // The home view lists the shipped files with sizes: dirs first, then the
   // readme and package.json, then the rest; the header carries the package's
   // total footprint.
@@ -570,7 +713,7 @@ it('mouse clicks and wheel drive the listings; the pager releases tracking', asy
   // report queued while the pager is up decodes to nothing.
   const click = await drive(
     undefined,
-    '\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<0;4;5M' + 'qq'
+    '\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<0;4;5M' + 'hq'
   );
   deepStrictEqual(/▸ index\.js/.test(click.text), true, click.text);
   deepStrictEqual(/index\.js · \d+ lines/.test(click.text), true, click.text);
@@ -585,15 +728,15 @@ it('mouse clicks and wheel drive the listings; the pager releases tracking', asy
   );
   deepStrictEqual(click.frames.includes('\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l'), true);
   // The modules view speaks the same click contract: select, then descend.
-  const mods = await drive(undefined, 'm\x1b[<0;2;4M\x1b[<0;2;4M' + 'q');
+  const mods = await drive(undefined, 'm\x1b[<0;2;4M\x1b[<0;2;4M' + 'qq');
   deepStrictEqual(/@bismar-test\/plain\/index\.js/.test(mods.text), true, mods.text);
   deepStrictEqual(/▸ add/.test(mods.text), true, mods.text);
 });
 
 it('files view skips symlinked entries instead of following them', async (t) => {
-  // Registry archives extract through the system tar and can ship symlinks
-  // aimed anywhere (~/.ssh); the files view must never list — let alone
-  // preview or descend into — anything a symlink points at.
+  // Local trees and legacy caches can contain symlinks aimed anywhere
+  // (~/.ssh); the files view must never list — let alone preview or descend
+  // into — anything a symlink points at.
   if (process.platform === 'win32') return void t.skip('posix symlinks');
   const outside = mkdtempSync(join(tmpdir(), 'bismar-i-outside-'));
   const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-syml-'));
@@ -658,8 +801,53 @@ it('interactive file preview sanitizes tabs and CRLF line endings', async () => 
   }
 });
 
+it('interactive filenames and preview bytes cannot inject terminal commands', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bismar-i-controls-'));
+  // Windows forbids control bytes in filenames; source payload coverage still
+  // runs there, while POSIX also exercises a newline + SGR-looking filename.
+  const hostileName = process.platform === 'win32' ? 'evil.txt' : 'evil\n\x1b[31mname.txt';
+  try {
+    writeFileSync(
+      join(cwd, 'package.json'),
+      `${JSON.stringify({
+        main: './index.js',
+        name: '@bismar-test/controls',
+        private: true,
+        type: 'module',
+        version: '1.0.0',
+      })}\n`
+    );
+    writeFileSync(join(cwd, 'index.js'), 'export const a = 1;\n');
+    writeFileSync(
+      join(cwd, hostileName),
+      'SGR \x1b[31mred CSI \x1b[2J OSC8 \x1b]8;;https://evil.example\x07link\x1b]8;;\x07 ' +
+        'OSC52 \x1b]52;c;YQ==\x1b\\ malformed \x1bX C1 \u009b2J SOH \x01\n'
+    );
+    const session = open(undefined, { cols: 240, cwd });
+    // package.json leads the file group; the hostile filename sorts next.
+    session.send('j\rqq');
+    await session.done;
+    const raw = session.raw();
+    if (process.platform !== 'win32') deepStrictEqual(raw.includes('\x1b[31mname'), false, raw);
+    deepStrictEqual(raw.includes('\x1b[31mred'), false, raw);
+    deepStrictEqual(raw.includes('\x1b[2J'), false, raw);
+    deepStrictEqual(raw.includes('\x1b]8'), false, raw);
+    deepStrictEqual(raw.includes('\x1b]52'), false, raw);
+    deepStrictEqual(raw.includes('\x1bX'), false, raw);
+    deepStrictEqual(raw.includes('\u009b'), false, raw);
+    const text = session.text();
+    if (process.platform !== 'win32')
+      deepStrictEqual(text.includes('evil\u240a\u241b[31mname.txt'), true, text);
+    deepStrictEqual(text.includes('SGR \u241b[31mred CSI \u241b[2J'), true, text);
+    deepStrictEqual(text.includes('OSC52 \u241b]52;c;YQ==\u241b\\'), true, text);
+    deepStrictEqual(text.includes('C1 \\u009b2J SOH \u2401'), true, text);
+  } finally {
+    rmSync(cwd, { force: true, recursive: true });
+  }
+});
+
 it('interactive pager searches with /pattern and jumps with :line', async () => {
-  const res = await drive(undefined, 'mj\r\r/defProp\r:1\rqq');
+  const res = await drive(undefined, 'mj\r\r/defProp\r:1\rqqq');
   const frames = res.frames.split('\x1b[H').map((frame) => strip(frame).split('\r\n'));
   // `/defProp` scrolls the window to the matching line…
   const hit = frames.findIndex((rows) => (rows[1] ?? '').includes('var __defProp'));
@@ -677,7 +865,7 @@ it('interactive pager wraps long lines to the width instead of truncating', asyn
   // A 20-column terminal: the bundle's `var bismarTestPlainIndexAdd…` line must
   // continue on following rows, not vanish behind an ellipsis.
   const session = open(undefined, { cols: 20 });
-  session.send('mj\r\rqq');
+  session.send('mj\r\rqqq');
   await session.done;
   const text = session.text();
   deepStrictEqual(text.replace(/\r?\n/g, '').includes('var bismarTestPlainIndexAdd'), true, text);
@@ -695,12 +883,17 @@ it('interactive pager wraps long lines to the width instead of truncating', asyn
 it('interactive mode handles PgUp/PgDn/Home/End escape sequences', async () => {
   // PgUp at the root must not quit (old parsing let unknown \x1b[5~-style
   // sequences fall through to bare Esc); End then jumps to the last export.
-  const res = await drive(undefined, 'm\x1b[5~j\r\x1b[Fq');
+  const res = await drive(undefined, 'm\x1b[5~j\r\x1b[Fqq');
   deepStrictEqual(/@bismar-test\/plain\/index\.js/.test(res.text), true, res.text);
   deepStrictEqual(/▸ blob/.test(res.text), true, res.text);
   // In the pager, PgDn scrolls a window: the footer leaves 0%.
-  const paged = await drive(undefined, 'mj\r\r\x1b[6~qq');
+  const paged = await drive(undefined, 'mj\r\r\x1b[6~qqq');
   deepStrictEqual(/\n(?:[1-9]\d?|100)% · ↑↓\/space scroll/.test(paged.text), true, paged.text);
+  // Modifier-tagged CSI variants fold onto their plain keys: Ctrl-PgDn pages
+  // to the bottom of the modules listing instead of decoding to nothing.
+  const ctrl = await drive(undefined, 'm\x1b[6;5~q');
+  const ctrlLast = strip((ctrl.frames.split('\x1b[H').pop() ?? '').toString());
+  deepStrictEqual(/▸ index\.js/.test(ctrlLast), true, ctrlLast);
 });
 
 it('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () => {
@@ -719,7 +912,7 @@ it('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () =
   const last = strip(esc.raw().split('\x1b[H').pop() ?? '');
   deepStrictEqual(/@bismar-test\/plain\r?\n/.test(last), true, last);
   deepStrictEqual(/▸ index\.js/.test(last), true, last);
-  // ctrl-c closes the whole app even from inside the pager (q there only backs out)…
+  // ctrl-c closes the whole app even from inside the pager, like q…
   const intr = open(undefined);
   intr.send('mj\r\r\x03');
   await timed(intr.done);
@@ -732,9 +925,10 @@ it('esc backs out one level then exits; ctrl-c/ctrl-d exit anywhere', async () =
 });
 
 it('a ref /path tail deep-links the files view', async () => {
-  // Seed a pinned machine-cache install by its documented layout: pinned refs
-  // hit the cache by existence alone, so the fake package works fully offline.
-  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-nav-9-9-9');
+  // Seed a pinned machine-cache install through the same collision-resistant
+  // key and identity marker as the implementation, so it works fully offline.
+  const cacheLabel = 'bismar-fake-nav@9.9.9';
+  const refDir = refsCacheDir(cacheLabel);
   const pkgDir = join(refDir, 'node_modules', 'bismar-fake-nav');
   rmSync(refDir, { force: true, recursive: true });
   mkdirSync(join(pkgDir, 'src'), { recursive: true });
@@ -748,19 +942,40 @@ it('a ref /path tail deep-links the files view', async () => {
   );
   writeFileSync(join(pkgDir, 'index.js'), 'export const twice = (n) => n * 2;\n');
   writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const twice = (n: number) => n * 2;\n');
+  writeCacheIdentity(cacheLabel);
   try {
-    // An exact shipped file opens the session with its preview pager up.
+    // An exact shipped file opens the session with its preview pager up. That
+    // preview is the session root: the user asked for this file, so q quits…
     const file = open('npm:bismar-fake-nav@9.9.9/src/util.ts');
     await waitFor(file, /n: number/);
-    file.send('q'); // close the pager: the file's own directory listing is under it
-    await waitFor(file, /bismar-fake-nav@9\.9\.9\/src · files/);
+    deepStrictEqual(/← files · q quit/.test(file.text()), true, file.text());
     file.send('q');
     await file.done;
+    deepStrictEqual(file.raw().includes('\x1b[?25h\x1b[?1049l'), true);
+    // …esc quits the same way (backing out of the root is leaving)…
+    const esc = open('npm:bismar-fake-nav@9.9.9/src/util.ts');
+    await waitFor(esc, /n: number/);
+    esc.send('\x1b');
+    await esc.done;
+    // …while ← climbs into the file's own directory listing underneath.
+    const climb = open('npm:bismar-fake-nav@9.9.9/src/util.ts');
+    await waitFor(climb, /n: number/);
+    climb.send('h');
+    await waitFor(climb, /bismar-fake-nav@9\.9\.9\/src · files/);
+    // A reopened preview is no longer the root: q/esc back out to the
+    // listing; two more climb to the home root and exit.
+    climb.send('\r');
+    await waitFor(climb, /:goto · q back/);
+    climb.send('\x1bqq');
+    await climb.done;
+    // The esc landed on the listing before q quit: the final frame is files.
+    const lastClimb = strip(climb.raw().split('\x1b[H').pop() ?? '');
+    deepStrictEqual(/· files/.test(lastClimb), true, lastClimb);
     // A directory tail opens the session on that subtree's listing.
     const dir = open('npm:bismar-fake-nav@9.9.9/src');
     await waitFor(dir, /bismar-fake-nav@9\.9\.9\/src · files/);
     deepStrictEqual(/util\.ts/.test(dir.text()), true, dir.text());
-    dir.send('q');
+    dir.send('qq');
     await dir.done;
     // A tail matching nothing is a typo'd path: error out before the TUI opens,
     // never a silently whole-package browse.
@@ -775,6 +990,7 @@ it('a ref /path tail deep-links the files view', async () => {
     );
   } finally {
     rmSync(refDir, { force: true, recursive: true });
+    rmSync(refsMetaFile(cacheLabel), { force: true });
   }
 });
 
@@ -806,9 +1022,16 @@ it('profile refs seed the launcher listing; @user searches one from the prompt',
   // The crumb is the profile itself, spelled with the long registry name.
   await waitFor(seeded, /github:@paulmillr · 1 listed/);
   await waitFor(seeded, /paulmillr\/qr.*12★.*Minimal QR/);
-  // The seeded listing is the session root: q/esc/← back out of the root,
-  // which is exiting — never the menu, which this session never came from.
+  // The seeded listing is the session root: q and esc exit — never into the
+  // menu, which this session never came from — while ← (a navigation key)
+  // stays put instead of exiting.
   deepStrictEqual(/↑↓ move · enter open · q quit/.test(seeded.text()), true, seeded.text());
+  input.write('\x1b[D');
+  const alive = await Promise.race([
+    done.then(() => 'done'),
+    new Promise((res) => setTimeout(() => res('alive'), 200)),
+  ]);
+  deepStrictEqual(alive, 'alive', 'left-arrow must not exit the root listing');
   input.write('\x1b');
   await done;
   deepStrictEqual(/what to open\?/.test(seeded.text()), false, seeded.text());
@@ -816,13 +1039,12 @@ it('profile refs seed the launcher listing; @user searches one from the prompt',
   // Opening a hit keeps the profile as the session crumb's head, with the
   // redundant owner collapsed: `npm:@fake · bismar-fake-prof@9.9.9`. Offline:
   // a seeded pinned install plus a fresh version tag resolve the floating hit.
-  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-prof-9-9-9');
+  const cacheLabel = 'bismar-fake-prof@9.9.9';
+  const tagLabel = 'bismar-fake-prof';
+  const refDir = refsCacheDir(cacheLabel);
   const pkgDir = join(refDir, 'node_modules', 'bismar-fake-prof');
-  const tagDir = join(tmpdir(), 'bismar-refs', 'v1', '.tags');
-  const tag = join(tagDir, 'bismar-fake-prof.json');
   rmSync(refDir, { force: true, recursive: true });
   mkdirSync(pkgDir, { recursive: true });
-  mkdirSync(tagDir, { recursive: true });
   writeFileSync(
     join(refDir, 'package.json'),
     JSON.stringify({ dependencies: { 'bismar-fake-prof': '9.9.9' }, private: true })
@@ -832,7 +1054,8 @@ it('profile refs seed the launcher listing; @user searches one from the prompt',
     JSON.stringify({ exports: { '.': './index.js' }, name: 'bismar-fake-prof', version: '9.9.9' })
   );
   writeFileSync(join(pkgDir, 'index.js'), 'export const one = 1;\n');
-  writeFileSync(tag, `${JSON.stringify({ at: Date.now(), version: '9.9.9' })}\n`);
+  writeCacheIdentity(cacheLabel);
+  writeVersionTag(tagLabel, '9.9.9');
   try {
     const input2 = new PassThrough();
     let raw2 = '';
@@ -864,7 +1087,8 @@ it('profile refs seed the launcher listing; @user searches one from the prompt',
     await done2;
   } finally {
     rmSync(refDir, { force: true, recursive: true });
-    rmSync(tag, { force: true });
+    rmSync(refsMetaFile(cacheLabel), { force: true });
+    rmSync(refsTagFile(tagLabel), { force: true });
   }
 
   // The search prompt: a bare @user lists that profile instead of name search.

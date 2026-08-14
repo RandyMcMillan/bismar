@@ -55,6 +55,72 @@ export function stdoutColor(env?: Env, stdoutTty?: boolean): boolean {
   return wantColor(env, stdoutTty ?? !!proc.stdout?.isTTY);
 }
 export const stripAnsi = (str: string): string => str.replace(/\x1b\[\d+(;\d+)*m/g, '');
+export type TerminalTextOpts = {
+  /** Keep LF as a line separator. All other controls remain visible. */
+  multiline?: boolean;
+  /** Expand tabs to this many spaces instead of showing their control picture. */
+  tabs?: number;
+};
+// C0 controls have standard visible "control pictures". C1 has no equivalent
+// complete block, so spell those bytes out. Either representation occupies
+// ordinary terminal cells and cannot be interpreted as a terminal command.
+const visibleControl = (code: number): string =>
+  code <= 0x1f
+    ? String.fromCharCode(0x2400 + code)
+    : code === 0x7f
+      ? '\u2421'
+      : `\\u${code.toString(16).padStart(4, '0')}`;
+/**
+ * Make untrusted text inert before composing it with terminal ANSI. Newlines
+ * and tabs are controls too: callers must opt into the layout they own.
+ */
+export const terminalText = (text: string, opts: TerminalTextOpts = {}): string => {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x0a && opts.multiline) {
+      out += '\n';
+      continue;
+    }
+    // Treat ordinary CRLF as the caller-owned LF. A standalone CR stays
+    // visible: it would otherwise rewind into text already drawn.
+    if (code === 0x0d && opts.multiline && text.charCodeAt(i + 1) === 0x0a) continue;
+    if (code === 0x09 && opts.tabs !== undefined) {
+      out += ' '.repeat(Math.max(0, opts.tabs));
+      continue;
+    }
+    out += code <= 0x1f || (code >= 0x7f && code <= 0x9f) ? visibleControl(code) : text[i];
+  }
+  return out;
+};
+// The complete SGR vocabulary emitted by bismar and the vendored terminal
+// highlighter. This is deliberately not a general ANSI parser: OSC hyperlinks,
+// clipboard commands, cursor motion, erases, and malformed ESC sequences are
+// rendered visibly even when they arrive next to trusted colors.
+const SAFE_SGR = /^\x1b\[(?:0|1|2|31|32|33|34|35|36|37|90|95|97)m/;
+/** Sanitize a composed terminal row while retaining bismar's own color SGRs. */
+export const terminalAnsi = (text: string, opts: TerminalTextOpts = {}): string => {
+  let out = '';
+  let plain = '';
+  const flush = (): void => {
+    out += terminalText(plain, opts);
+    plain = '';
+  };
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 0x1b) {
+      const sgr = SAFE_SGR.exec(text.slice(i))?.[0];
+      if (sgr) {
+        flush();
+        out += sgr;
+        i += sgr.length - 1;
+        continue;
+      }
+    }
+    plain += text[i];
+  }
+  flush();
+  return out;
+};
 /** Shared ANSI palette. */
 const esc = String.fromCharCode(27); // \x1b — a shared prefix minifies better than escapes
 export const color: Record<
@@ -84,8 +150,10 @@ export const color: Record<
   yellow: esc + '[33m',
 };
 /** Colorize text for terminals; pass `on` from colorEnabled()/wantColor(). */
-export const paint = (text: string, code: string, on: boolean = true): string =>
-  on ? `${code}${text}${color.reset}` : text;
+export const paint = (text: string, code: string, on: boolean = true): string => {
+  const safe = terminalText(text);
+  return on ? `${code}${safe}${color.reset}` : safe;
+};
 /**
 Transient startup progress: one status line on stderr for runs that stay silent
 too long (npm installs, export enumeration, measuring a large package). The line
@@ -106,7 +174,7 @@ const progressWrite = (): void =>
 /** Update the status detail; the first call arms the one-second delay. No-op off-terminal. */
 export const progressUpdate = (text: string): void => {
   if (progressMuted || !progressStderr()?.isTTY) return;
-  progressText = text;
+  progressText = terminalText(text);
   if (progressShown) progressWrite();
   else if (!progressTimer) {
     const timer = setTimeout(() => {
@@ -124,7 +192,7 @@ export const progressShow = (text: string): void => {
   if (progressMuted || !progressStderr()?.isTTY) return;
   if (progressTimer) clearTimeout(progressTimer);
   progressTimer = undefined;
-  progressText = text;
+  progressText = terminalText(text);
   progressShown = true;
   progressWrite();
 };
@@ -148,7 +216,9 @@ export const progressReset = (): void => {
   progressMuted = false;
 };
 export const csvCell = (val: unknown): string => {
-  const cell = stripAnsi(String(val ?? ''));
+  // CSV can be forced onto a TTY. Remove bismar-owned colors, then neutralize
+  // every remaining terminal control while retaining real CSV record content.
+  const cell = terminalText(stripAnsi(String(val ?? '')), { multiline: true, tabs: 2 });
   return /[",\r\n]/.test(cell) ? `"${cell.replaceAll('"', '""')}"` : cell;
 };
 export const csvRow = (values: unknown[]): string => values.map(csvCell).join(',');

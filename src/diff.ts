@@ -12,10 +12,10 @@ of file` markers are not emitted.
  */
 import { lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { color, csvRow, paint, progressShow } from './env.ts';
+import { color, csvRow, paint, progressShow, terminalText } from './env.ts';
 import { extractArchive, npmInstall, npmPack, writePkg } from './fs-modify.ts';
-import { bad, err, explicitPath, kb, readPkg, slug } from './public.ts';
-import { asRef, explicitRef, installedRef, npmHintUse, parseNpmRef } from './refs.ts';
+import { bad, err, explicitPath, kb, readPkg } from './public.ts';
+import { asRef, cacheKey, explicitRef, installedRef, npmHintUse, parseNpmRef } from './refs.ts';
 import { isRegistrySelector, jsHitStats, parseRegistryRef, registryContext } from './registries.ts';
 
 export type DiffStatus = 'added' | 'modified' | 'removed';
@@ -44,7 +44,7 @@ const TGZ = /\.(?:tgz|tar\.gz)$/i;
 // single root directory — usually `package/`, but the name is not guaranteed.
 const extractedTgz = (outDir: string, file: string, label: string): DiffSide => {
   const bytes = readFileSync(file);
-  const dir = join(outDir, `tgz-${slug(label)}`);
+  const dir = join(outDir, `tgz-${cacheKey(label)}`);
   extractArchive(bytes, dir);
   const entries = readdirSync(dir, { withFileTypes: true });
   const root = entries.length === 1 && entries[0].isDirectory() ? join(dir, entries[0].name) : dir;
@@ -129,7 +129,11 @@ const packable = (side: DiffSide): boolean =>
 export const packLocalSide = (outDir: string, side: DiffSide): DiffSide => {
   if (!packable(side)) return side;
   const label = `${side.label} (npm pack)`;
-  return extractedTgz(outDir, npmPack(side.dir, join(outDir, `pack-${slug(side.label)}`)), label);
+  return extractedTgz(
+    outDir,
+    npmPack(side.dir, join(outDir, `pack-${cacheKey(side.label)}`)),
+    label
+  );
 };
 export const packLocalSides = (outDir: string, a: DiffSide, b: DiffSide): [DiffSide, DiffSide] => {
   if (packable(a) === packable(b)) return [a, b];
@@ -150,7 +154,7 @@ export const measuredSide = (outDir: string, side: DiffSide): DiffSide => {
   if (!statSync(join(side.dir, 'package.json'), { throwIfNoEntry: false })?.isFile()) return side;
   const name = readPkg(join(side.dir, 'package.json')).name;
   progressShow(`installing ${side.label}`);
-  const dir = join(outDir, `install-${slug(side.label)}`);
+  const dir = join(outDir, `install-${cacheKey(side.label)}`);
   writePkg(
     join(dir, 'package.json'),
     `${JSON.stringify({ dependencies: { [name]: `file:${side.tarball}` }, private: true }, null, 2)}\n`
@@ -159,9 +163,9 @@ export const measuredSide = (outDir: string, side: DiffSide): DiffSide => {
   return { ...side, dir: join(dir, 'node_modules', name) };
 };
 
-// Shipped files only, like the navigator's files view: dev-only trees are
-// skipped, and symlinks are skipped whole (registry archives extract through
-// the system tar and can ship links aimed anywhere).
+// Shipped files only, like the navigator's files view: dev-only trees and
+// symlinks are skipped whole. Hardened registry extraction rejects links too;
+// the skip still protects local trees and caches made by older builds.
 const SKIP = new Set(['.git', 'node_modules']);
 const walk = (root: string, rel: string, out: Map<string, number>): void => {
   for (const ent of readdirSync(join(root, rel), { withFileTypes: true })) {
@@ -344,7 +348,7 @@ const opLine = (op: DiffOp, on: boolean): string =>
     ? paint(`+${op.text}`, color.green, on)
     : op.kind === '-'
       ? paint(`-${op.text}`, color.red, on)
-      : ` ${op.text}`;
+      : ` ${terminalText(op.text)}`;
 const textHunks = (aText: string, bText: string, on: boolean): string[] => {
   const lines: string[] = [];
   for (const hunk of hunksOf(diffLines(aText, bText))) {
@@ -426,7 +430,9 @@ export const fileDiffLines = (
       return lines;
     }
     lines.push(
-      `Binary files a/${p} and b/${p} differ (${kb(entry.aBytes)} → ${kb(entry.bBytes)}kb)`
+      terminalText(
+        `Binary files a/${p} and b/${p} differ (${kb(entry.aBytes)} → ${kb(entry.bBytes)}kb)`
+      )
     );
     // Its own line: appended to the header it pushes past every terminal width.
     if (entry.status === 'modified') lines.push(binarySummary(aBuf, bBuf));
@@ -441,6 +447,83 @@ export const fileDiffLines = (
 };
 export const renderUnified = (aDir: string, bDir: string, tree: TreeDiff, on: boolean): string[] =>
   tree.entries.flatMap((entry) => fileDiffLines(aDir, bDir, entry, on));
+
+// Classic diff paint is the fallback for unknown file types and any highlighter
+// failure. Keeping it here also leaves the synchronous renderers above stable
+// for callers that need deterministic, immediately available strings.
+const paintUnifiedLines = (lines: string[], on: boolean): string[] =>
+  lines.map((line) =>
+    line.startsWith('diff --bismar ') || line.startsWith('--- ') || line.startsWith('+++ ')
+      ? paint(line, color.bold, on)
+      : line.startsWith('@@ ')
+        ? paint(line, color.cyan, on)
+        : line.startsWith('+')
+          ? paint(line, color.green, on)
+          : line.startsWith('-')
+            ? paint(line, color.red, on)
+            : line
+  );
+
+const syntaxUnifiedLines = async (
+  lines: string[],
+  filename: string,
+  on: boolean
+): Promise<string[]> => {
+  if (!on) return lines;
+  // Match bundle/source preview policy: a pathological generated file should
+  // open immediately, even if that means retaining only classic diff colors.
+  if (lines.reduce((bytes, line) => bytes + line.length + 1, 0) > 1024 * 1024)
+    return paintUnifiedLines(lines, true);
+  const { languageFromFilename } = await import('./vendor/speed-highlight/detect.js');
+  const lang = languageFromFilename(filename);
+  if (!lang) return paintUnifiedLines(lines, true);
+  try {
+    const { highlightDiffText } = await import('./vendor/speed-highlight/terminal.js');
+    const highlighted = (await highlightDiffText(lines.join('\n'), lang)).split('\n');
+    // highlightDiffText owns only hunk payloads and +/- markers. Preserve the
+    // established bismar dress for file and hunk scaffolding.
+    return highlighted.map((line, i) =>
+      lines[i].startsWith('diff --bismar ') ||
+      lines[i].startsWith('--- ') ||
+      lines[i].startsWith('+++ ')
+        ? paint(line, color.bold, true)
+        : lines[i].startsWith('@@ ')
+          ? paint(line, color.cyan, true)
+          : line
+    );
+  } catch {
+    return paintUnifiedLines(lines, true);
+  }
+};
+
+/** A file diff with source-language syntax colors when terminal color is on. */
+export const highlightedFileDiffLines = async (
+  aDir: string,
+  bDir: string,
+  entry: DiffEntry,
+  on: boolean
+): Promise<string[]> => syntaxUnifiedLines(fileDiffLines(aDir, bDir, entry, false), entry.path, on);
+
+/** Tree counterpart to renderUnified, loaded by colored CLI/TUI paths only. */
+export const renderUnifiedHighlighted = async (
+  aDir: string,
+  bDir: string,
+  tree: TreeDiff,
+  on: boolean
+): Promise<string[]> =>
+  (
+    await Promise.all(tree.entries.map((entry) => highlightedFileDiffLines(aDir, bDir, entry, on)))
+  ).flat();
+
+/** Bundle diffs always contain JavaScript, regardless of their selector labels. */
+export const renderTextUnifiedHighlighted = async (
+  aText: string,
+  bText: string,
+  aLabel: string,
+  bLabel: string,
+  on: boolean
+): Promise<string[]> =>
+  syntaxUnifiedLines(renderTextUnified(aText, bText, aLabel, bLabel, false), 'bundle.js', on);
 
 const MARK: Record<DiffStatus, string> = { added: 'A', modified: 'M', removed: 'D' };
 const MARK_COLOR: Record<DiffStatus, string> = {
@@ -489,7 +572,9 @@ const markOf = (entry: DiffEntry, on: boolean): string =>
 // files its counts and totals just restate the rows.
 export const statHuman = (tree: TreeDiff, on: boolean, a?: DiffSide, b?: DiffSide): string[] => [
   ...tree.entries.map(
-    (entry) => `${markOf(entry, on)} ${entry.path}` + paint(`  ${statTail(entry)}`, color.dim, on)
+    (entry) =>
+      `${markOf(entry, on)} ${terminalText(entry.path)}` +
+      paint(`  ${statTail(entry)}`, color.dim, on)
   ),
   ...(a?.sel || b?.sel
     ? []
@@ -497,7 +582,7 @@ export const statHuman = (tree: TreeDiff, on: boolean, a?: DiffSide, b?: DiffSid
 ];
 // `-dl`: just the changed files, name-status style — no sizes, no content.
 export const statNames = (tree: TreeDiff, on: boolean): string[] =>
-  tree.entries.map((entry) => `${markOf(entry, on)} ${entry.path}`);
+  tree.entries.map((entry) => `${markOf(entry, on)} ${terminalText(entry.path)}`);
 // Headerless machine rows: status, path, a bytes, b bytes, signed delta.
 export const statCsv = (tree: TreeDiff): string[] =>
   tree.entries.map((entry) => {
@@ -584,7 +669,7 @@ export const bundleStatHuman = (stat: BundleStat, on: boolean): string[] => {
   return [
     ...stat.entries.map(
       (entry) =>
-        `${paint(MARK[entry.status], MARK_COLOR[entry.status], on)} ${bundleLabel(entry)}` +
+        `${paint(MARK[entry.status], MARK_COLOR[entry.status], on)} ${terminalText(bundleLabel(entry))}` +
         paint(`  ${bundleTail(entry, stat.metric)}`, color.dim, on)
     ),
     '',

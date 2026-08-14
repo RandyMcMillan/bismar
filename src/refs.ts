@@ -4,11 +4,19 @@ into bismar-owned dirs, and the per-ref measurement cache (`bismar.db.json`).
 Destructive ops and `npm install` go through `fs-modify.ts` only.
 @module
  */
-import { existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { progressShow } from './env.ts';
-import { npmInstall, promoteTemp, write, writeJsrNpmrc, writePkg } from './fs-modify.ts';
+import {
+  npmInstall,
+  privateCacheDir,
+  promoteTemp,
+  rmTempDir,
+  write,
+  writeJsrNpmrc,
+  writePkg,
+} from './fs-modify.ts';
 import { bad, err, type Pkg, readJson, readPkg, readText, slug } from './public.ts';
 
 // External refs: `@noble/hashes@2.2.0/sha2.js/sha256` measures another package
@@ -58,7 +66,7 @@ export const parseNpmRef = (raw: string): ExternalRef => {
 // most every 15 minutes: a tag file remembers what the floating spec resolved to,
 // and the resolving install itself is promoted into the machine cache.
 export const PINNED: RegExp = /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/;
-const TAG_TTL_MS = 15 * 60_000;
+export const TAG_TTL_MS: number = 15 * 60_000;
 // jsr's npm-compat registry serves packages as @jsr/scope__name, and their tarballs
 // self-reference that name in package.json and deep imports — so refs install under
 // it verbatim; only labels and selectors keep the friendly jsr:@scope/name spelling.
@@ -66,6 +74,17 @@ const installName = (ref: ExternalRef): string =>
   ref.jsr ? `@jsr/${ref.bare.slice(1).replace('/', '__')}` : ref.bare;
 const installedAt = (base: string, ref: ExternalRef): string =>
   join(base, 'node_modules', installName(ref), 'package.json');
+const validRefCache = (dir: string, label: string, ref: ExternalRef, version: string): boolean => {
+  if (!hasCacheIdentity(label)) return false;
+  try {
+    const manifest = installedAt(dir, ref);
+    const st = lstatSync(manifest, { throwIfNoEntry: false });
+    const pkg = st?.isFile() ? readPkg(manifest, true) : undefined;
+    return pkg?.name === installName(ref) && pkg.version === version;
+  } catch {
+    return false;
+  }
+};
 // Deep import paths must use the real install name: friendly labels (jsr:@scope/name)
 // never exist under node_modules, so specs by real name keep self-referencing
 // imports resolvable. Specs already under the package's own name stay untouched.
@@ -76,31 +95,47 @@ export const realSpec = (ref: ExternalRef, spec: string, pkgName: string): strin
 // bumps this segment and abandons the old tree — recomputed, never migrated —
 // and concurrent bismar versions each own their whole tree. The root keeps its
 // `bismar-` prefix, so `--clear` from any version removes any version's caches.
-export const refsRoot = (): string => join(tmpdir(), 'bismar-refs', 'v1');
+export const refsRoot = (): string => privateCacheDir('bismar-refs', 'v2');
+// Human-readable slugs are useful in diagnostics but are not identities:
+// `a+b` and `a-b`, for example, collapse to the same spelling. Cache paths keep
+// a short readable prefix and a full SHA-256 of the exact, namespaced label.
+// The digest also keeps very long package/module names below filesystem limits.
+export const cacheKey = (label: string): string => {
+  const readable = slug(label).slice(0, 48) || 'ref';
+  const digest = createHash('sha256').update(label).digest('hex');
+  return `${readable}-${digest}`;
+};
 // The machine-wide ref cache root: one label-keyed dir per pinned install,
 // shared by npm/jsr refs here and every registry ecosystem (registries.ts),
-// filed one subdirectory per registry — …/v1/gem/, …/v1/crate/ — with bare npm
+// filed one subdirectory per registry — …/v2/gem/, …/v2/crate/ — with bare npm
 // labels (`qr@0.6.0`) under npm/.
 export const refsCacheDir = (label: string): string => {
   const colon = label.indexOf(':');
   const prefix = colon > 0 ? label.slice(0, colon) : 'npm';
   const rest = colon > 0 ? label.slice(colon + 1) : label;
-  return join(refsRoot(), prefix, slug(rest));
+  return join(refsRoot(), prefix, cacheKey(rest));
 };
 // For originally-pinned refs this reproduces ref.label, so both spellings of one
 // version (`qr@0.6.0` and a fresh-tagged `qr`) share a single cache dir.
 const pinnedDirOf = (ref: ExternalRef, version: string): string =>
   refsCacheDir(`${ref.jsr ? 'jsr:' : ''}${ref.bare}@${version}`);
 // Tag files are keyed by display label (`npm:qr`, `crate:serde`), so every
-// ecosystem's floating "latest" shares one TTL cache without colliding.
-const tagFile = (label: string): string => join(refsRoot(), '.tags', `${slug(label)}.json`);
-export const readVersionTag = (label: string): string | undefined => {
+// ecosystem's floating "latest" shares one TTL cache without colliding. The
+// TTL applies at read time; a registry with tight anonymous quotas (github)
+// stretches it via `ttlScale`, so one write serves both scales.
+export const refsTagFile = (label: string): string =>
+  join(refsRoot(), '.tags', `${cacheKey(label)}.json`);
+export const readVersionTag = (label: string, ttlScale: number = 1): string | undefined => {
   try {
-    const tag = readJson<{ at: number; version: string }>(tagFile(label));
+    const tag = readJson<{ at: number; label?: unknown; v?: unknown; version: string }>(
+      refsTagFile(label)
+    );
     if (
+      tag.v === 2 &&
+      tag.label === label &&
       typeof tag.version === 'string' &&
       typeof tag.at === 'number' &&
-      Date.now() - tag.at < TAG_TTL_MS
+      Date.now() - tag.at < TAG_TTL_MS * ttlScale
     )
       return tag.version;
   } catch {
@@ -109,29 +144,57 @@ export const readVersionTag = (label: string): string | undefined => {
   return undefined;
 };
 export const writeVersionTag = (label: string, version: string): void =>
-  void write(tagFile(label), `${JSON.stringify({ at: Date.now(), version })}\n`);
-// Pinned archives are immutable, so their downloaded byte size persists beside
+  void write(refsTagFile(label), `${JSON.stringify({ at: Date.now(), label, v: 2, version })}\n`);
+// Pinned archives are immutable, so their identity, digest, and downloaded byte
+// size persist beside
 // the tag cache (never inside the extract dir, whose sole-dir descent and file
 // listings must stay pristine). Extracts predating the meta file simply omit
 // the stat.
-const metaFile = (label: string): string => join(refsRoot(), '.meta', `${slug(label)}.json`);
-export const readArchiveBytes = (label: string): number | undefined => {
-  try {
-    const bytes = readJson<{ archiveBytes?: unknown }>(metaFile(label)).archiveBytes;
-    return typeof bytes === 'number' && bytes > 0 ? bytes : undefined;
-  } catch {
-    return undefined;
-  }
+type RefCacheMeta = {
+  archiveBytes?: number;
+  archiveSha256?: string;
+  label: string;
+  v: 2;
 };
-export const writeArchiveBytes = (label: string, bytes: number): void =>
-  void write(metaFile(label), `${JSON.stringify({ archiveBytes: bytes })}\n`);
+export const refsMetaFile = (label: string): string =>
+  join(refsRoot(), '.meta', `${cacheKey(label)}.json`);
+const readCacheMeta = (label: string): RefCacheMeta | undefined => {
+  try {
+    const meta = readJson<Partial<RefCacheMeta>>(refsMetaFile(label));
+    if (meta.v === 2 && meta.label === label) return meta as RefCacheMeta;
+  } catch {
+    // Missing, corrupt, or from another cache identity: cold below.
+  }
+  return undefined;
+};
+export const hasCacheIdentity = (label: string): boolean => readCacheMeta(label) !== undefined;
+export const writeCacheIdentity = (
+  label: string,
+  fields: Pick<RefCacheMeta, 'archiveBytes' | 'archiveSha256'> = {}
+): void => void write(refsMetaFile(label), `${JSON.stringify({ ...fields, label, v: 2 })}\n`);
+export const readArchiveBytes = (label: string): number | undefined => {
+  const bytes = readCacheMeta(label)?.archiveBytes;
+  return typeof bytes === 'number' && bytes > 0 ? bytes : undefined;
+};
+export const readArchiveSha256 = (label: string): string | undefined => {
+  const digest = readCacheMeta(label)?.archiveSha256;
+  return typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
+};
+export const writeArchiveBytes = (label: string, bytes: number, archiveSha256?: string): void =>
+  writeCacheIdentity(label, { archiveBytes: bytes, archiveSha256 });
 const installRef = (outDir: string, ref: ExternalRef): string => {
   const version = PINNED.test(ref.version)
     ? ref.version
     : (readVersionTag(ref.label) ?? ref.version);
   const pinned = PINNED.test(version);
-  const dir = pinned ? pinnedDirOf(ref, version) : join(outDir, '.refs', slug(ref.label));
-  if (pinned && existsSync(installedAt(dir, ref))) return dir;
+  const pinnedDir = pinned ? pinnedDirOf(ref, version) : '';
+  const pinnedLabel = `${ref.jsr ? 'jsr:' : ''}${ref.bare}@${version}`;
+  const validPinned = (): boolean => pinned && validRefCache(pinnedDir, pinnedLabel, ref, version);
+  if (validPinned()) return pinnedDir;
+  // Never install directly into the shared cache: another process must see
+  // either a complete promoted tree or no tree at all.
+  if (pinned && existsSync(pinnedDir)) rmTempDir(pinnedDir);
+  const dir = join(outDir, '.refs', cacheKey(`${ref.label}@${version || 'latest'}`));
   // Immediate, not delayed: the synchronous npm install blocks the event loop,
   // so a timer armed now could only ever fire after the wait is already over.
   progressShow(`installing ${ref.label}`);
@@ -158,7 +221,7 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
     npmInstall(dir);
   } catch (error) {
     // A concurrent prime may have won the race; only fail when the ref is truly absent.
-    if (pinned && existsSync(installedAt(dir, ref))) return dir;
+    if (pinned && validPinned()) return pinnedDir;
     const msg = (error as Error).message;
     // A "missing" version or package may just be npm's offline-first cache
     // holding a packument older than the release; ask the registry once for
@@ -170,6 +233,19 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
       explain(again as Error);
     }
   }
+  if (pinned) {
+    // Publish the identity first, then atomically rename the completed tree.
+    // A reader can therefore never observe a promoted directory without its
+    // matching marker (a marker without a directory is simply a cold miss).
+    writeCacheIdentity(pinnedLabel);
+    if (promoteTemp(dir, pinnedDir)) {
+      return pinnedDir;
+    }
+    // A concurrent complete promotion wins; otherwise the private per-run
+    // install remains valid for this invocation and no partial cache is used.
+    if (validPinned()) return pinnedDir;
+    return dir;
+  }
   if (!pinned) {
     // The floating spec just resolved; remember the answer and promote the fresh
     // install into the machine cache so the pinned path is warm for 15 minutes.
@@ -178,7 +254,16 @@ const installRef = (outDir: string, ref: ExternalRef): string => {
     if (PINNED.test(got)) {
       writeVersionTag(ref.label, got);
       const target = pinnedDirOf(ref, got);
-      if (!existsSync(target) && promoteTemp(dir, target)) return target;
+      const targetLabel = `${ref.jsr ? 'jsr:' : ''}${ref.bare}@${got}`;
+      // Never bless a pre-existing unknown tree by writing an identity marker
+      // beside it. A valid concurrent/earlier promotion can win; an invalid
+      // occupant merely disables this optional machine-cache promotion while
+      // the complete private install serves the current run.
+      if (validRefCache(target, targetLabel, ref, got)) return target;
+      if (existsSync(target)) return dir;
+      writeCacheIdentity(targetLabel);
+      if (promoteTemp(dir, target)) return target;
+      if (validRefCache(target, targetLabel, ref, got)) return target;
     }
   }
   return dir;

@@ -12,7 +12,8 @@ urls read from registry metadata are confined to known-registry origins first
 (`allowUrl`); hardcoded-base fetches (gem/crate/gh/gitlab/go) need no such check.
 @module
  */
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { type FetchFn, ftch, retry } from 'micro-ftch';
 import { cliProcess, envFlag, progressDone, progressShow } from './env.ts';
@@ -21,16 +22,21 @@ import {
   extractArchive,
   extractTar,
   promoteTemp,
+  rm,
   rmTempDir,
   write,
 } from './fs-modify.ts';
-import { bad, err, explicitPath, fmtBytes, readJson, slug } from './public.ts';
+import { bad, err, explicitPath, fmtBytes, readJson } from './public.ts';
 import {
+  cacheKey,
+  hasCacheIdentity,
   PINNED,
   readArchiveBytes,
+  readArchiveSha256,
   readVersionTag,
   refsCacheDir,
   refsRoot,
+  TAG_TTL_MS,
   writeArchiveBytes,
   writeVersionTag,
 } from './refs.ts';
@@ -72,18 +78,24 @@ const allowedOrigins = (): string[] =>
     originOf(jsrApi()),
     originOf(jsrNpm()),
   ].filter(Boolean);
-let lazyNet: FetchFn | undefined;
-let lazyHosts = '';
-const net = (): FetchFn => {
+// Metadata is attacker-controlled too. Keep it comfortably above real registry
+// documents while preventing an unbounded JSON/text response from being fully
+// buffered. Archives get a separate soft consent threshold and hard ceiling.
+export const MAX_METADATA_BYTES: number = 16 * 1024 * 1024;
+export const MAX_ARCHIVE_BYTES: number = 512 * 1024 * 1024;
+const lazyNets = new Map<string, FetchFn>();
+const bodyLimitError = (error: unknown): boolean =>
+  error instanceof Error && error.message.includes('maxBodySize=');
+const net = (maxBodySize: number = MAX_METADATA_BYTES): FetchFn => {
   // Rebuilt when the effective host set changes (env-overridden bases vary
   // per test); a stable environment builds exactly once.
   const hosts = allowedOrigins();
-  const key = hosts.join(',');
-  if (!lazyNet || key !== lazyHosts) {
-    lazyHosts = key;
+  const key = `${maxBodySize}\0${hosts.join(',')}`;
+  let cached = lazyNets.get(key);
+  if (!cached) {
     const tuned = Number(process.env.BISMAR_RPS ?? NaN);
     const rps = Number.isFinite(tuned) ? tuned : 8;
-    lazyNet = retry(
+    cached = retry(
       ftch(fetch, {
         allowedHosts: hosts,
         concurrencyLimit: 4,
@@ -96,11 +108,23 @@ const net = (): FetchFn => {
             appendLog(file, `${new Date().toISOString()} ${opts?.method ?? 'GET'} ${url}\n`);
         },
         ...(rps > 0 ? { rps } : {}),
+        maxBodySize,
         timeout: 30_000,
-      })
+      }),
+      {
+        // A deterministic policy rejection will not become smaller on retry.
+        // Preserve the normal safe-method retry behavior for transient errors
+        // and 408/429/5xx responses.
+        shouldRetry: ({ error, opts, status }) => {
+          const method = (opts.method || 'GET').toUpperCase();
+          if (!['GET', 'HEAD', 'OPTIONS'].includes(method) || bodyLimitError(error)) return false;
+          return error !== undefined || status === 408 || status === 429 || (status ?? 0) >= 500;
+        },
+      }
     );
+    lazyNets.set(key, cached);
   }
-  return lazyNet;
+  return cached;
 };
 type NetResponse = Awaited<ReturnType<FetchFn>>;
 // Env-overridable bases for offline tests and proxies, like BISMAR_JSR_REGISTRY.
@@ -136,9 +160,18 @@ const allowUrl = (url: string, origins: string[]): string => {
   return url;
 };
 const fetchOk = async (url: string, miss: () => never, accept?: string): Promise<NetResponse> => {
-  const res = await net()(url, {
-    headers: accept ? { accept, 'user-agent': UA } : { 'user-agent': UA },
-  });
+  let res: NetResponse;
+  try {
+    res = await net()(url, {
+      headers: accept ? { accept, 'user-agent': UA } : { 'user-agent': UA },
+    });
+  } catch (error) {
+    if (bodyLimitError(error))
+      return err(
+        `refusing oversized registry response from ${bad(new URL(url).host)}; limit is ${fmtBytes(MAX_METADATA_BYTES)}`
+      );
+    throw error;
+  }
   // 410 is the go proxy's "no such module"; 403 doubles as github's rate limit.
   if (res.status === 403 || res.status === 404 || res.status === 410) miss();
   if (!res.ok) err(`fetching ${url} failed: HTTP ${res.status}`);
@@ -182,11 +215,41 @@ export const guardBigArchive = async (id: string, bytes: number): Promise<void> 
   if (!/^y(es)?$/i.test(answer.trim())) err(`download cancelled: ${bad(id)}`);
 };
 const bytesOf = async (url: string, miss: () => never, id: string = url): Promise<Uint8Array> => {
-  const res = await fetchOk(url, miss);
-  // Static registry files announce their size up front; codeload streams
-  // without content-length, so the gh fetcher pre-checks via the repo api.
+  const proc = cliProcess();
+  let largeAllowed = envFlag(proc?.env?.BISMAR_BIG);
+  const get = async (limit: number): Promise<NetResponse> => {
+    const res = await net(limit)(url, { headers: { 'user-agent': UA } });
+    if (res.status === 403 || res.status === 404 || res.status === 410) miss();
+    if (!res.ok) err(`fetching ${url} failed: HTTP ${res.status}`);
+    return res;
+  };
+  let res: NetResponse;
+  try {
+    // Unknown-length/chunked responses are cancelled as soon as they cross the
+    // consent boundary. A confirmed request is retried once with the hard cap.
+    res = await get(largeAllowed ? MAX_ARCHIVE_BYTES : BIG_ARCHIVE - 1);
+  } catch (error) {
+    if (!bodyLimitError(error)) throw error;
+    if (largeAllowed)
+      return err(
+        `refusing oversized download: ${bad(id)} exceeds the ${fmtBytes(MAX_ARCHIVE_BYTES)} hard limit`
+      );
+    await guardBigArchive(id, BIG_ARCHIVE);
+    largeAllowed = true;
+    try {
+      res = await get(MAX_ARCHIVE_BYTES);
+    } catch (again) {
+      if (bodyLimitError(again))
+        return err(
+          `refusing oversized download: ${bad(id)} exceeds the ${fmtBytes(MAX_ARCHIVE_BYTES)} hard limit`
+        );
+      throw again;
+    }
+  }
+  // Honest Content-Length values can still present a precise prompt. The
+  // streaming caps above remain authoritative for missing or false headers.
   const len = Number(res.headers?.get?.('content-length'));
-  if (len) await guardBigArchive(id, len);
+  if (len && !largeAllowed) await guardBigArchive(id, len);
   return new Uint8Array(await res.arrayBuffer());
 };
 const textOf = async (url: string, miss: () => never, accept: string): Promise<string> =>
@@ -200,6 +263,9 @@ type Fetched = { bytes: Uint8Array; ext: string };
 type Registry = {
   // Turn typed versions into the registry's own spelling (go: 0.14.0 → v0.14.0).
   canon?: (version: string) => string;
+  // Canonical immutable commit spelling for registries with `pin`. GitHub
+  // currently uses SHA-1 only; GitLab repositories may use SHA-1 or SHA-256.
+  commitId?: RegExp;
   // Version spelling for error hints.
   example: string;
   // Download `name@version`, extract it into `dir`, and hand back the verbatim
@@ -217,6 +283,9 @@ type Registry = {
   // unambiguously and the whole body stays the name.
   segs?: number;
   site: string;
+  // Version-tag TTL multiplier (default 1 = 15 minutes). github's anonymous
+  // api quota is tight, so its ref→commit pins live twice as long.
+  tagTtlScale?: number;
   // Ref shape for error hints, e.g. 'vendor/name@version'.
   use: string;
   version: RegExp;
@@ -360,9 +429,13 @@ export const REGISTRIES: Record<string, Registry> = {
         data = readFileSync(join(shell, 'data.tar.gz'));
       } catch {
         return err(`invalid gem archive for ${bad(label)}: missing data.tar.gz`);
+      } finally {
+        // The inner bytes are in memory now. Drop the shell before expanding
+        // them so two independently bounded archive trees never coexist on
+        // disk and temporarily double the member/size ceiling.
+        rmTempDir(shell);
       }
       extractTar(data, dir);
-      rmTempDir(shell);
       return { bytes, ext: '.gem' };
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/,
@@ -379,8 +452,10 @@ export const REGISTRIES: Record<string, Registry> = {
   },
   // Repos, not releases: any ref — branch, tag, sha, or none (HEAD) — pins to a
   // commit id first, so labels stay copy-pasteable and the cache never goes
-  // stale for longer than the 15-minute tag. Tarballs come from codeload.
+  // stale for longer than the ref→commit tag — 30 minutes here (2× the usual
+  // TTL, easing github's anonymous quotas). Tarballs come from codeload.
   'gh:': {
+    commitId: /^[0-9a-f]{40}$/,
     example: 'main',
     fetch: async (name, version, label, dir) => {
       // Codeload streams its tarballs chunked, without content-length; the
@@ -413,9 +488,10 @@ export const REGISTRIES: Record<string, Registry> = {
           ),
         'application/vnd.github.sha'
       );
-      return sha.trim().slice(0, 12);
+      return sha.trim();
     },
     site: 'github.com',
+    tagTtlScale: 2,
     use: 'owner/repo@ref',
     version: /^[\w./-]+$/,
     what: 'repository',
@@ -423,6 +499,7 @@ export const REGISTRIES: Record<string, Registry> = {
   // GitLab repos, same contract as gh:: any ref pins to a commit id first.
   // Names are group/project with nested subgroups allowed.
   'gitlab:': {
+    commitId: /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/,
     example: 'main',
     fetch: async (name, version, label, dir) => {
       // Unlike gh:, no size pre-check: the project api hides repository size
@@ -444,7 +521,7 @@ export const REGISTRIES: Record<string, Registry> = {
       const list = await jsonOf<{ id?: string }[]>(url, miss);
       const sha = (Array.isArray(list) && list[0]?.id) || '';
       if (!sha) miss();
-      return sha.trim().slice(0, 12);
+      return sha.trim();
     },
     site: 'gitlab.com',
     use: 'group/project@ref',
@@ -846,6 +923,50 @@ const PROFILERS: Record<string, Profiler> = {
   },
 };
 export const canProfile = (prefix: string): boolean => prefix in PROFILERS;
+// Profile listings are normally fetched live — a listing is a jumping-off
+// point — but github's anonymous search quota is 10 requests/minute, so gh
+// user listings persist machine-wide for 2× the version-tag TTL (30 minutes).
+// Same disposable-derivative rules as `.stats`: one file per user, any shape
+// surprise or expired stamp is a miss, `--clear` wipes it with the rest.
+const CACHED_PROFILES = new Set(['gh:']);
+const profileFile = (prefix: string, user: string): string =>
+  join(refsRoot(), '.profiles', `${cacheKey(`${prefix}${user}`)}.json`);
+const readProfileHits = (prefix: string, user: string): SearchHit[] | undefined => {
+  try {
+    const label = `${prefix}${user}`;
+    const got = readJson<{
+      at?: number;
+      hits?: Partial<SearchHit>[];
+      label?: unknown;
+      v?: unknown;
+    }>(profileFile(prefix, user));
+    if (
+      got.v !== 2 ||
+      got.label !== label ||
+      typeof got?.at !== 'number' ||
+      Date.now() - got.at >= TAG_TTL_MS * 2
+    )
+      return undefined;
+    const rows = Array.isArray(got.hits) ? got.hits : [];
+    const hits = rows.flatMap((h) =>
+      h && typeof h.name === 'string' && typeof h.version === 'string' && typeof h.desc === 'string'
+        ? [{ desc: h.desc, name: h.name, version: h.version }]
+        : []
+    );
+    return hits.length && hits.length === rows.length ? hits : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const writeProfileHits = (prefix: string, user: string, hits: SearchHit[]): SearchHit[] => {
+  const label = `${prefix}${user}`;
+  const rows = hits.map(({ desc, name, version }) => ({ desc, name, version }));
+  write(
+    profileFile(prefix, user),
+    `${JSON.stringify({ at: Date.now(), hits: rows, label, v: 2 })}\n`
+  );
+  return hits;
+};
 // Display spelling for labels and crumbs: the long registry name. Only gh: has
 // a short canonical prefix; the long alias is equally valid to type back in,
 // so prettified crumbs stay copy-pasteable selectors.
@@ -855,13 +976,15 @@ export const profileHits = async (prefix: string, user: string): Promise<SearchH
   const profile = PROFILERS[prefix];
   if (!profile)
     return err(`no profile listing behind ${bad(prefix)}; open an exact package instead`);
+  const cached = CACHED_PROFILES.has(prefix) ? readProfileHits(prefix, user) : undefined;
+  if (cached) return cached;
   const miss = (): never =>
     prefix === 'gh:'
       ? err(`profile not found: ${bad(`gh:@${user}`)} — or github's rate limit; retry in a minute`)
       : err(`profile not found: ${bad(`${prefix}@${user}`)}`);
   const hits = await profile(user, miss);
   if (!hits.length) err(`no packages under ${bad(`${prefix}@${user}`)}`);
-  return hits;
+  return CACHED_PROFILES.has(prefix) ? writeProfileHits(prefix, user, hits) : hits;
 };
 
 export const searchRegistry = async (prefix: string, query: string): Promise<SearchHit[]> => {
@@ -921,12 +1044,12 @@ export type HitStats = { deps?: number; tgzBytes?: number; version?: string };
 // are immutable per exact version, so repeat searches (and reopened listings)
 // skip the metadata round-trips. One file per pkg@version, like the version
 // tags — no read-modify-write races; --clear wipes it with the rest.
-const statsFile = (label: string): string => join(refsRoot(), '.stats', `${slug(label)}.json`);
+const statsFile = (label: string): string => join(refsRoot(), '.stats', `${cacheKey(label)}.json`);
 const readHitStats = (label: string): HitStats | undefined => {
   try {
-    const got = readJson<HitStats>(statsFile(label));
+    const got = readJson<HitStats & { label?: unknown; v?: unknown }>(statsFile(label));
     // Older or hand-mangled entries recompute instead of being trusted.
-    if (typeof got?.deps !== 'number') return undefined;
+    if (got.v !== 2 || got.label !== label || typeof got?.deps !== 'number') return undefined;
     return {
       deps: got.deps,
       ...(typeof got.tgzBytes === 'number' ? { tgzBytes: got.tgzBytes } : {}),
@@ -937,7 +1060,7 @@ const readHitStats = (label: string): HitStats | undefined => {
 };
 const writeHitStats = (label: string, stats: HitStats): HitStats => {
   const { deps, tgzBytes } = stats;
-  write(statsFile(label), `${JSON.stringify({ deps, tgzBytes })}\n`);
+  write(statsFile(label), `${JSON.stringify({ deps, label, tgzBytes, v: 2 })}\n`);
   return stats;
 };
 export const jsHitStats = async (
@@ -1031,18 +1154,27 @@ export const parseRegistryRef = (raw: string): RegistryRef => {
 // `name-version/` top dir, go module zips nest the whole import path. Gems and
 // wheels ship their files at the root and stay put.
 const rootOf = (dir: string): string => {
-  for (;;) {
-    const ents = readdirSync(dir);
-    if (ents.length !== 1 || !statSync(join(dir, ents[0])).isDirectory()) return dir;
-    dir = join(dir, ents[0]);
+  for (let depth = 0; depth < 64; depth++) {
+    const ents = readdirSync(dir, { withFileTypes: true });
+    // Dirent.isDirectory is deliberately false for symlinks. Never follow a
+    // cache entry out of its extracted tree, including caches from old builds.
+    if (ents.length !== 1 || !ents[0].isDirectory()) return dir;
+    dir = join(dir, ents[0].name);
+  }
+  return err(`refusing archive with excessive wrapper depth: ${bad(dir)}`);
+};
+const hasFiles = (dir: string): boolean => {
+  try {
+    return lstatSync(dir).isDirectory() && readdirSync(dir).length > 0;
+  } catch {
+    return false;
   }
 };
-const hasFiles = (dir: string): boolean => existsSync(dir) && readdirSync(dir).length > 0;
-const SHA = /^[0-9a-f]{7,40}$/;
 // Fetch + extract a registry ref, reusing the pinned machine cache (`bismar-refs`,
 // same as npm refs): exact versions are immutable on their registries, so a warm
 // run touches neither the network nor an extractor. Versionless refs re-resolve
-// "latest" at most every 15 minutes via the shared tag cache.
+// "latest" at most every 15 minutes via the shared tag cache (gh: every 30, per
+// its tagTtlScale).
 export const registryContext = async (
   outDir: string,
   ref: RegistryRef
@@ -1050,22 +1182,24 @@ export const registryContext = async (
   const reg = REGISTRIES[ref.prefix];
   let version = ref.version;
   if (reg.pin) {
+    const commitId = reg.commitId;
+    if (!commitId) throw new Error(`missing commit id policy for ${ref.prefix}`);
     // Branches and tags move: pin them to an immutable commit id, keyed per ref,
-    // so the extract cache never serves a tree staler than the 15-minute tag.
+    // so the extract cache never serves a tree staler than the ref→commit tag.
     const key = `${ref.prefix}${ref.name}${version ? `@${version}` : ''}`;
-    if (!SHA.test(version)) {
-      const tagged = readVersionTag(key);
-      if (tagged && SHA.test(tagged)) version = tagged;
+    if (!commitId.test(version)) {
+      const tagged = readVersionTag(key, reg.tagTtlScale);
+      if (tagged && commitId.test(tagged)) version = tagged;
       else {
         progressShow(`resolving ${key}`);
         version = await reg.pin(ref.name, ref.version);
-        if (!SHA.test(version)) err(`cannot resolve ${bad(key)}; check ${reg.site}`);
+        if (!commitId.test(version)) err(`cannot resolve ${bad(key)}; check ${reg.site}`);
         writeVersionTag(key, version);
       }
     }
   } else {
     if (!version) {
-      const tagged = readVersionTag(`${ref.prefix}${ref.name}`);
+      const tagged = readVersionTag(`${ref.prefix}${ref.name}`, reg.tagTtlScale);
       if (tagged && reg.version.test(tagged)) version = tagged;
     }
     if (!version) {
@@ -1080,14 +1214,16 @@ export const registryContext = async (
   }
   const label = `${ref.prefix}${ref.name}@${version}`;
   const pinnedDir = refsCacheDir(label);
-  if (hasFiles(pinnedDir))
+  if (hasFiles(pinnedDir) && hasCacheIdentity(label))
     return { archiveBytes: readArchiveBytes(label), label, pkgDir: rootOf(pinnedDir) };
+  if (existsSync(pinnedDir)) rmTempDir(pinnedDir);
   progressShow(`downloading ${label}`);
-  const dir = join(outDir, '.refs', slug(label));
+  const dir = join(outDir, '.refs', cacheKey(label));
   const got = await reg.fetch(ref.name, version, label, dir);
   if (!hasFiles(dir)) err(`empty archive for ${bad(label)}; check ${reg.site}`);
-  writeArchiveBytes(label, got.bytes.length);
   saveArchive(label, got);
+  // Publish the verified identity/digest before the atomic tree promotion: a
+  // reader can never observe a promoted directory with no matching marker.
   // Promote the fresh extract into the machine cache; on a lost race (or any
   // rename failure) the per-run copy serves this session just as well.
   if (promoteTemp(dir, pinnedDir))
@@ -1098,13 +1234,32 @@ export const registryContext = async (
 // (`bismar-refs/crate/serde-1-0-219.crate`), the same way npm keeps tarballs
 // in its own cache: `-b` serves it offline, byte-identical to what the
 // registry shipped.
-const saveArchive = (label: string, got: Fetched): string =>
-  write(`${refsCacheDir(label)}${got.ext}`, got.bytes);
+const digestOf = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
+const saveArchive = (label: string, got: Fetched): string => {
+  const file = write(`${refsCacheDir(label)}${got.ext}`, got.bytes);
+  writeArchiveBytes(label, got.bytes.length, digestOf(got.bytes));
+  return file;
+};
+const ARCHIVE_EXTS = ['.crate', '.gem', '.tar.gz', '.zip', '.whl'] as const;
 const findArchive = (label: string): string | undefined => {
   const dir = refsCacheDir(label);
+  const expected = readArchiveSha256(label);
+  if (!expected) return undefined;
   try {
-    for (const ent of readdirSync(dirname(dir)))
-      if (ent.startsWith(`${basename(dir)}.`)) return join(dirname(dir), ent);
+    for (const ext of ARCHIVE_EXTS) {
+      const file = join(dirname(dir), `${basename(dir)}${ext}`);
+      const st = lstatSync(file, { throwIfNoEntry: false });
+      // Persistent cache reads never follow links and never trust a stale file
+      // larger than the same hard ceiling enforced while downloading it.
+      if (!st) continue;
+      if (!st.isFile() || st.size > MAX_ARCHIVE_BYTES) {
+        rm(file);
+        return undefined;
+      }
+      if (digestOf(readFileSync(file)) === expected) return file;
+      rm(file);
+      return undefined;
+    }
   } catch {
     // No cache subdir for this registry yet.
   }
@@ -1122,8 +1277,7 @@ export const registryArchive = async (
   if (cached) return { file: cached, label: got.label };
   const version = got.label.slice(got.label.lastIndexOf('@') + 1);
   progressShow(`downloading ${got.label}`);
-  const dir = join(outDir, '.refs', `${slug(got.label)}-rearchive`);
+  const dir = join(outDir, '.refs', `${cacheKey(got.label)}-rearchive`);
   const fetched = await REGISTRIES[ref.prefix].fetch(ref.name, version, got.label, dir);
-  writeArchiveBytes(got.label, fetched.bytes.length);
   return { file: saveArchive(got.label, fetched), label: got.label };
 };

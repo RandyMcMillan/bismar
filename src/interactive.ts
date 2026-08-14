@@ -10,8 +10,10 @@ packages into the modules view, where modules are directories, exports are files
 row measures itself in the background (same in-memory engine as --size);
 `enter` there bundles and pages through the source. Listings take the mouse too
 — click to select, click again to open, wheel to scroll; the pager keeps it
-native so text selection works. Draws with plain ANSI on the alternate screen;
-nothing is ever written to the filesystem.
+native so text selection works. One key grammar across every view: `q` and
+`esc` back out one level (exiting at the session root), ←/h climb without ever
+exiting, PgUp/PgDn/d/u page, and Ctrl-C closes from anywhere. Draws with plain
+ANSI on the alternate screen; nothing is ever written to the filesystem.
 @module
  */
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
@@ -20,16 +22,25 @@ import { highlightText } from './vendor/speed-highlight/terminal.js';
 import {
   type DiffEntry,
   type DiffSide,
-  fileDiffLines,
+  highlightedFileDiffLines,
   scoped,
   statSummary,
   statTail,
   type TreeDiff,
   walkFiles,
 } from './diff.ts';
-import { color, paint, progressOff, stripAnsi, wantColor } from './env.ts';
+import {
+  color,
+  paint,
+  progressOff,
+  stripAnsi,
+  terminalAnsi,
+  terminalText,
+  wantColor,
+} from './env.ts';
 import { rmTempDir, tempDir } from './fs-modify.ts';
 import { bad, err, explicitPath, firstModule, fmtBytes, kb, ONLY_EXT, paintId } from './public.ts';
+import { languageFromFilename } from './vendor/speed-highlight/detect.js';
 import {
   canProfile,
   canSearch,
@@ -100,11 +111,25 @@ type FEntry = { dir: boolean; name: string; path: string; size: number };
 type Pager = {
   lines: string[];
   offset: number;
+  // A deep-linked preview (`bismar gem:sinatra/README.md`) is its session's
+  // root view: esc exits from it like q, while ← still climbs into the
+  // listing underneath.
+  root?: boolean;
+  // Header tail replacing the default rendered-line count — a diff pager
+  // carries the file's own length and how much of it changed.
+  stat?: string;
   title: string;
   // Draw-time wrap memo: logical lines re-wrap only when the width changes;
   // starts[i] is the wrapped-row index where logical line i begins.
   wrap?: { cols: number; rows: string[]; starts: number[] };
 };
+// One navigation grammar for every view — launcher, listings, pagers, diff:
+// `q` and `esc` are one back-out key — one level up, exiting at the session
+// root (a deep-linked preview IS its session's root); ←/h/backspace climb one
+// level but never exit; arrows and paging keys only move; Ctrl-C/Ctrl-D close
+// the app from anywhere. Text prompts (the search box, `/`, `:`) eat
+// characters raw — q types there, and only esc (or ← where noted) drops the
+// prompt.
 const KEYMAP: Record<string, string> = {
   '\b': 'back',
   '/': 'search', // vim-like, pager only: find forward…
@@ -145,8 +170,8 @@ const KEYMAP: Record<string, string> = {
   m: 'mode', // toggle between the files view and the modules/size view
   n: 'next', // repeat the last pager search…
   N: 'prev', // …and backwards
-  q: 'quit',
-  r: 'repo', // files view: jump to the package's github repo and back
+  q: 'esc', // q ≡ esc: one back-out key, exiting at the session root
+  r: 'repo', // files view: hop to the package's github repo and back
   s: 'size',
   u: 'halfup', // …and half window back
   w: 'pgup', // less: one window back, like b
@@ -156,6 +181,21 @@ const KEYMAP: Record<string, string> = {
 // through to bare Esc and quit. Units stay raw (KEYMAP applies at the consumer):
 // search input needs the characters themselves, not their bindings.
 const KEY_SEQ = /^\x1b(\[<[\d;]*[Mm]|\[[\d;]*[~A-Za-z]|O[A-Za-z])/;
+// Binding lookup for one consumed unit. Modifier-tagged CSI variants
+// (`\x1b[6;5~` Ctrl-PgDn, `\x1b[1;2A` Shift-↑) fold onto their plain keys, so
+// paging and movement work however the terminal spells them.
+const keyOf = (unit: string | undefined): string | undefined => {
+  if (unit === undefined) return undefined;
+  const got = KEYMAP[unit];
+  if (got) return got;
+  const mod = /^\x1b\[(\d+);\d+([~A-Z])$/.exec(unit);
+  if (!mod) return undefined;
+  return mod[2] === '~'
+    ? KEYMAP[`\x1b[${mod[1]}~`]
+    : mod[1] === '1'
+      ? KEYMAP[`\x1b[${mod[2]}`]
+      : undefined;
+};
 const tokenize = (raw: string): string[] => {
   const out: string[] = [];
   for (let i = 0; i < raw.length; i++) {
@@ -171,10 +211,10 @@ const tokenize = (raw: string): string[] => {
   }
   return out;
 };
-// Terminal-safe preview text: a tab renders wider than the one column the width
-// math counts, and a stray \r rewinds the cursor into the previous text
-// (vscode-jsonrpc ships tab-indented, CRLF-ish files inside typescript).
-const displayText = (text: string): string => text.replace(/\t/g, '  ').replace(/\r/g, '');
+// Terminal-safe preview text: retain only SGRs emitted by bismar/highlightText;
+// package bytes supply no terminal commands. Tabs expand to the same two cells
+// the width math sees, and ordinary CRLF collapses to its caller-owned LF.
+const displayText = (text: string): string => terminalAnsi(text, { multiline: true, tabs: 2 });
 const ALT_ON = '\x1b[?1049h\x1b[?25l';
 const ALT_OFF = '\x1b[?25h\x1b[?1049l';
 // Click + wheel reporting in SGR encoding (1006: coordinates past column 223
@@ -196,7 +236,11 @@ const mouseOf = (unit: string): { key?: 'down' | 'up'; row?: number } | undefine
 };
 const statsTail = (stats: Stats): string => sizeTail(stats.loc, stats.min, stats.gz);
 // Width-aware truncation: escape codes take no columns and must never be split.
-const truncAnsi = (line: string, max: number): string => {
+const truncAnsi = (unsafe: string, max: number): string => {
+  // Every TUI frame reaches this final row boundary. Individual fields are
+  // sanitized before painting too; this catches forgotten plain fields such as
+  // a filename, diff path, prompt error, or metadata crumb.
+  const line = terminalAnsi(unsafe);
   if (stripAnsi(line).length <= max) return line;
   let width = 0;
   let out = '';
@@ -215,7 +259,8 @@ const truncAnsi = (line: string, max: number): string => {
 };
 // Width-aware wrapping for pager rows: escape codes take no columns and must never
 // be split; whatever codes are active at a break reopen on the continuation row.
-const wrapAnsi = (line: string, max: number): string[] => {
+const wrapAnsi = (unsafe: string, max: number): string[] => {
+  const line = terminalAnsi(unsafe);
   if (stripAnsi(line).length <= max) return [line];
   const out: string[] = [];
   let chunk = '';
@@ -302,7 +347,7 @@ export const chooseTarget = async (
   const output = io.output ?? process.stdout;
   const colorOn = wantColor();
   const options = [
-    `browse current directory (${dirLabel})`,
+    `browse current directory (${terminalText(dirLabel)})`,
     ...SEARCHES.map((reg) => `search ${reg.label}${canSearch(reg.prefix) ? '' : ' (exact name)'}`),
   ];
   let cursor = state.cursor ?? 0;
@@ -323,6 +368,10 @@ export const chooseTarget = async (
     const max = (io.cols ?? (process.stdout.columns || 80)) - 1;
     output.write(`\x1b[H${lines.map((line) => truncAnsi(line, max)).join('\x1b[K\r\n')}\x1b[J`);
   };
+  const listRows = (): number => Math.max(3, (io.rows ?? (process.stdout.rows || 24)) - 4);
+  // Hits listing scroll offset, recomputed around the cursor like every other
+  // listing; a fresh search resets it with its new results.
+  let resOffset = 0;
   const draw = (): void => {
     if (results) {
       // Profile listings crumb as the profile itself (`github:@veorq`);
@@ -338,7 +387,10 @@ export const chooseTarget = async (
           ),
         '',
       ];
-      for (const [i, found] of results.hits.entries()) {
+      const visible = listRows();
+      if (results.cursor < resOffset) resOffset = results.cursor;
+      if (results.cursor >= resOffset + visible) resOffset = results.cursor - visible + 1;
+      for (const [i, found] of results.hits.slice(resOffset, resOffset + visible).entries()) {
         // JS hits carry their garnish after the version: deps, then packed size.
         // Painted per segment so a zero-dep package can flag green (a clean,
         // dependency-free install) while the rest of the tail stays dim.
@@ -352,7 +404,7 @@ export const chooseTarget = async (
         ].filter(Boolean);
         const tail = parts.length ? `  ${parts.join(paint(' · ', color.dim, colorOn))}` : '';
         lines.push(
-          `${i === results.cursor ? paint('▸ ', color.bold, colorOn) : '  '}${paint(found.name, color.yellow, colorOn)}${tail}`
+          `${resOffset + i === results.cursor ? paint('▸ ', color.bold, colorOn) : '  '}${paint(found.name, color.yellow, colorOn)}${tail}`
         );
       }
       lines.push(
@@ -374,7 +426,7 @@ export const chooseTarget = async (
         paint(`search ${search.which.label}`, color.bold, colorOn) +
           paint(searchable ? '' : ' · exact package name, no search api', color.dim, colorOn),
         '',
-        `name: ${search.text}`,
+        `name: ${terminalText(search.text)}`,
         search.note ? paint(search.note, color.red, colorOn) : '',
         paint(
           `${searchable ? 'enter search' : 'enter open'} · esc back · e.g. ${search.which.example}${
@@ -419,6 +471,10 @@ export const chooseTarget = async (
   // The menu owns the terminal from here; mute the startup progress line.
   progressOff();
   output.write(ALT_ON + MOUSE_ON);
+  // Shrinking the terminal would scroll a taller stale frame off the top;
+  // redraw on resize so the frame always fits the current window.
+  const onResize = (): void => draw();
+  process.stdout.on('resize', onResize);
   // A restored listing may have rows whose garnish got aborted mid-flight when
   // the launcher last closed; the per-version cache makes the refill cheap.
   if (results) garnish(results);
@@ -431,28 +487,32 @@ export const chooseTarget = async (
         });
       const unit = pending.shift();
       const mouse = unit ? mouseOf(unit) : undefined;
-      let key = unit ? (mouse ? mouse.key : KEYMAP[unit]) : undefined;
+      let key = unit ? (mouse ? mouse.key : keyOf(unit)) : undefined;
       // Ctrl-C/Ctrl-D close the launcher from any stage.
       if (key === 'exit') return undefined;
       if (results) {
         const picks = results;
         if (mouse?.row !== undefined) {
-          const at = mouse.row - LIST_TOP;
-          if (at < 0 || at >= picks.hits.length) continue;
+          const at = resOffset + mouse.row - LIST_TOP;
+          if (mouse.row < LIST_TOP || at >= Math.min(picks.hits.length, resOffset + listRows()))
+            continue;
           if (at !== picks.cursor) {
             picks.cursor = at;
             continue;
           }
           key = 'enter';
         }
+        const jump = listRows();
         switch (key) {
-          case 'quit':
           case 'esc':
           case 'back':
             // A CLI-seeded profile listing is the session root: no menu or
-            // prompt lies behind it, so backing out of the root is exiting —
-            // exactly like esc at every other root view.
-            if (picks.root) return undefined;
+            // prompt lies behind it, so q/esc exit — like at every other root
+            // view — while ← is a navigation key and stays put.
+            if (picks.root) {
+              if (key === 'esc') return undefined;
+              break;
+            }
             // Back to the prompt with the query kept for refining; stop the
             // garnish requests still in flight for the dropped listing.
             picks.abort.abort();
@@ -463,6 +523,18 @@ export const chooseTarget = async (
             break;
           case 'down':
             picks.cursor = Math.min(picks.hits.length - 1, picks.cursor + 1);
+            break;
+          case 'pgup':
+            picks.cursor = Math.max(0, picks.cursor - jump);
+            break;
+          case 'pgdn':
+            picks.cursor = Math.min(picks.hits.length - 1, picks.cursor + jump);
+            break;
+          case 'halfup':
+            picks.cursor = Math.max(0, picks.cursor - Math.ceil(jump / 2));
+            break;
+          case 'halfdn':
+            picks.cursor = Math.min(picks.hits.length - 1, picks.cursor + Math.ceil(jump / 2));
             break;
           case 'top':
             picks.cursor = 0;
@@ -517,6 +589,7 @@ export const chooseTarget = async (
                 which: box.which,
               };
               results = picks;
+              resOffset = 0;
               garnish(picks);
             } else box.note = `no matches for ${bare}`;
           } catch (error) {
@@ -541,7 +614,8 @@ export const chooseTarget = async (
         key = 'enter';
       }
       switch (key) {
-        case 'quit':
+        // The menu is the launcher's root: q/esc exit; ← is unbound here —
+        // navigation keys never exit.
         case 'esc':
           return undefined;
         case 'up':
@@ -549,6 +623,14 @@ export const chooseTarget = async (
           break;
         case 'down':
           cursor = Math.min(options.length - 1, cursor + 1);
+          break;
+        case 'pgup':
+        case 'halfup':
+          cursor = 0;
+          break;
+        case 'pgdn':
+        case 'halfdn':
+          cursor = options.length - 1;
           break;
         case 'top':
           cursor = 0;
@@ -577,6 +659,7 @@ export const chooseTarget = async (
       title: results.title,
       which: results.which,
     };
+    process.stdout.off('resize', onResize);
     output.write(MOUSE_OFF + ALT_OFF);
     input.off('data', onData);
     input.setRawMode?.(false);
@@ -585,8 +668,10 @@ export const chooseTarget = async (
 };
 // Diff navigator (`-d` on a terminal): a flat listing of the changed files
 // between two resolved trees — A/M/D markers with size deltas — and enter pages
-// through the file's unified line diff. Same key and click contract as the
-// other listings; like every view here, nothing is written to the filesystem.
+// through the file's unified line diff. A scope naming one exact file deep-links
+// straight into that file's diff pager, like the navigator's file deep links.
+// Same key and click contract as the other listings; like every view here,
+// nothing is written to the filesystem.
 export const runDiff = async (
   a: DiffSide,
   b: DiffSide,
@@ -636,7 +721,7 @@ export const runDiff = async (
       const [mark, markColor] = MARK[entry.status];
       lines.push(
         `${active ? paint('▸ ', color.bold, colorOn) : '  '}${paint(mark, markColor, colorOn)} ` +
-          `${entry.path}${paint(`  ${statTail(entry)}`, color.dim, colorOn)}`
+          `${terminalText(entry.path)}${paint(`  ${statTail(entry)}`, color.dim, colorOn)}`
       );
     }
     // Summary as a footer, -ds's two lines in -ds's order: counts, then sizes.
@@ -666,21 +751,74 @@ export const runDiff = async (
     const pct = maxOffset ? Math.round((page.offset / maxOffset) * 100) : 100;
     render([
       paintId(page.title, colorOn, 'module') +
-        paint(` · ${page.lines.length} lines`, color.dim, colorOn),
+        paint(` · ${page.stat ?? `${page.lines.length} lines`}`, color.dim, colorOn),
       ...wrapped.slice(page.offset, page.offset + visible),
       // A diff color may span past the window's last line; close it.
       (colorOn ? color.reset : '') +
-        paint(`${pct}% · ↑↓/space scroll · q back`, color.dim, colorOn),
+        paint(
+          page.root
+            ? `${pct}% · ↑↓/space scroll · ← files · q quit`
+            : `${pct}% · ↑↓/space scroll · q back`,
+          color.dim,
+          colorOn
+        ),
     ]);
   };
-  const openEntry = (entry: DiffEntry): void => {
+  // Header stat for a file diff: the file's own length (the newer side; the
+  // old one for removals) and how many of its lines the diff touches. Counted
+  // off the rendered hunks — per hunk a replaced pair counts once (the larger
+  // of removed/added), so the number reads as file lines, not diff rows.
+  // Binary payloads keep the default rendered-line count.
+  const diffStat = (entry: DiffEntry, lines: string[]): string | undefined => {
+    let text: string;
+    try {
+      text = readFileSync(join(entry.status === 'removed' ? a.dir : b.dir, entry.path), 'utf8');
+    } catch {
+      return undefined;
+    }
+    // Same binary rule as the diff render (diff.ts looksBinary): a NUL in the
+    // first 8KB. Deeper NULs (micro-ftch keeps one in a string constant)
+    // still diff as text, so they still deserve the stat.
+    if (text.slice(0, 8192).includes('\0')) return undefined;
+    const total = text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+    let changed = 0;
+    let minus = 0;
+    let plus = 0;
+    let inHunk = false;
+    const flush = (): void => {
+      changed += Math.max(minus, plus);
+      minus = plus = 0;
+    };
+    for (const raw of lines) {
+      const line = stripAnsi(raw);
+      if (line.startsWith('@@')) {
+        flush();
+        inHunk = true;
+      } else if (inHunk && line.startsWith('+')) plus++;
+      else if (inHunk && line.startsWith('-')) minus++;
+    }
+    flush();
+    if (!changed || !total) return undefined;
+    const pct = Math.min(100, Math.round((changed / total) * 100));
+    return `${total} line${total === 1 ? '' : 's'} · ${changed} line${changed === 1 ? '' : 's'} changed (${pct}%)`;
+  };
+  const openEntry = async (entry: DiffEntry): Promise<void> => {
     let lines = views.get(entry.path);
     if (!lines) {
-      lines = fileDiffLines(a.dir, b.dir, entry, colorOn).map(displayText);
+      lines = (await highlightedFileDiffLines(a.dir, b.dir, entry, colorOn)).map(displayText);
       views.set(entry.path, lines);
     }
-    pager = { lines, offset: 0, title: entry.path };
+    pager = { lines, offset: 0, stat: diffStat(entry, lines), title: entry.path };
   };
+  // A scope naming one exact changed file deep-links like the navigator: the
+  // session opens with that file's diff pager already up, and that pager is
+  // the session root — q and esc exit, ← climbs into the one-row listing. A
+  // directory scope (even one holding a single changed file) keeps the listing.
+  const soleSel = a.sel ?? b.sel;
+  if (soleSel && tree.entries.length === 1 && tree.entries[0].path === soleSel) {
+    await openEntry(tree.entries[0]);
+    if (pager) pager.root = true;
+  }
   const pending: string[] = [];
   let wake: (() => void) | undefined;
   const onData = (chunk: unknown): void => {
@@ -695,6 +833,11 @@ export const runDiff = async (
   // The TUI owns the terminal from here; mute the startup progress line.
   progressOff();
   output.write(ALT_ON + MOUSE_ON);
+  const draw = (): void => (pager ? drawPager(pager) : drawList());
+  // Shrinking the terminal would scroll a taller stale frame off the top;
+  // redraw on resize so the frame always fits the current window.
+  const onResize = (): void => draw();
+  process.stdout.on('resize', onResize);
   let mouseHeld = true;
   try {
     loop: for (;;) {
@@ -704,23 +847,26 @@ export const runDiff = async (
         mouseHeld = !pager;
         output.write(mouseHeld ? MOUSE_ON : MOUSE_OFF);
       }
-      if (pager) drawPager(pager);
-      else drawList();
+      draw();
       while (!pending.length)
         await new Promise<void>((res) => {
           wake = res;
         });
       const unit = pending.shift();
       const mouse = unit && !pager ? mouseOf(unit) : undefined;
-      let key = unit ? (mouse ? mouse.key : KEYMAP[unit]) : undefined;
+      let key = unit ? (mouse ? mouse.key : keyOf(unit)) : undefined;
       if (key === 'exit') break;
       if (pager) {
         const page = pager;
         const jump = Math.max(3, term().rows - 3);
         switch (key) {
-          case 'quit':
-          case 'back':
           case 'esc':
+            // q/esc back out one level — from a deep-linked root diff that
+            // is leaving the session, like the navigator's root preview.
+            if (page.root) break loop;
+            pager = undefined;
+            break;
+          case 'back':
             pager = undefined;
             break;
           case 'down':
@@ -764,7 +910,6 @@ export const runDiff = async (
       }
       const jump = listRows();
       switch (key) {
-        case 'quit':
         case 'esc':
           break loop;
         case 'up':
@@ -793,12 +938,13 @@ export const runDiff = async (
           break;
         case 'enter': {
           const entry = tree.entries[cursor];
-          if (entry) openEntry(entry);
+          if (entry) await openEntry(entry);
           break;
         }
       }
     }
   } finally {
+    process.stdout.off('resize', onResize);
     output.write(MOUSE_OFF + ALT_OFF);
     input.off('data', onData);
     input.setRawMode?.(false);
@@ -814,7 +960,7 @@ export const runDiff = async (
 export const runPager = async (
   title: string,
   text: string,
-  opts: { footer?: string; io?: InteractiveIo } = {}
+  opts: { ansi?: boolean; footer?: string; io?: InteractiveIo } = {}
 ): Promise<void> => {
   const io = opts.io ?? {};
   const input = io.input ?? process.stdin;
@@ -828,7 +974,11 @@ export const runPager = async (
     const max = term().cols - 1;
     output.write(`\x1b[H${lines.map((line) => truncAnsi(line, max)).join('\x1b[K\r\n')}\x1b[J`);
   };
-  const page: Pager = { lines: displayText(text).split('\n'), offset: 0, title };
+  // Raw bundle text must not opt into ANSI merely because its bytes resemble
+  // one of bismar's SGRs. Highlighted callers mark their composed colors as
+  // trusted; everything else takes the plain-text boundary.
+  const safeText = opts.ansi ? displayText(text) : terminalText(text, { multiline: true, tabs: 2 });
+  const page: Pager = { lines: safeText.split('\n'), offset: 0, title };
   let ask: { kind: ':' | '/'; text: string } | undefined;
   let lastSearch = '';
   // The logical line currently at the top of the pager window.
@@ -886,7 +1036,7 @@ export const runPager = async (
     page.offset = Math.max(0, Math.min(page.offset, maxOffset));
     const pct = maxOffset ? Math.round((page.offset / maxOffset) * 100) : 100;
     const foot = ask
-      ? `${ask.kind}${ask.text}`
+      ? `${ask.kind}${terminalText(ask.text)}`
       : paint(
           `${pct}%${opts.footer ? ` · ${opts.footer}` : ''} · ↑↓/space scroll · / search · q quit`,
           color.dim,
@@ -914,6 +1064,10 @@ export const runPager = async (
   // The TUI owns the terminal from here; mute the startup progress line.
   progressOff();
   output.write(ALT_ON);
+  // Shrinking the terminal would scroll a taller stale frame off the top;
+  // redraw on resize so the frame always fits the current window.
+  const onResize = (): void => draw();
+  process.stdout.on('resize', onResize);
   try {
     for (;;) {
       draw();
@@ -922,7 +1076,7 @@ export const runPager = async (
           wake = res;
         });
       const unit = pending.shift();
-      const key = unit ? KEYMAP[unit] : undefined;
+      const key = keyOf(unit);
       // Ctrl-C/Ctrl-D close from anywhere, prompt open or not.
       if (key === 'exit') return;
       // An open `/`/`:` prompt eats raw characters, not their bindings.
@@ -935,8 +1089,8 @@ export const runPager = async (
       }
       const jump = Math.max(3, term().rows - 3);
       switch (key) {
-        case 'quit':
-        case 'back':
+        // A lone pager is its own session root: q/esc exit; ←/h are
+        // navigation keys with nowhere to climb, so they stay put.
         case 'esc':
           return;
         case 'down':
@@ -980,6 +1134,7 @@ export const runPager = async (
       }
     }
   } finally {
+    process.stdout.off('resize', onResize);
     output.write(ALT_OFF);
     input.off('data', onData);
     input.setRawMode?.(false);
@@ -1286,10 +1441,9 @@ export const runInteractive = async (
           if (FILE_SKIP.has(name)) continue;
           const path = join(filesRoot(), rel, name);
           try {
-            // lstat, like the footprint walk: registry archives extract through
-            // the system tar and can ship symlinks aimed anywhere (~/.ssh);
-            // following one would let the preview pager read outside the
-            // extract. Symlinked entries are skipped whole, dirs and files.
+            // lstat, like the footprint walk: hardened extraction rejects
+            // archive links, while local trees and old caches may still have
+            // them. Never let a preview follow one outside its root.
             const st = lstatSync(path);
             if (st.isSymbolicLink()) continue;
             out.push({ dir: st.isDirectory(), name, path, size: st.size });
@@ -1341,7 +1495,7 @@ export const runInteractive = async (
         const lines = [crumb, ''];
         for (const [i, ent] of fileList.slice(fileOffset, fileOffset + visible).entries()) {
           const active = fileOffset + i === fileCursor;
-          const text = ent.dir && ent.name !== '..' ? `${ent.name}/` : ent.name;
+          const text = terminalText(ent.dir && ent.name !== '..' ? `${ent.name}/` : ent.name);
           // Dirs keep their cyan; plain files stay unpainted so the two entry
           // points a package always has — its README and manifest — pop in red.
           const hot = !ent.dir && (ent.name === 'package.json' || /^readme(\.|$)/i.test(ent.name));
@@ -1359,15 +1513,18 @@ export const runInteractive = async (
                 : paint(`  ${kb(ent.size)}kb`, color.dim, colorOn);
           lines.push(`${active ? paint('▸ ', color.bold, colorOn) : '  '}${name}${tail}`);
         }
-        // Both hints name where the key lands: the repo side of the jump is
-        // github, the way back is the package's own ecosystem.
-        const hop = ghRepo ? ` · r repo (${repoMode ? home.eco : 'gh'})` : '';
+        // Both hints name where the key lands: github on the way out, the
+        // package's own ecosystem on the way back.
+        const hop = ghRepo ? (repoMode ? ` · r get back to ${home.eco}` : ' · r github') : '';
+        // q ≡ esc: inside a subtree (or on the repo side) it backs up first;
+        // only the home root's q actually leaves.
+        const qHint = fileRel || repoMode ? 'q back' : 'q quit';
         lines.push(
           '',
           paint(
             filesOnly
-              ? `↑↓ move · enter preview · ← up${hop} · q quit`
-              : `↑↓ move · enter preview · ← up · m mode (bundles)${hop} · q quit`,
+              ? `↑↓ move · enter preview · ← up${hop} · ${qHint}`
+              : `↑↓ move · enter preview · ← up · m mode (bundles)${hop} · ${qHint}`,
             color.dim,
             colorOn
           )
@@ -1399,7 +1556,7 @@ export const runInteractive = async (
           '',
           paint(
             current
-              ? '↑↓ move · enter source · ← back · m mode (files) · q quit'
+              ? '↑↓ move · enter source · ← back · m mode (files) · q back'
               : '↑↓ move · enter open · m mode (files) · q quit',
             color.dim,
             colorOn
@@ -1434,8 +1591,16 @@ export const runInteractive = async (
           // While a `/`/`:` prompt is open, the footer row is its input line.
           (colorOn ? color.reset : '') +
             (ask
-              ? `${ask.kind}${ask.text}`
-              : paint(`${pct}% · ↑↓/space scroll · /search · :goto · q back`, color.dim, colorOn)),
+              ? `${ask.kind}${terminalText(ask.text)}`
+              : paint(
+                  // A root preview exits on esc like q; ← still opens the
+                  // listing underneath — the footer says which is which.
+                  page.root
+                    ? `${pct}% · ↑↓/space scroll · /search · :goto · ← files · q quit`
+                    : `${pct}% · ↑↓/space scroll · /search · :goto · q back`,
+                  color.dim,
+                  colorOn
+                )),
         ];
         render(lines);
       };
@@ -1554,7 +1719,7 @@ export const runInteractive = async (
           try {
             const built = await bundleOf(entry.sel);
             if (!built) return;
-            let text = displayText(decoder.decode(built.plain));
+            let text = terminalText(decoder.decode(built.plain), { multiline: true, tabs: 2 });
             if (colorOn)
               // Highlight tokens carry their own resets, so line-splitting is safe.
               text = await highlightText(text, 'js').catch(() => text);
@@ -1569,40 +1734,6 @@ export const runInteractive = async (
       };
       // Preview a shipped file as text — highlighted for known languages, never
       // bundled or executed. Binary content gets a stub instead of escape soup.
-      type PreviewLang =
-        | ''
-        | 'bash'
-        | 'c'
-        | 'go'
-        | 'html'
-        | 'js'
-        | 'json'
-        | 'md'
-        | 'php'
-        | 'py'
-        | 'rb'
-        | 'rs'
-        | 'toml'
-        | 'ts'
-        | 'yaml';
-      const LANGS: [RegExp, PreviewLang][] = [
-        [/\.[mc]?jsx?$/i, 'js'],
-        [/\.[mc]?tsx?$/i, 'ts'],
-        [/\.sh$/i, 'bash'],
-        [/\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/i, 'c'],
-        [/\.json$/i, 'json'],
-        [/\.(md|markdown)$/i, 'md'],
-        [/\.html?$/i, 'html'],
-        [/\.py$/i, 'py'],
-        [/^Rakefile$/, 'rb'],
-        [/\.rb$/i, 'rb'],
-        [/\.rs$/i, 'rs'],
-        [/\.go$/i, 'go'],
-        [/\.php$/i, 'php'],
-        [/\.toml$/i, 'toml'],
-        [/\.ya?ml$/i, 'yaml'],
-      ];
-      const langOf = (name: string): PreviewLang => LANGS.find(([re]) => re.test(name))?.[1] ?? '';
       const openFile = async (ent: FEntry): Promise<void> => {
         let lines = fileViews.get(ent.path);
         if (!lines) {
@@ -1614,8 +1745,8 @@ export const runInteractive = async (
           }
           if (text.includes('\0')) text = `(binary file, ${kb(ent.size)}kb)`;
           else {
-            text = displayText(text);
-            const lang = colorOn ? langOf(ent.name) : '';
+            text = terminalText(text, { multiline: true, tabs: 2 });
+            const lang = colorOn ? languageFromFilename(ent.name) : undefined;
             if (lang) text = await highlightText(text, lang).catch(() => text);
           }
           lines = text.split('\n');
@@ -1665,6 +1796,9 @@ export const runInteractive = async (
           if (at >= 0) {
             fileCursor = at;
             await openFile(listing[at]);
+            // The selector asked for this file: its preview is the session
+            // root, so backing out of it (esc) means leaving, not browsing.
+            if (pager) pager.root = true;
           }
         } else fileRel = refFocus.replace(/\/+$/, '');
       }
@@ -1677,6 +1811,10 @@ export const runInteractive = async (
       // from here the TUI owns the terminal, so mute it for good.
       progressOff();
       output.write(ALT_ON + MOUSE_ON);
+      // Shrinking the terminal would scroll a taller stale frame off the top;
+      // redraw on resize so the frame always fits the current window.
+      const onResize = (): void => draw();
+      process.stdout.on('resize', onResize);
       // Stdin is raw and ours from here: mid-session fetches (the `r` repo
       // hop) must refuse oversized archives instead of prompting into the TUI.
       setBigArchivePolicy('refuse');
@@ -1701,7 +1839,7 @@ export const runInteractive = async (
           const unit = pending.shift();
           // Reports queued just before the pager took over decode to nothing.
           const mouse = unit && !pager ? mouseOf(unit) : undefined;
-          let key = unit ? (mouse ? mouse.key : KEYMAP[unit]) : undefined;
+          let key = unit ? (mouse ? mouse.key : keyOf(unit)) : undefined;
           // Ctrl-C/Ctrl-D close the whole app no matter which view is open.
           if (key === 'exit') break;
           if (pager) {
@@ -1717,9 +1855,13 @@ export const runInteractive = async (
             }
             const jump = Math.max(3, term().rows - 3);
             switch (key) {
-              case 'quit':
-              case 'back':
               case 'esc':
+                // q/esc back out one level — which from a deep-linked root
+                // preview is leaving the session.
+                if (page.root) break loop;
+                pager = undefined;
+                break;
+              case 'back':
                 pager = undefined;
                 break;
               case 'down':
@@ -1777,15 +1919,13 @@ export const runInteractive = async (
             const ent = fileList[fileCursor];
             const jump = listRows();
             switch (key) {
-              case 'quit':
-                break loop;
               case 'mode':
                 // Files-only sessions have no modules view to switch to.
                 if (!filesOnly) filesMode = false;
                 break;
-              // Esc mirrors a filesystem "up": climb a directory, leave the repo
-              // side for the package side, and exit from the home root. Back (h)
-              // only climbs — at a root it is a no-op.
+              // q/esc mirror a filesystem "up": climb a directory, leave the
+              // repo side for the package side, and exit from the home root.
+              // Back (h) only climbs — at a root it is a no-op.
               case 'esc':
                 if (fileRel) fileUp();
                 else if (repoMode) swapSides();
@@ -1868,9 +2008,7 @@ export const runInteractive = async (
           const entry = list[cursor];
           const page = listRows();
           switch (key) {
-            case 'quit':
-              break loop;
-            // Esc mirrors a filesystem "up": one level back, and out from the root.
+            // q/esc mirror a filesystem "up": one level back, out from the root.
             case 'esc':
               if (current) toRoot();
               else break loop;
@@ -1947,6 +2085,7 @@ export const runInteractive = async (
         queue.length = 0;
         await pump;
         setBigArchivePolicy('ask');
+        process.stdout.off('resize', onResize);
         output.write(MOUSE_OFF + ALT_OFF);
         input.off('data', onData);
         input.setRawMode?.(false);

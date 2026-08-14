@@ -26,8 +26,17 @@ process.env.npm_config_progress = 'false';
 process.env.npm_config_update_notifier = 'false';
 const { runCli: runBismar } = await import('../src/bismar.ts');
 const { npmInstall } = await import('../src/fs-modify.ts');
-const { foreignSelector } = await import('../src/refs.ts');
-const { measureRows, runSize } = await import('../src/size.ts');
+const {
+  foreignSelector,
+  refsCacheDir,
+  refsMetaFile,
+  refsTagFile,
+  writeCacheIdentity,
+  writeVersionTag,
+} = await import('../src/refs.ts');
+const { buildFirst, fillExports, loadEsbuild, measureRows, readModules, runSize } = await import(
+  '../src/size.ts'
+);
 
 const fixture = (name: string) => join(ROOT, name);
 const cleanup = (cwd: string) => {
@@ -388,6 +397,153 @@ const withScratchPkg = async (
 const scratchJson = (extra: Record<string, unknown>) =>
   `${JSON.stringify({ name: '@bismar-test/scratch', private: true, version: '1.0.0', ...extra })}\n`;
 
+it('installed ref manifests cannot select entries outside their package', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'bismar-size-confined-entry-'));
+  try {
+    const install = join(parent, 'install');
+    const pkgDir = join(install, 'node_modules', 'unsafe-ref');
+    const pkgFile = join(pkgDir, 'package.json');
+    const outside = join(parent, 'outside.js');
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, 'safe.js'), 'export const safe = 1;\n');
+    writeFileSync(outside, 'export const secret = 1;\n');
+    symlinkSync(outside, join(pkgDir, 'linked.js'));
+    writeFileSync(
+      pkgFile,
+      scratchJson({
+        exports: {
+          '.': './safe.js',
+          './linked': './linked.js',
+          './outside': '../../../outside.js',
+        },
+        name: 'unsafe-ref',
+        type: 'module',
+      })
+    );
+    const pkg = (await import('../src/public.ts')).readPkg(pkgFile);
+    const local = { cwd: pkgDir, outDir: parent, pkg, pkgDir, pkgFile };
+
+    // An explicitly selected local checkout retains its historical monorepo
+    // semantics, including package entries that point beyond the package dir.
+    deepStrictEqual(
+      readModules(local).map((mod) => mod.module),
+      ['index', 'linked', 'outside']
+    );
+    // The same manifest as a downloaded ref accepts only the ordinary entry.
+    deepStrictEqual(
+      readModules({ ...local, sandboxRoot: install }).map((mod) => mod.module),
+      ['index']
+    );
+  } finally {
+    rmSync(parent, { force: true, recursive: true });
+  }
+});
+
+it('installed ref manifest paths cannot inject generated bundle source', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'bismar-size-generated-source-'));
+  const suffix = scratch.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+  const name = `bismar-test-source${suffix}`;
+  const version = '9.9.9';
+  const label = `${name}@${version}`;
+  const refDir = refsCacheDir(label);
+  // Without JS-string encoding, the quote closes the generated module specifier
+  // and the remainder injects an executable statement into the bundle entry.
+  const entry = "entry';throw Error('BISMAR_INJECTED');let trailing='.js";
+  try {
+    const pkgDir = join(refDir, 'node_modules', name);
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, entry), 'export const safe = 1;\n');
+    writeFileSync(
+      join(pkgDir, 'package.json'),
+      `${JSON.stringify({ main: `./${entry}`, name, type: 'module', version })}\n`
+    );
+    writeCacheIdentity(label);
+    const built = await buildFirst({
+      cwd: fixture('plain'),
+      only: [`npm:${name}@${version}`],
+      outDir: scratch,
+    });
+    deepStrictEqual(!!built, true);
+    deepStrictEqual(Buffer.from(built!.min).includes('BISMAR_INJECTED'), false);
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+    rmSync(refsMetaFile(label), { force: true });
+    rmSync(scratch, { force: true, recursive: true });
+  }
+});
+
+it('installed ref export enumeration cannot follow imports outside its install', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'bismar-size-confined-list-'));
+  try {
+    const install = join(parent, 'install');
+    const pkgDir = join(install, 'node_modules', 'unsafe-ref');
+    const outside = join(parent, 'outside.js');
+    const entry = join(pkgDir, 'index.js');
+    const namedEntry = join(pkgDir, 'named.js');
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(outside, 'export const secret = 1;\n');
+    writeFileSync(entry, "export { secret } from '../../../outside.js';\n");
+    writeFileSync(namedEntry, 'const x = 1; export { x as "not-an-identifier" };\n');
+    const plainMod = {
+      dir: 'index',
+      exports: [],
+      file: entry,
+      key: '.',
+      module: 'index',
+      spec: './index.js',
+    };
+    const confinedMod = { ...plainMod, exports: [], sandboxRoot: install };
+    const namedMod = { ...plainMod, exports: [], file: namedEntry, spec: './named.js' };
+    const build = loadEsbuild().build;
+
+    await fillExports(build, [plainMod]);
+    await fillExports(build, [confinedMod]);
+    await fillExports(build, [namedMod]);
+    deepStrictEqual(plainMod.exports, ['secret']);
+    deepStrictEqual(confinedMod.exports, []);
+    deepStrictEqual(namedMod.exports, []);
+  } finally {
+    rmSync(parent, { force: true, recursive: true });
+  }
+});
+
+it('installed ref bundles reject symlinked imports outside their install', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'bismar-size-confined-build-'));
+  const suffix = scratch.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+  const name = `bismar-test-sandbox${suffix}`;
+  const version = '9.9.9';
+  const label = `${name}@${version}`;
+  const refDir = refsCacheDir(label);
+  try {
+    const pkgDir = join(refDir, 'node_modules', name);
+    const outside = join(scratch, 'outside.js');
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(outside, 'export const secret = 1;\n');
+    symlinkSync(outside, join(pkgDir, 'linked.js'));
+    writeFileSync(join(pkgDir, 'index.js'), "export { secret } from './linked.js';\n");
+    writeFileSync(
+      join(pkgDir, 'package.json'),
+      `${JSON.stringify({ main: './index.js', name, type: 'module', version })}\n`
+    );
+    writeCacheIdentity(label);
+
+    const cwd = fixture('plain');
+    const res = await capture(() =>
+      runBismar(['-bs', `npm:${name}@${version}/index/secret`], { color: false, cwd })
+    );
+    deepStrictEqual(res.ok, false, all(res));
+    deepStrictEqual(
+      /refusing import outside installed package: \.\/linked\.js/.test(plain(res)),
+      true,
+      plain(res)
+    );
+  } finally {
+    rmSync(refDir, { force: true, recursive: true });
+    rmSync(refsMetaFile(label), { force: true });
+    rmSync(scratch, { force: true, recursive: true });
+  }
+});
+
 it('size command handles legacy and modern package entry shapes', async () => {
   const cjs = "'use strict';\nexports.add = (a, b) => a + b;\n";
   const esm = 'export const add = (a, b) => a + b;\n';
@@ -622,9 +778,25 @@ it('size command --list prints import statements without bundling', async () => 
   deepStrictEqual(/from '@microsoft\/tsdoc'/.test(bout), false, bout);
 });
 
+it('size command lists external refs from a module-less package', async () => {
+  // A fresh `npm init -y` package points main at a file that never existed; an
+  // all-ref selection touches no local modules, so it must not demand any.
+  await withScratchPkg({ 'package.json': scratchJson({ main: 'index.js' }) }, async (cwd) => {
+    const res = await capture(() =>
+      runBismar(['--list', 'npm:@microsoft/tsdoc@0.16.0'], { color: false, cwd })
+    );
+    deepStrictEqual(res.ok, true, all(res));
+    deepStrictEqual(
+      /^\{TSDocParser\} from '@microsoft\/tsdoc'$/m.test(plain(res)),
+      true,
+      plain(res)
+    );
+  });
+});
+
 it('size command --list caches pinned ref enumeration in bismar.db.json', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(refsCacheDir('@microsoft/tsdoc@0.16.0'), 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['--list', 'npm:@microsoft/tsdoc@0.16.0'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
@@ -646,7 +818,7 @@ it('size command --list caches pinned ref enumeration in bismar.db.json', async 
 
 it('size command serves pinned ref sizes from the machine cache', async () => {
   const cwd = fixture('plain');
-  const db = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'microsoft-tsdoc-0-16-0', 'bismar.db.json');
+  const db = join(refsCacheDir('@microsoft/tsdoc@0.16.0'), 'bismar.db.json');
   rmSync(db, { force: true });
   const argv = ['-bs', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'];
   const first = await capture(() => runBismar(argv, { color: false, cwd }));
@@ -728,9 +900,10 @@ it('size command serves pinned ref sizes from the machine cache', async () => {
 
 it('unknown-module errors on multi-module refs list real selector ids', async () => {
   const cwd = fixture('plain');
-  // Seed a pinned machine-cache install by its documented layout: pinned refs
-  // hit the cache by existence alone, so the fake package works fully offline.
-  const refDir = join(tmpdir(), 'bismar-refs', 'v1', 'npm', 'bismar-fake-9-9-9');
+  // Seed a pinned machine-cache install and matching identity marker so the
+  // fake package works fully offline.
+  const label = 'bismar-fake@9.9.9';
+  const refDir = refsCacheDir(label);
   const pkgDir = join(refDir, 'node_modules', 'bismar-fake');
   rmSync(refDir, { force: true, recursive: true });
   mkdirSync(pkgDir, { recursive: true });
@@ -748,6 +921,7 @@ it('unknown-module errors on multi-module refs list real selector ids', async ()
   );
   writeFileSync(join(pkgDir, 'index.js'), 'export const one = 1;\n');
   writeFileSync(join(pkgDir, 'extra.js'), 'export const two = 2;\n');
+  writeCacheIdentity(label);
   mkdirSync(join(pkgDir, 'src'), { recursive: true });
   writeFileSync(join(pkgDir, 'src', 'util.ts'), 'export const three = 3;\n');
   writeFileSync(join(pkgDir, 'LICENSE'), 'MIT\n');
@@ -786,6 +960,7 @@ it('unknown-module errors on multi-module refs list real selector ids', async ()
     }
   } finally {
     rmSync(refDir, { force: true, recursive: true });
+    rmSync(refsMetaFile(label), { force: true });
   }
 });
 
@@ -817,15 +992,13 @@ it('size command pins floating refs through a fresh tag, re-resolves stale ones'
     runBismar(['-bs', 'npm:@microsoft/tsdoc@0.16.0/index/TSDocParser'], { color: false, cwd })
   );
   deepStrictEqual(prime.ok, true, all(prime));
-  const tagDir = join(tmpdir(), 'bismar-refs', 'v1', '.tags');
-  mkdirSync(tagDir, { recursive: true });
-  const tag = join(tagDir, 'microsoft-tsdoc.json');
+  const tag = refsTagFile('@microsoft/tsdoc');
   const argv = ['-bs', 'npm:@microsoft/tsdoc/index/TSDocParser'];
   await withEnv('npm_config_registry', 'http://127.0.0.1:9', () =>
     withEnv('npm_config_fetch_retries', '0', () =>
       withEnv('npm_config_fetch_retry_maxtimeout', '100', async () => {
         // Fresh tag: the floating spec reuses the pinned install, fully offline.
-        writeFileSync(tag, `${JSON.stringify({ at: Date.now(), version: '0.16.0' })}\n`);
+        writeVersionTag('@microsoft/tsdoc', '0.16.0');
         const fresh = await capture(() => runBismar(argv, { color: false, cwd }));
         deepStrictEqual(fresh.ok, true, all(fresh));
         deepStrictEqual(
@@ -836,7 +1009,12 @@ it('size command pins floating refs through a fresh tag, re-resolves stale ones'
         // Stale tag: latest must re-resolve, which the dead registry refuses.
         writeFileSync(
           tag,
-          `${JSON.stringify({ at: Date.now() - 16 * 60_000, version: '0.16.0' })}\n`
+          `${JSON.stringify({
+            at: Date.now() - 16 * 60_000,
+            label: '@microsoft/tsdoc',
+            v: 2,
+            version: '0.16.0',
+          })}\n`
         );
         const stale = await capture(() => runBismar(argv, { color: false, cwd }));
         deepStrictEqual(stale.ok, false, all(stale));

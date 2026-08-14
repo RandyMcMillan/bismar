@@ -22,7 +22,9 @@ import {
   paint,
   progressDone,
   progressUpdate,
+  stripAnsi,
   stdoutColor,
+  terminalText,
 } from './env.ts';
 import { rmTempDir, tempDir } from './fs-modify.ts';
 import {
@@ -45,6 +47,7 @@ import {
   type Pkg,
   publicSpec,
   readPkg,
+  resolveInside,
   slug,
   sorted,
 } from './public.ts';
@@ -67,6 +70,56 @@ import {
 } from './refs.ts';
 import { jsHitStats } from './registries.ts';
 
+type ResolveKind =
+  | 'entry-point'
+  | 'import-statement'
+  | 'require-call'
+  | 'dynamic-import'
+  | 'require-resolve'
+  | 'import-rule'
+  | 'composes-from'
+  | 'url-token';
+type ResolveResult = {
+  errors: { text?: string }[];
+  external: boolean;
+  namespace: string;
+  path: string;
+  pluginData?: unknown;
+  sideEffects: boolean;
+  suffix: string;
+  warnings: { text?: string }[];
+};
+type BuildHooks = {
+  onLoad: (
+    opts: { filter: RegExp },
+    cb: (args: { path: string }) => { contents: string; loader: 'js' } | undefined
+  ) => void;
+  onResolve: (
+    opts: { filter: RegExp },
+    cb: (args: {
+      importer: string;
+      kind: ResolveKind;
+      namespace: string;
+      path: string;
+      pluginData?: unknown;
+      resolveDir: string;
+      with: Record<string, string>;
+    }) => Promise<ResolveResult | undefined> | ResolveResult | undefined
+  ) => void;
+  resolve: (
+    path: string,
+    opts: {
+      importer: string;
+      kind: ResolveKind;
+      namespace: string;
+      pluginData?: unknown;
+      resolveDir: string;
+      with: Record<string, string>;
+    }
+  ) => Promise<ResolveResult>;
+};
+type BuildPlugin = { name: string; setup: (hooks: BuildHooks) => void };
+
 export type BuildLike = (opts: {
   absWorkingDir?: string;
   bundle: true;
@@ -80,15 +133,7 @@ export type BuildLike = (opts: {
   outdir?: string;
   packages?: 'external';
   platform?: 'node';
-  plugins?: {
-    name: string;
-    setup: (hooks: {
-      onLoad: (
-        opts: { filter: RegExp },
-        cb: (args: { path: string }) => { contents: string; loader: 'js' } | undefined
-      ) => void;
-    }) => void;
-  }[];
+  plugins?: BuildPlugin[];
   stdin?: { contents: string; resolveDir: string; sourcefile: string };
   write: false;
 }) => Promise<{
@@ -96,13 +141,23 @@ export type BuildLike = (opts: {
   outputFiles?: { contents: Uint8Array }[];
   warnings?: { location?: { file: string } | null; text: string }[];
 }>;
-export type Ctx = { cwd: string; outDir: string; pkg: Pkg; pkgDir: string; pkgFile: string };
+export type Ctx = {
+  cwd: string;
+  outDir: string;
+  pkg: Pkg;
+  pkgDir: string;
+  pkgFile: string;
+  // Installed registry refs are untrusted. Their entries must stay inside the
+  // package and every import they trigger must stay inside this install root.
+  sandboxRoot?: string;
+};
 export type Mod = {
   dir: string;
   exports: string[];
   file: string;
   key: string;
   module: string;
+  sandboxRoot?: string;
   spec: string;
 };
 type Item = {
@@ -117,6 +172,7 @@ type Item = {
   module: string;
   out: string;
   resolveDir?: string;
+  sandboxRoots?: string[];
   // Set when a bare name fell back to a root-module export: on failure the error lists
   // the package's modules, since the name may have meant either a module or an export.
   rootModules?: string[];
@@ -198,11 +254,57 @@ export const isFile = (file: string): boolean => existsSync(file) && statSync(fi
 // A bare selector can only mean a file when it carries a JS extension — on the
 // path head (`src/util.js`) or the whole selector (`src/util.js/twice`).
 const BARE_FILE = new RegExp(`${SRC_EXT}(/|$)`);
+// Resolve every import made by a file inside an installed ref ourselves, then
+// prove the result remains inside that same install. Looking at the importer
+// (instead of applying one build-wide allowlist) keeps mixed local+ref and
+// multi-ref selection bundles safe: local files retain normal monorepo access,
+// while ref A cannot reach the local checkout or ref B. Realpath checks reject
+// symlink escapes as well as lexical `../` paths.
+const refSandbox = (sandboxRoots: string[]): BuildPlugin => {
+  const roots = sorted(new Set(sandboxRoots.map((root) => realpathSync(root)))).sort(
+    (a, b) => b.length - a.length
+  );
+  return {
+    name: 'bismar-ref-sandbox',
+    setup: (hooks) => {
+      const marker = {};
+      hooks.onResolve({ filter: /.*/ }, async (args) => {
+        // `hooks.resolve` re-enters onResolve hooks; this per-call marker skips
+        // our one recursive pass without weakening later imports from the file.
+        if (args.pluginData === marker || !args.importer) return undefined;
+        const root = roots.find((candidate) => resolveInside(candidate, args.importer));
+        if (!root) return undefined;
+        const resolved = await hooks.resolve(args.path, {
+          importer: args.importer,
+          kind: args.kind,
+          namespace: args.namespace,
+          pluginData: marker,
+          resolveDir: args.resolveDir,
+          with: args.with ?? {},
+        });
+        const clean = {
+          ...resolved,
+          pluginData: resolved.pluginData === marker ? undefined : resolved.pluginData,
+        };
+        if (resolved.errors.length || resolved.external || !resolved.path) return clean;
+        // Non-file namespaces (for example esbuild's data URLs) cannot read a
+        // host path. File resolutions are the boundary that must remain rooted.
+        if (resolved.namespace === 'file' && !resolveInside(root, resolved.path))
+          throw new Error(`refusing import outside installed package: ${args.path}`);
+        return clean;
+      });
+    },
+  };
+};
 // Export names come from esbuild's metafile: bundle the module entry with all bare
 // imports left external and read the flattened export list. Star re-exports of local
 // files resolve during bundling; external and CJS entries yield no names, matching the
 // old TypeScript-parser behavior (CJS entries defeat static export enumeration).
-const bundleExports = async (build: BuildLike, file: string): Promise<string[]> => {
+const bundleExports = async (
+  build: BuildLike,
+  file: string,
+  sandboxRoot?: string
+): Promise<string[]> => {
   try {
     const res = await build({
       bundle: true,
@@ -213,12 +315,13 @@ const bundleExports = async (build: BuildLike, file: string): Promise<string[]> 
       outdir: '.',
       packages: 'external',
       platform: 'node',
+      plugins: sandboxRoot ? [refSandbox([sandboxRoot])] : undefined,
       write: false,
     });
     const out = Object.values(res.metafile?.outputs ?? {}).find((entry) => entry.entryPoint);
     // `_underscore`-prefixed exports are internal by convention (covers `__esModule` too).
     return (out?.exports ?? [])
-      .filter((name) => name && name !== 'default' && !name.startsWith('_'))
+      .filter((name) => ident(name) && name !== 'default' && !name.startsWith('_'))
       .sort();
   } catch {
     // Unparseable or unresolvable entries surface later, when (and if) they're measured.
@@ -229,7 +332,7 @@ export const fillExports = async (build: BuildLike, mods: Mod[]): Promise<void> 
   let done = 0;
   const lists = await Promise.all(
     mods.map(async (mod) => {
-      const list = await bundleExports(build, mod.file);
+      const list = await bundleExports(build, mod.file, mod.sandboxRoot);
       progressUpdate(`reading exports ${++done}/${mods.length}`);
       return list;
     })
@@ -240,6 +343,14 @@ export const fillExports = async (build: BuildLike, mods: Mod[]): Promise<void> 
 };
 export const readModules = (ctx: Ctx): Mod[] => {
   const res: Mod[] = [];
+  const confinedPkgDir = ctx.sandboxRoot ? resolveInside(ctx.sandboxRoot, ctx.pkgDir) : undefined;
+  if (ctx.sandboxRoot && !confinedPkgDir) return res;
+  const packageRoot = confinedPkgDir ?? ctx.pkgDir;
+  // Local projects are explicitly user-selected and retain their existing
+  // monorepo/path semantics. Downloaded refs carry a sandbox root; for those,
+  // package.json leaves must be real files inside the package directory itself.
+  const manifestFile = (file: string): string | undefined =>
+    ctx.sandboxRoot ? resolveInside(packageRoot, file) : resolve(packageRoot, file);
   // Alias keys (`./bind` + `./bind.js`, dotenv/classnames) and per-condition variants
   // (react-dom's `./server` family) share a label; the first exports-map entry wins.
   const seen = new Set<string>();
@@ -252,15 +363,15 @@ export const readModules = (ctx: Ctx): Mod[] => {
     // Legacy mains may be extensionless (`"main": "./index"`, ms); resolve node-style.
     if (!file && typeof value === 'string' && !extname(value))
       for (const tail of ['.js', '.mjs', '.cjs', '/index.js', '/index.mjs', '/index.cjs'])
-        if (isFile(resolve(ctx.pkgDir, value + tail))) {
+        if (isFile(manifestFile(value + tail) ?? '')) {
           file = value + tail;
           break;
         }
     if (!file) continue;
-    const abs = resolve(ctx.pkgDir, file);
+    const abs = manifestFile(file);
     // Published exports maps can point at files absent from the tarball (ramda's
     // ./dist); measure the modules that exist instead of dying on the broken one.
-    if (!isFile(abs)) continue;
+    if (!abs || !isFile(abs)) continue;
     const module = moduleName(key, key);
     if (seen.has(module)) continue;
     seen.add(module);
@@ -270,11 +381,17 @@ export const readModules = (ctx: Ctx): Mod[] => {
       file: abs,
       key,
       module,
+      sandboxRoot: ctx.sandboxRoot,
       spec: exportSpec(ctx.pkg, key, file),
     });
   }
   return res;
 };
+// Generated entry modules are a code boundary: manifest paths and filesystem
+// names can contain quotes, newlines, and comment delimiters. JSON string syntax
+// is valid JavaScript string syntax and prevents any of them becoming source.
+const sourceString = (text: string): string => JSON.stringify(text);
+const reexportAll = (spec: string): string => `export * from ${sourceString(spec)};`;
 const fullSource = (mods: Mod[], spec: (mod: Mod) => string): string => {
   // Exports-map keys like `./actions` and `./celo/actions` share a basename; uniquify
   // the namespace aliases so the package-wide bundle stays valid ESM.
@@ -283,16 +400,26 @@ const fullSource = (mods: Mod[], spec: (mod: Mod) => string): string => {
     const base = camel(mod.dir) || 'mod';
     const count = seen.get(base) || 0;
     seen.set(base, count + 1);
-    return `export * as ${count ? `${base}_${count}` : base} from '${spec(mod)}';`;
+    return `export * as ${count ? `${base}_${count}` : base} from ${sourceString(spec(mod))};`;
   });
   return lines.join('\n') || 'export {};';
 };
 const exportSource = (spec: string, name: string) =>
-  name === 'default' ? `export { default } from '${spec}';` : `export { ${name} } from '${spec}';`;
+  name === 'default'
+    ? `export { default } from ${sourceString(spec)};`
+    : `export { ${name} } from ${sourceString(spec)};`;
 // Absolute-path spec (forward slashes): resolvable from any resolveDir, used when a
 // selection bundle mixes local exports with external npm refs.
 const fwdSlash = (path: string): string => path.split('\\').join('/');
 const absSpec = (mod: Mod): string => fwdSlash(mod.file);
+// An installed ref builds the exact manifest leaf that readModules already
+// confined. Re-resolving its public package spec could select a different
+// conditional leaf than the one we validated.
+const buildSpec = (mod: Mod): string => (mod.sandboxRoot ? absSpec(mod) : mod.spec);
+const sandboxRootsOf = (mods: Pick<Mod, 'sandboxRoot'>[]): string[] | undefined => {
+  const roots = sorted(new Set(mods.flatMap((mod) => (mod.sandboxRoot ? [mod.sandboxRoot] : []))));
+  return roots.length ? roots : undefined;
+};
 export const inputCtx = (
   cwd: string | undefined,
   outArg: string | undefined,
@@ -354,6 +481,10 @@ const selection = (picked: Item[], resolveDir?: string): Item => ({
   module: 'selection',
   out: ALL,
   resolveDir,
+  sandboxRoots: (() => {
+    const roots = sorted(new Set(picked.flatMap((item) => item.sandboxRoots ?? [])));
+    return roots.length ? roots : undefined;
+  })(),
   source: picked
     .map((item, index) =>
       selReexport(resolveDir ? (item.absSource ?? item.source) : item.source, index)
@@ -367,7 +498,8 @@ const exportItem = (pkg: Pkg, mod: Mod, name: string): Item => ({
   global: camel(`${pkg.name}-${mod.module}-${name}`),
   module: mod.module,
   out: name,
-  source: exportSource(mod.spec, name),
+  sandboxRoots: mod.sandboxRoot ? [mod.sandboxRoot] : undefined,
+  source: exportSource(buildSpec(mod), name),
 });
 // Filesystem selector rows: the file (or one of its exports) as a standalone
 // item — absolute-path sources bundle from any resolveDir, so file picks mix
@@ -376,7 +508,7 @@ const exportItem = (pkg: Pkg, mod: Mod, name: string): Item => ({
 const fileItem = (spell: string, file: string, exportName: string): Item => {
   const abs = fwdSlash(file);
   const base = slug(spell);
-  const source = exportName ? exportSource(abs, exportName) : `export * from '${abs}';`;
+  const source = exportName ? exportSource(abs, exportName) : reexportAll(abs);
   return {
     absSource: source,
     dir: base,
@@ -397,19 +529,21 @@ const cases = (pkg: Pkg, mods: Mod[], pkgRow = true): Item[] => {
       global: camel(pkg.name),
       module: pkg.name,
       out: ALL,
-      source: fullSource(mods, (mod) => mod.spec),
+      sandboxRoots: sandboxRootsOf(mods),
+      source: fullSource(mods, buildSpec),
     });
   for (const mod of mods) {
     // A single-export module's ALL bundle duplicates that export's bundle; skip it.
     if (mod.exports.length !== 1)
       res.push({
-        absSource: `export * from '${absSpec(mod)}';`,
+        absSource: reexportAll(absSpec(mod)),
         dir: mod.dir,
         export: ALL,
         global: camel(`${pkg.name}-${mod.module}`),
         module: mod.module,
         out: ALL,
-        source: `export * from '${mod.spec}';`,
+        sandboxRoots: mod.sandboxRoot ? [mod.sandboxRoot] : undefined,
+        source: reexportAll(buildSpec(mod)),
       });
     for (const name of mod.exports) res.push(exportItem(pkg, mod, name));
   }
@@ -421,13 +555,15 @@ const bundle = async (
   globalName: string,
   cwd: string,
   minify: boolean,
-  note: (text: string) => void
+  note: (text: string) => void,
+  sandboxRoots: string[] = []
 ) => {
   // Runtime-provided node builtins cost zero shipped bytes; leave them external.
   const external = [...builtinModules, 'node:*'];
   // esbuild resolves files through symlinks, so a symlinked anchor (macOS's
   // /var/folders tmpdir) would turn every path comment into a `../..` walk.
   const workDir = realpathSync(cwd);
+  const sandbox = sandboxRoots.length ? refSandbox(sandboxRoots) : undefined;
   // Dependency files esbuild proved broken by a same-file const reassignment
   // (deppack@old's `shims = shims.concat(…)`) — a hard error with no log
   // override. Retries reload them with const demoted to var: measurement never
@@ -454,23 +590,32 @@ const bundle = async (
         metafile: true,
         minify,
         platform,
-        plugins: varPatch.size
-          ? [
-              {
-                name: 'bismar-const-to-var',
-                setup: (hooks) => {
-                  hooks.onLoad({ filter: /\.[cm]?js$/ }, (args) =>
-                    varPatch.has(args.path)
-                      ? {
-                          contents: readFileSync(args.path, 'utf8').replace(/\bconst\b/g, 'var'),
-                          loader: 'js',
-                        }
-                      : undefined
-                  );
-                },
-              },
-            ]
-          : undefined,
+        plugins:
+          sandbox || varPatch.size
+            ? [
+                ...(sandbox ? [sandbox] : []),
+                ...(varPatch.size
+                  ? [
+                      {
+                        name: 'bismar-const-to-var',
+                        setup: (hooks: BuildHooks) => {
+                          hooks.onLoad({ filter: /\.[cm]?js$/ }, (args) =>
+                            varPatch.has(args.path)
+                              ? {
+                                  contents: readFileSync(args.path, 'utf8').replace(
+                                    /\bconst\b/g,
+                                    'var'
+                                  ),
+                                  loader: 'js',
+                                }
+                              : undefined
+                          );
+                        },
+                      } satisfies BuildPlugin,
+                    ]
+                  : []),
+              ]
+            : undefined,
         stdin: {
           contents: source,
           resolveDir: workDir,
@@ -585,8 +730,8 @@ const buildCase = async (
 ): Promise<Built> => {
   const resolveDir = item.resolveDir ?? ctx.cwd;
   const [plain, min] = await Promise.all([
-    bundle(build, item.source, item.global, resolveDir, false, note),
-    bundle(build, item.source, item.global, resolveDir, true, note),
+    bundle(build, item.source, item.global, resolveDir, false, note, item.sandboxRoots),
+    bundle(build, item.source, item.global, resolveDir, true, note, item.sandboxRoots),
   ]);
   return { ...item, min, plain };
 };
@@ -647,7 +792,11 @@ export const refContext = (
   ref: ExternalRef
 ): { label: string; refCtx: Ctx; refDir: string } => {
   const { label, pkg, pkgDir, pkgFile, refDir } = installedRef(outDir, ref);
-  return { label, refCtx: { cwd: refDir, outDir, pkg, pkgDir, pkgFile }, refDir };
+  return {
+    label,
+    refCtx: { cwd: refDir, outDir, pkg, pkgDir, pkgFile, sandboxRoot: refDir },
+    refDir,
+  };
 };
 const unknownErr = (
   what: string,
@@ -1041,8 +1190,10 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
   // validate names while bundling.
   const refOnly = !!only.length && only.every(npmish);
   // Zero modules would silently measure an empty entry (a ~400-byte interop shim) and
-  // list nothing; whatever shape caused it, an error beats a meaningless number.
-  if (!mods.length && !noLocal) err(`no importable JS modules found in ${ctx.pkg.name}`);
+  // list nothing; whatever shape caused it, an error beats a meaningless number. All-ref
+  // selections never touch the local modules, so a module-less cwd package stays usable.
+  if (!mods.length && !noLocal && !refOnly)
+    err(`no importable JS modules found in ${ctx.pkg.name}`);
   if ((input || (opts.listOnly && !refOnly) || !only.length) && !prefilled) {
     await fillExports(loadBuild(), mods);
     // Freshly enumerated full-package browse over a pinned ref: cache it for
@@ -1067,7 +1218,9 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
   if (opts.listOnly) return runList(ctx, mods, items, only, input ?? '', loadBuild);
   // Enumerates a module's export ids on demand (error paths only; extra metafile pass).
   const exportIds = async (mod: Mod): Promise<string[]> => {
-    const names = mod.exports.length ? mod.exports : await bundleExports(loadBuild(), mod.file);
+    const names = mod.exports.length
+      ? mod.exports
+      : await bundleExports(loadBuild(), mod.file, mod.sandboxRoot);
     return names.map((name) => `${mod.module}/${name}`);
   };
   // Ref modules by branded name, so build failures list ref exports as friendly errors.
@@ -1329,7 +1482,8 @@ const runSizeIn = async (opts: SizeOpts & { outDir: string }): Promise<void> => 
     noted.add(text);
     // Notes and the progress line share stderr; clear the line so they never merge.
     progressDone();
-    (opts.onNote ?? console.error)(text);
+    if (opts.onNote) opts.onNote(text);
+    else console.error(terminalText(stripAnsi(text), { multiline: true, tabs: 2 }));
   };
   const cachedRows = items.map((item) => cachedRow(item));
   const toBuild = cachedRows.filter((row) => !row).length;

@@ -17,7 +17,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { scoped, walkFiles } from './diff.ts';
 import { color, csvEnabled, csvRow, paint, stdoutColor } from './env.ts';
-import { bad, err, fmtBytes, kb, readJson, sorted } from './public.ts';
+import { bad, err, fmtBytes, kb, readJson, resolveInside, sorted } from './public.ts';
 import { parseRegistryRef, registryContext } from './registries.ts';
 
 const IDENT = /^[A-Za-z_]\w*$/;
@@ -98,8 +98,11 @@ const composerSurface = (pkgDir: string): string[] => {
       (dir): dir is string => typeof dir === 'string'
     );
     for (const dir of dirs) {
-      const root = join(pkgDir, dir);
-      if (!existsSync(root)) continue;
+      // Composer metadata comes from a downloaded package. A PSR-4 target may
+      // name the package root, but never a lexical `../` escape or an in-tree
+      // symlink whose real target is elsewhere.
+      const root = resolveInside(pkgDir, dir);
+      if (!root) continue;
       for (const file of walkFiles(root).keys()) {
         if (!file.endsWith('.php')) continue;
         const parts = file.slice(0, -4).split('/');
@@ -286,7 +289,9 @@ export const surfaceOf = (
           : prefix === 'gem:'
             ? wrap(gemSurface(pkgDir), (token) => `require '${token}'`)
             : [];
-  return lines.length ? lines : sorted(walkFiles(pkgDir).keys());
+  return lines.length
+    ? lines
+    : sorted(walkFiles(pkgDir).keys()).map((path) => paint(path, '', false));
 };
 
 export const registrySurface = async (outDir: string, selector: string): Promise<string[]> => {
@@ -317,7 +322,7 @@ const sizeCsv = (entries: [string, number][]): string[] =>
 const paintPath = (path: string, on: boolean): string => {
   const slash = path.lastIndexOf('/');
   const dir = slash >= 0 ? path.slice(0, slash + 1) : '';
-  return (dir && paint(dir, color.cyan, on)) + path.slice(slash + 1);
+  return (dir && paint(dir, color.cyan, on)) + paint(path.slice(slash + 1), '', false);
 };
 const sizeHuman = (entries: [string, number][], on: boolean, archiveBytes?: number): string[] => {
   const total = entries.reduce((sum, [, bytes]) => sum + bytes, 0);
