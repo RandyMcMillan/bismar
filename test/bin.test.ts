@@ -56,9 +56,9 @@ it('package exports name the supported subpaths and nothing else', () => {
 it('bismar --help documents the single command, every flag and its alias', async () => {
   const out = await capture(() => runCli(['--help'], { tty: false }));
   deepStrictEqual(/^usage:\n  bismar \[<selector>\]/.test(out), true, out);
-  for (const flag of ['--bundle', '--size', '--minify', '--list', '--diff', '--clear'])
+  for (const flag of ['--bundle', '--size', '--minify', '--list', '--diff', '--version', '--clear'])
     deepStrictEqual(out.includes(flag), true, `${flag}\n${out}`);
-  for (const alias of ['-b,', '-s,', '-m,', '-l,', '-d,'])
+  for (const alias of ['-b,', '-s,', '-m,', '-l,', '-d,', '-v,'])
     deepStrictEqual(out.includes(alias), true, `${alias}\n${out}`);
   // No subcommands and no other binaries: positionals are always selectors.
   deepStrictEqual(/bismar (bundle|size) |jsbt-check|<command>/.test(out), false, out);
@@ -109,4 +109,30 @@ it('bismar rejects unknown options and cross-mode flag combos', async () => {
   await rejects(() => runCli(['-i'], { tty: true }), /unknown option: -i/);
   await rejects(() => runCli(['--interactive'], { tty: true }), /unknown option: --interactive/);
   await rejects(() => runCli(['--input=./x.js'], { tty: true }), /--input is retired/);
+});
+
+it('bismar --version prints its own package version', async () => {
+  deepStrictEqual(await capture(() => runCli(['--version'], { tty: false })), `${pkg.version}\n`);
+  deepStrictEqual(await capture(() => runCli(['-v'], { tty: false })), `${pkg.version}\n`);
+});
+
+it('bismar -v reads local dir versions offline, with no date tail', async () => {
+  // Local manifests carry no release timestamp; the version stands alone.
+  // Ref selectors (which garnish with registry dates) live in registries.test.ts.
+  deepStrictEqual(await capture(() => runCli(['-v', '.'], { tty: false })), `${pkg.version}\n`);
+});
+
+it('bismar -v refuses flag combos, path tails, and bare names', async () => {
+  await rejects(
+    () => runCli(['-vb', 'npm:qr'], { tty: false }),
+    /--version prints resolved versions alone; drop other flags/
+  );
+  await rejects(
+    () => runCli(['-v', 'crate:serde/src/lib.rs'], { tty: false }),
+    /versions name whole packages; drop \/src\/lib\.rs/
+  );
+  await rejects(
+    () => runCli(['-v', 'qr'], { tty: false }),
+    /bare names never imply a registry: qr; use npm:qr for the registry package/
+  );
 });

@@ -54,6 +54,7 @@ it('bundle parses flags and rejects removed ones', () => {
     minify: true,
     paths: ['index/add'],
     size: false,
+    version: false,
   });
   // Short aliases resolve to the same canonical flags as the long spellings.
   deepStrictEqual(parseArgs(['-m', 'index/add']), args);
