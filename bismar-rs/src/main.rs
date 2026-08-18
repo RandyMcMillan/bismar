@@ -1,4 +1,6 @@
 #!/usr/bin/env bismar
+#![allow(dead_code)]
+
 //! bismar — Browse, weigh, and diff packages from any registry.
 //! Rust port of the TypeScript bismar CLI.
 

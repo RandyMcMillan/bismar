@@ -13,7 +13,6 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -770,7 +769,7 @@ pub fn js_hit_stats(prefix: &str, hit: &SearchHit) -> Result<Option<HitStats>> {
     let meta: serde_json::Value = get_json(&url)?;
     let version = meta["dist-tags"]["latest"]
         .as_str()
-        .or_else(|| Some(hit.version.as_str()))
+        .or(Some(hit.version.as_str()))
         .unwrap_or("")
         .to_string();
     let tgz_bytes = meta["versions"][&version]["dist"]["unpackedSize"]

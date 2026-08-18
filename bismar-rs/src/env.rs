@@ -141,7 +141,7 @@ pub fn terminal_text(text: &str, multiline: bool, tab_width: Option<usize>) -> S
         }
         if c == '\t' {
             if let Some(w) = tab_width {
-                for _ in 0..w.max(0) {
+                for _ in 0..w {
                     out.push(' ');
                 }
                 i += 1;
@@ -153,7 +153,7 @@ pub fn terminal_text(text: &str, multiline: bool, tab_width: Option<usize>) -> S
             out.push(char::from_u32(0x2400 + code).unwrap_or('\u{FFFD}'));
         } else if code == 0x7f {
             out.push('\u{2421}'); // DEL picture
-        } else if code >= 0x80 && code <= 0x9f {
+        } else if (0x80..=0x9f).contains(&code) {
             out.push_str(&format!("\\u{:04x}", code));
         } else {
             out.push(c);

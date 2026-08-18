@@ -510,8 +510,8 @@ pub fn diff_bundle_rows(
             let b = b_rows.get(k);
             BundleRow {
                 id: k.clone(),
-                a_loc: a.and_then(|r| r.get(0).copied()),
-                b_loc: b.and_then(|r| r.get(0).copied()),
+                a_loc: a.and_then(|r| r.first().copied()),
+                b_loc: b.and_then(|r| r.first().copied()),
                 a_min: a.and_then(|r| r.get(1).copied()),
                 b_min: b.and_then(|r| r.get(1).copied()),
                 a_gz: a.and_then(|r| r.get(2).copied()),

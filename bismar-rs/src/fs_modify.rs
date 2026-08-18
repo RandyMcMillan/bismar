@@ -151,17 +151,13 @@ fn safe_member_path(path: &Path) -> Result<PathBuf> {
     }
     for comp in path.components() {
         use std::path::Component::*;
-        match comp {
-            Normal(c) => {
-                let s = c.to_string_lossy();
-                // Reject Windows device names and traversal tricks.
-                if s.contains('\0') || s == ".." {
-                    bail!("unsafe archive path component: {:?}", s);
-                }
-                out.push(c);
+        if let Normal(c) = comp {
+            let s = c.to_string_lossy();
+            // Reject Windows device names and traversal tricks.
+            if s.contains('\0') || s == ".." {
+                bail!("unsafe archive path component: {:?}", s);
             }
-            // Drop leading '/', CurDir, and ParentDir.
-            _ => {}
+            out.push(c);
         }
     }
     Ok(out)
