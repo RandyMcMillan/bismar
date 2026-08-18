@@ -22,7 +22,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
+      - name: Cargo check
+        run: cargo check --locked
+        continue-on-error: true
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
