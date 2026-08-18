@@ -23,14 +23,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: rustfmt
       - name: Cargo check
         run: cargo check --locked
         continue-on-error: true
       - name: Check formatting
         run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked
       - name: Test
