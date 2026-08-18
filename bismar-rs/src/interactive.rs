@@ -136,7 +136,8 @@ impl App {
                 }
                 KeyCode::Enter => {
                     self.search_mode = false;
-                    self.status = format!("filter: {} ({} files)", self.search, self.filtered.len());
+                    self.status =
+                        format!("filter: {} ({} files)", self.search, self.filtered.len());
                 }
                 KeyCode::Backspace => {
                     self.search.pop();
@@ -191,8 +192,11 @@ impl App {
                 }
                 KeyCode::Char('u') => {
                     let step = 10;
-                    if self.file_cursor >= step { self.file_cursor -= step; }
-                    else { self.file_cursor = 0; }
+                    if self.file_cursor >= step {
+                        self.file_cursor -= step;
+                    } else {
+                        self.file_cursor = 0;
+                    }
                     self.list_state.select(Some(self.file_cursor));
                     self.load_current_file();
                 }
@@ -225,7 +229,9 @@ impl App {
                     let max = self.content.len().saturating_sub(1);
                     self.content_scroll = (self.content_scroll + 20).min(max);
                 }
-                KeyCode::Char('g') => { self.content_scroll = 0; }
+                KeyCode::Char('g') => {
+                    self.content_scroll = 0;
+                }
                 KeyCode::Char('G') => {
                     self.content_scroll = self.content.len().saturating_sub(1);
                 }
@@ -248,18 +254,12 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(size);
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(70),
-        ])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[0]);
 
     // File list
@@ -323,8 +323,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     } else {
         app.status.clone()
     };
-    let status = Paragraph::new(status_text)
-        .style(Style::default().fg(TuiColor::Gray));
+    let status = Paragraph::new(status_text).style(Style::default().fg(TuiColor::Gray));
     f.render_widget(status, chunks[1]);
 }
 
@@ -392,7 +391,9 @@ impl DiffApp {
         entries: Vec<crate::diff::DiffEntry>,
     ) -> Self {
         let mut list_state = ListState::default();
-        if !entries.is_empty() { list_state.select(Some(0)); }
+        if !entries.is_empty() {
+            list_state.select(Some(0));
+        }
         let mut app = DiffApp {
             a_root,
             b_root,
@@ -489,7 +490,11 @@ fn diff_ui(f: &mut Frame, app: &mut DiffApp) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" changed files "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" changed files "),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
@@ -540,11 +545,17 @@ pub fn run_diff_interactive(
                 app.handle_key(key);
             }
         }
-        if app.quit { break; }
+        if app.quit {
+            break;
+        }
     }
 
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen, cursor::Show)?;
+    execute!(
+        terminal.backend_mut(),
+        terminal::LeaveAlternateScreen,
+        cursor::Show
+    )?;
     progress_reset();
     Ok(())
 }

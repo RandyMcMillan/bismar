@@ -3,36 +3,38 @@
 //! Rust port of the TypeScript bismar CLI.
 
 mod cli;
+#[allow(dead_code)]
 mod diff;
+#[allow(dead_code)]
 mod env;
+#[allow(dead_code)]
 mod fs_modify;
+#[allow(dead_code)]
 mod interactive;
+#[allow(dead_code)]
 mod public;
+#[allow(dead_code)]
 mod refs;
+#[allow(dead_code)]
 mod registries;
+#[allow(dead_code)]
 mod size;
+#[allow(dead_code)]
 mod surface;
 
 use crate::cli::{parse_args, USAGE};
 use crate::diff::{
-    bundle_stat_csv, bundle_stat_human, diff_bundle_rows, diff_target, diff_trees,
-    measured_side, pack_local_sides,
-    render_unified_highlighted, stat_csv, stat_human, walk_files,
+    bundle_stat_csv, bundle_stat_human, diff_bundle_rows, diff_target, diff_trees, measured_side,
+    pack_local_sides, render_unified_highlighted, stat_csv, stat_human, walk_files,
 };
-use crate::env::{
-    csv_enabled, paint, stdout_color, want_color, Color,
-};
+use crate::env::{csv_enabled, paint, stdout_color, want_color, Color};
 use crate::fs_modify::{clear_temp_caches, temp_dir};
 use crate::interactive::{run_diff_interactive, run_interactive};
 use crate::public::explicit_path;
 use crate::refs::{as_ref_str, explicit_ref, parse_npm_ref};
-use crate::registries::{
-    is_registry_selector, parse_registry_ref, registry_context,
-};
+use crate::registries::{is_registry_selector, parse_registry_ref, registry_context};
 use crate::size::run_size;
-use crate::surface::{
-    file_sizes_csv, file_sizes_human,
-};
+use crate::surface::{file_sizes_csv, file_sizes_human};
 use anyhow::{bail, Result};
 use std::io::{self, Write};
 
@@ -123,11 +125,21 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
             let b_rows = crate::size::measure_rows(&b_bf, args.minify, false)?;
             let a_map: std::collections::HashMap<String, Vec<f64>> = a_rows
                 .iter()
-                .map(|r| (r.id.clone(), vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes]))
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes],
+                    )
+                })
                 .collect();
             let b_map: std::collections::HashMap<String, Vec<f64>> = b_rows
                 .iter()
-                .map(|r| (r.id.clone(), vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes]))
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes],
+                    )
+                })
                 .collect();
             let bundle_rows = diff_bundle_rows(&a_map, &b_map);
             if csv_enabled() {
@@ -156,12 +168,7 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
             // Non-TTY: emit unified diff to stdout.
             println!(
                 "{}",
-                render_unified_highlighted(
-                    &a_packed.dir,
-                    &b_packed.dir,
-                    &diff.entries,
-                    false
-                )
+                render_unified_highlighted(&a_packed.dir, &b_packed.dir, &diff.entries, false)
             );
         } else {
             run_diff_interactive(
@@ -188,7 +195,11 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
         if is_registry_selector(raw) {
             let r = parse_registry_ref(raw);
             let ctx = fetch_registry(out_dir.clone(), r.clone()).await?;
-            let sel = if r.path.is_empty() { None } else { Some(r.path.as_str()) };
+            let sel = if r.path.is_empty() {
+                None
+            } else {
+                Some(r.path.as_str())
+            };
             if csv_enabled() {
                 println!("{}", file_sizes_csv(&ctx.pkg_dir, sel, &ctx.label));
             } else {
@@ -200,7 +211,11 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
         } else if explicit_ref(raw) {
             let r = parse_npm_ref(&as_ref_str(raw))?;
             let got = crate::refs::installed_ref(&out_dir, &r, true)?;
-            let sel = if r.path.is_empty() { None } else { Some(r.path.as_str()) };
+            let sel = if r.path.is_empty() {
+                None
+            } else {
+                Some(r.path.as_str())
+            };
             if csv_enabled() {
                 println!("{}", file_sizes_csv(&got.pkg_dir, sel, &got.label));
             } else {
@@ -288,7 +303,9 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
             let files = walk_files(&dir);
             let mut sorted: Vec<String> = files.into_keys().collect();
             sorted.sort();
-            for f in sorted { println!("{}", f); }
+            for f in sorted {
+                println!("{}", f);
+            }
         }
         return Ok(());
     }
@@ -302,7 +319,9 @@ async fn run_cli(argv: Vec<String>) -> Result<()> {
         let files = walk_files(&got.pkg_dir);
         let mut sorted: Vec<String> = files.into_keys().collect();
         sorted.sort();
-        for f in sorted { println!("{}", f); }
+        for f in sorted {
+            println!("{}", f);
+        }
     }
     Ok(())
 }

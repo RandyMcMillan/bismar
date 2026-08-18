@@ -1,6 +1,5 @@
 //! CLI argument parsing. Maps bismar's src/bismar.ts parseArgs / CliArgs.
 
-
 #[derive(Debug, Clone, Default)]
 pub struct CliArgs {
     pub bundle: bool,
@@ -24,24 +23,63 @@ pub fn parse_args(argv: &[String]) -> CliArgs {
     while i < argv.len() {
         let a = &argv[i];
         match a.as_str() {
-            "--help" | "-h" => { args.help = true; args.interactive = false; }
-            "--bundle" | "-b" => { args.bundle = true; args.interactive = false; }
-            "--minify" | "-m" => { args.minify = true; args.interactive = false; }
-            "--size" | "-s" => { args.size = true; args.interactive = false; }
-            "--list" | "-l" => { args.list = true; args.interactive = false; }
-            "--diff" | "-d" => { args.diff = true; args.interactive = false; }
-            "--clear" => { args.clear = true; args.interactive = false; }
+            "--help" | "-h" => {
+                args.help = true;
+                args.interactive = false;
+            }
+            "--bundle" | "-b" => {
+                args.bundle = true;
+                args.interactive = false;
+            }
+            "--minify" | "-m" => {
+                args.minify = true;
+                args.interactive = false;
+            }
+            "--size" | "-s" => {
+                args.size = true;
+                args.interactive = false;
+            }
+            "--list" | "-l" => {
+                args.list = true;
+                args.interactive = false;
+            }
+            "--diff" | "-d" => {
+                args.diff = true;
+                args.interactive = false;
+            }
+            "--clear" => {
+                args.clear = true;
+                args.interactive = false;
+            }
             other if other.starts_with('-') => {
                 // Compound flags like -bs, -bsm, -dbsm, -ds, -dbs
                 let flags = &other[1..];
                 for ch in flags.chars() {
                     match ch {
-                        'b' => { args.bundle = true; args.interactive = false; }
-                        'm' => { args.minify = true; args.interactive = false; }
-                        's' => { args.size = true; args.interactive = false; }
-                        'l' => { args.list = true; args.interactive = false; }
-                        'd' => { args.diff = true; args.interactive = false; }
-                        'h' => { args.help = true; args.interactive = false; }
+                        'b' => {
+                            args.bundle = true;
+                            args.interactive = false;
+                        }
+                        'm' => {
+                            args.minify = true;
+                            args.interactive = false;
+                        }
+                        's' => {
+                            args.size = true;
+                            args.interactive = false;
+                        }
+                        'l' => {
+                            args.list = true;
+                            args.interactive = false;
+                        }
+                        'd' => {
+                            args.diff = true;
+                            args.interactive = false;
+                        }
+                        'h' => {
+                            args.help = true;
+                            args.interactive = false;
+                        }
                         _ => {}
                     }
                 }
@@ -55,8 +93,13 @@ pub fn parse_args(argv: &[String]) -> CliArgs {
     }
 
     // If only paths are given with no flags, use interactive mode.
-    let has_flags = args.bundle || args.clear || args.diff || args.help
-        || args.list || args.minify || args.size;
+    let has_flags = args.bundle
+        || args.clear
+        || args.diff
+        || args.help
+        || args.list
+        || args.minify
+        || args.size;
     if !has_flags && !args.paths.is_empty() {
         args.interactive = true;
     }

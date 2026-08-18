@@ -7,10 +7,7 @@ use crate::diff::walk_files;
 use crate::env::{csv_enabled, progress_done, progress_update, stdout_color};
 use crate::fs_modify::temp_dir;
 use crate::public::{read_pkg, Pkg};
-use crate::refs::{
-    as_ref_str, explicit_ref, installed_ref, parse_npm_ref, ref_db,
-    RefDbMod,
-};
+use crate::refs::{as_ref_str, explicit_ref, installed_ref, parse_npm_ref, ref_db, RefDbMod};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,7 +54,10 @@ fn esbuild_measure(
     root_dir: &Path,
 ) -> Result<(f64, f64, f64, f64)> {
     let esbuild = find_esbuild().ok_or_else(|| anyhow::anyhow!("esbuild not found"))?;
-    let external_args: Vec<String> = external.iter().map(|e| format!("--external:{}", e)).collect();
+    let external_args: Vec<String> = external
+        .iter()
+        .map(|e| format!("--external:{}", e))
+        .collect();
     let mut args = vec![
         entry.to_string(),
         "--bundle".to_string(),
@@ -122,7 +122,9 @@ pub fn build_first(raw: &str, out_dir: &Path) -> Result<BuildFirst> {
         let r = parse_npm_ref(&as_ref_str(raw))?;
         let got = installed_ref(out_dir, &r, false)?;
         let db = ref_db(&got.ref_dir);
-        let modules = db.modules.unwrap_or_else(|| enumerate_modules(&got.pkg, &got.pkg_dir, &got.ref_dir));
+        let modules = db
+            .modules
+            .unwrap_or_else(|| enumerate_modules(&got.pkg, &got.pkg_dir, &got.ref_dir));
         Ok(BuildFirst {
             label: got.label,
             pkg: got.pkg,
@@ -158,7 +160,11 @@ fn enumerate_modules(pkg: &Pkg, pkg_dir: &Path, _ref_dir: &Path) -> Vec<RefDbMod
         .filter(|e| !e.js_rel.is_empty())
         .map(|e| {
             let module = e.key.trim_start_matches("./").to_string();
-            let module = if module == "." { pkg.name.clone() } else { module };
+            let module = if module == "." {
+                pkg.name.clone()
+            } else {
+                module
+            };
             RefDbMod {
                 exports: vec![],
                 file: e.js_rel,
@@ -170,11 +176,7 @@ fn enumerate_modules(pkg: &Pkg, pkg_dir: &Path, _ref_dir: &Path) -> Vec<RefDbMod
 
 // ── measureRows ───────────────────────────────────────────────────────────────
 
-pub fn measure_rows(
-    bf: &BuildFirst,
-    _minify: bool,
-    _skip_cache: bool,
-) -> Result<Vec<RowData>> {
+pub fn measure_rows(bf: &BuildFirst, _minify: bool, _skip_cache: bool) -> Result<Vec<RowData>> {
     let mut rows = Vec::new();
     for m in &bf.modules {
         progress_update(&format!("measuring {}", m.module));
@@ -205,12 +207,7 @@ pub fn measure_rows(
 
 // ── runSize ───────────────────────────────────────────────────────────────────
 
-pub fn run_size(
-    raw: &str,
-    bundle: bool,
-    minify: bool,
-    list_mode: bool,
-) -> Result<String> {
+pub fn run_size(raw: &str, bundle: bool, minify: bool, list_mode: bool) -> Result<String> {
     let out_dir = temp_dir()?;
     let bf = build_first(raw, &out_dir)?;
 
@@ -227,19 +224,33 @@ pub fn run_size(
         if csv_enabled() {
             return Ok(crate::surface::sizes_csv(&sorted_files));
         }
-        return Ok(crate::surface::sizes_human(&sorted_files, &bf.label, stdout_color()));
+        return Ok(crate::surface::sizes_human(
+            &sorted_files,
+            &bf.label,
+            stdout_color(),
+        ));
     }
 
     let rows = measure_rows(&bf, minify, false)?;
     let _row_map: HashMap<String, Vec<f64>> = rows
         .iter()
-        .map(|r| (r.id.clone(), vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes]))
+        .map(|r| {
+            (
+                r.id.clone(),
+                vec![r.loc, r.min_bytes, r.gz_bytes, r.plain_bytes],
+            )
+        })
         .collect();
 
     if csv_enabled() {
         let entries: Vec<(String, u64)> = rows
             .iter()
-            .map(|r| (r.id.clone(), if minify { r.gz_bytes } else { r.min_bytes } as u64))
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    if minify { r.gz_bytes } else { r.min_bytes } as u64,
+                )
+            })
             .collect();
         return Ok(crate::surface::sizes_csv(&entries));
     }
@@ -251,5 +262,9 @@ pub fn run_size(
             (r.id.clone(), bytes)
         })
         .collect();
-    Ok(crate::surface::sizes_human(&entries, &bf.label, stdout_color()))
+    Ok(crate::surface::sizes_human(
+        &entries,
+        &bf.label,
+        stdout_color(),
+    ))
 }
