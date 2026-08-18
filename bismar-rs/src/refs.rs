@@ -28,8 +28,7 @@ pub struct ExternalRef {
     pub version: String,
 }
 
-static PINNED: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$").unwrap());
+static PINNED: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$").unwrap());
 
 pub fn is_pinned(version: &str) -> bool {
     PINNED.is_match(version)
@@ -55,7 +54,9 @@ pub fn parse_npm_ref(raw: &str) -> Result<ExternalRef> {
         (name.clone(), String::new())
     };
 
-    let valid_name = Regex::new(r"^(@[\w.-]+/)?[\w.-]+$").unwrap().is_match(&bare);
+    let valid_name = Regex::new(r"^(@[\w.-]+/)?[\w.-]+$")
+        .unwrap()
+        .is_match(&bare);
     let scoped_incomplete = body.starts_with('@') && parts.len() < 2;
     let bad_version = version.contains(':') || version.contains('+');
 
@@ -98,10 +99,7 @@ pub fn parse_npm_ref(raw: &str) -> Result<ExternalRef> {
 
 fn install_name(r: &ExternalRef) -> String {
     if r.jsr {
-        format!(
-            "@jsr/{}",
-            r.bare[1..].replace('/', "__")
-        )
+        format!("@jsr/{}", r.bare[1..].replace('/', "__"))
     } else {
         r.bare.clone()
     }
@@ -121,7 +119,12 @@ pub fn refs_root() -> Result<PathBuf> {
 
 pub fn cache_key(label: &str) -> String {
     let readable = slug(label);
-    let readable = if readable.is_empty() { "ref" } else { &readable[..readable.len().min(48)] }.to_string();
+    let readable = if readable.is_empty() {
+        "ref"
+    } else {
+        &readable[..readable.len().min(48)]
+    }
+    .to_string();
     let mut h = Sha256::new();
     h.update(label.as_bytes());
     let digest = format!("{:x}", h.finalize());
@@ -141,12 +144,16 @@ pub fn refs_cache_dir(label: &str) -> Result<PathBuf> {
 
 pub fn refs_tag_file(label: &str) -> Result<PathBuf> {
     let root = refs_root()?;
-    Ok(root.join(".tags").join(format!("{}.json", cache_key(label))))
+    Ok(root
+        .join(".tags")
+        .join(format!("{}.json", cache_key(label))))
 }
 
 pub fn refs_meta_file(label: &str) -> Result<PathBuf> {
     let root = refs_root()?;
-    Ok(root.join(".meta").join(format!("{}.json", cache_key(label))))
+    Ok(root
+        .join(".meta")
+        .join(format!("{}.json", cache_key(label))))
 }
 
 // ── Version tags ──────────────────────────────────────────────────────────────
@@ -169,10 +176,7 @@ fn now_ms() -> u64 {
 pub fn read_version_tag(label: &str, ttl_scale: u64) -> Option<String> {
     let file = refs_tag_file(label).ok()?;
     let tag: VersionTag = read_json(&file).ok()?;
-    if tag.v == 2
-        && tag.label == label
-        && (now_ms() - tag.at) < TAG_TTL_MS * ttl_scale
-    {
+    if tag.v == 2 && tag.label == label && (now_ms() - tag.at) < TAG_TTL_MS * ttl_scale {
         Some(tag.version)
     } else {
         None
@@ -239,7 +243,11 @@ pub fn write_cache_identity(
 
 pub fn read_archive_bytes(label: &str) -> Option<u64> {
     let b = read_cache_meta(label)?.archive_bytes?;
-    if b > 0 { Some(b) } else { None }
+    if b > 0 {
+        Some(b)
+    } else {
+        None
+    }
 }
 
 pub fn read_archive_sha256(label: &str) -> Option<String> {
@@ -282,8 +290,12 @@ pub struct RefDb {
 
 pub fn ref_db(ref_dir: &Path) -> RefDb {
     let file = ref_dir.join(REF_DB);
-    let Ok(text) = read_text(&file) else { return RefDb::default() };
-    let Ok(raw): Result<serde_json::Value, _> = serde_json::from_str(&text) else { return RefDb::default() };
+    let Ok(text) = read_text(&file) else {
+        return RefDb::default();
+    };
+    let Ok(raw): Result<serde_json::Value, _> = serde_json::from_str(&text) else {
+        return RefDb::default();
+    };
     if raw.get("v") != Some(&serde_json::Value::Number(1.into())) {
         return RefDb::default();
     }
@@ -295,7 +307,11 @@ pub fn ref_db(ref_dir: &Path) -> RefDb {
         let sizes: Option<RefDbSizes> = serde_json::from_value(s.clone()).ok();
         sizes.filter(|s| s.v == SIZES_V)
     });
-    RefDb { modules, sizes, v: Some(1) }
+    RefDb {
+        modules,
+        sizes,
+        v: Some(1),
+    }
 }
 
 pub fn save_ref_db(ref_dir: &Path, patch: &RefDb) -> Result<()> {
@@ -330,12 +346,7 @@ pub struct InstalledRef {
 }
 
 fn pinned_dir_of(r: &ExternalRef, version: &str) -> Result<PathBuf> {
-    let label = format!(
-        "{}{}@{}",
-        if r.jsr { "jsr:" } else { "" },
-        r.bare,
-        version
-    );
+    let label = format!("{}{}@{}", if r.jsr { "jsr:" } else { "" }, r.bare, version);
     refs_cache_dir(&label)
 }
 
@@ -363,12 +374,7 @@ fn install_ref(out_dir: &Path, r: &ExternalRef) -> Result<PathBuf> {
     } else {
         None
     };
-    let pinned_label = format!(
-        "{}{}@{}",
-        if r.jsr { "jsr:" } else { "" },
-        r.bare,
-        version
-    );
+    let pinned_label = format!("{}{}@{}", if r.jsr { "jsr:" } else { "" }, r.bare, version);
 
     if let Some(ref pd) = pinned_dir {
         if valid_ref_cache(pd, &pinned_label, r, &version) {
@@ -379,13 +385,15 @@ fn install_ref(out_dir: &Path, r: &ExternalRef) -> Result<PathBuf> {
         }
     }
 
-    let dir = out_dir
-        .join(".refs")
-        .join(cache_key(&format!(
-            "{}@{}",
-            r.label,
-            if version.is_empty() { "latest" } else { &version }
-        )));
+    let dir = out_dir.join(".refs").join(cache_key(&format!(
+        "{}@{}",
+        r.label,
+        if version.is_empty() {
+            "latest"
+        } else {
+            &version
+        }
+    )));
     std::fs::create_dir_all(&dir)?;
     progress_show(&format!("installing {}", r.label));
 
@@ -436,12 +444,8 @@ fn install_ref(out_dir: &Path, r: &ExternalRef) -> Result<PathBuf> {
                 if is_pinned(&got) {
                     write_version_tag(&r.label, &got)?;
                     let target = pinned_dir_of(r, &got)?;
-                    let target_label = format!(
-                        "{}{}@{}",
-                        if r.jsr { "jsr:" } else { "" },
-                        r.bare,
-                        got
-                    );
+                    let target_label =
+                        format!("{}{}@{}", if r.jsr { "jsr:" } else { "" }, r.bare, got);
                     if !valid_ref_cache(&target, &target_label, r, &got) && !target.exists() {
                         write_cache_identity(&target_label, None, None)?;
                         if promote_temp(&dir, &target)
@@ -492,8 +496,7 @@ pub fn installed_ref(
 
 // ── Selector helpers ──────────────────────────────────────────────────────────
 
-static NPM_BARE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-z0-9][\w.-]*$").unwrap());
+static NPM_BARE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z0-9][\w.-]*$").unwrap());
 
 pub fn npm_hint_of(raw: &str) -> String {
     if raw.starts_with('@') {

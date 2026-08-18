@@ -10,14 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-static RE_GO_MODULE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^module\s+(\S+)").unwrap());
+static RE_GO_MODULE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^module\s+(\S+)").unwrap());
 static RE_GO_PACKAGE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^package\s+([A-Za-z_]\w*)").unwrap());
-static RE_IDENT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
-static RE_DIST_INFO: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\.(dist|egg)-info$").unwrap());
+static RE_IDENT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+static RE_DIST_INFO: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.(dist|egg)-info$").unwrap());
 static RE_CARGO_NAME: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?m)^name\s*=\s*"([^"]+)""#).unwrap());
 
@@ -55,7 +52,11 @@ pub fn go_surface(pkg_dir: &Path, ref_name: &str) -> Vec<String> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
-        let rel = if dir == "." || dir.is_empty() { String::new() } else { dir };
+        let rel = if dir == "." || dir.is_empty() {
+            String::new()
+        } else {
+            dir
+        };
         if go_skip(&rel) {
             continue;
         }
@@ -99,7 +100,9 @@ pub fn composer_surface(pkg_dir: &Path) -> Vec<String> {
     }
 
     let manifest_path = pkg_dir.join("composer.json");
-    let Ok(manifest) = read_json::<ComposerJson>(&manifest_path) else { return vec![] };
+    let Ok(manifest) = read_json::<ComposerJson>(&manifest_path) else {
+        return vec![];
+    };
     let psr4 = match manifest.autoload.and_then(|a| a.psr4) {
         Some(serde_json::Value::Object(m)) => m,
         _ => return vec![],
@@ -115,7 +118,9 @@ pub fn composer_surface(pkg_dir: &Path) -> Vec<String> {
             _ => continue,
         };
         for dir in dirs {
-            let Some(root) = resolve_inside(pkg_dir, &dir) else { continue };
+            let Some(root) = resolve_inside(pkg_dir, &dir) else {
+                continue;
+            };
             for file in walk_files(&root).keys() {
                 if !file.ends_with(".php") {
                     continue;
@@ -139,7 +144,11 @@ static PY_SKIP: &[&str] = &[
 pub fn pypi_surface(pkg_dir: &Path) -> Vec<String> {
     let mut names = HashSet::new();
     for base in &["", "src"] {
-        let base_dir = if base.is_empty() { pkg_dir.to_path_buf() } else { pkg_dir.join(base) };
+        let base_dir = if base.is_empty() {
+            pkg_dir.to_path_buf()
+        } else {
+            pkg_dir.join(base)
+        };
         if let Ok(entries) = fs::read_dir(&base_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -159,17 +168,25 @@ pub fn pypi_surface(pkg_dir: &Path) -> Vec<String> {
     }
     if names.is_empty() {
         for base in &["src", ""] {
-            let base_dir = if base.is_empty() { pkg_dir.to_path_buf() } else { pkg_dir.join(base) };
+            let base_dir = if base.is_empty() {
+                pkg_dir.to_path_buf()
+            } else {
+                pkg_dir.join(base)
+            };
             if let Ok(entries) = fs::read_dir(&base_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if PY_SKIP.contains(&name.as_str()) { continue; }
+                    if PY_SKIP.contains(&name.as_str()) {
+                        continue;
+                    }
                     if base_dir.join(&name).join("__init__.py").exists() {
                         names.insert(name);
                     }
                 }
             }
-            if !names.is_empty() { break; }
+            if !names.is_empty() {
+                break;
+            }
         }
     }
     sorted(names)
@@ -179,7 +196,9 @@ pub fn pypi_surface(pkg_dir: &Path) -> Vec<String> {
 
 pub fn gem_surface(pkg_dir: &Path) -> Vec<String> {
     let lib = pkg_dir.join("lib");
-    if !lib.exists() { return vec![]; }
+    if !lib.exists() {
+        return vec![];
+    }
     sorted(
         walk_files(&lib)
             .keys()
@@ -198,19 +217,16 @@ pub fn crate_surface(pkg_dir: &Path) -> Vec<String> {
         .ok()
         .and_then(|t| RE_CARGO_NAME.captures(&t).map(|c| c[1].to_string()))
         .unwrap_or_default();
-    if name.is_empty() { return vec![]; }
+    if name.is_empty() {
+        return vec![];
+    }
     sorted(vec![name])
 }
 
 // ── Public surface entry point ────────────────────────────────────────────────
 
 /// Generate `import` / `use` lines for a package, or file listing as fallback.
-pub fn registry_surface(
-    pkg_dir: &Path,
-    prefix: &str,
-    ref_name: &str,
-    _color: bool,
-) -> Vec<String> {
+pub fn registry_surface(pkg_dir: &Path, prefix: &str, ref_name: &str, _color: bool) -> Vec<String> {
     let lines = match prefix {
         "go" => go_surface(pkg_dir, ref_name),
         "packagist" => composer_surface(pkg_dir),
@@ -230,12 +246,7 @@ pub fn registry_surface(
 
 // ── Plain file sizes ──────────────────────────────────────────────────────────
 
-pub fn file_sizes_human(
-    pkg_dir: &Path,
-    sel: Option<&str>,
-    label: &str,
-    color: bool,
-) -> String {
+pub fn file_sizes_human(pkg_dir: &Path, sel: Option<&str>, label: &str, color: bool) -> String {
     let files = scoped(walk_files(pkg_dir), sel);
     let mut sorted_files: Vec<(String, u64)> = files.into_iter().collect();
     sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -275,7 +286,13 @@ pub fn sizes_human(entries: &[(String, u64)], label: &str, color: bool) -> Strin
         .iter()
         .map(|(id, bytes)| format!("{:>10}  {}", kb(*bytes), id))
         .collect();
-    lines.push(format!("\n{}total: {} ({}){}",col, fmt_bytes(total), label, reset));
+    lines.push(format!(
+        "\n{}total: {} ({}){}",
+        col,
+        fmt_bytes(total),
+        label,
+        reset
+    ));
     lines.join("\n")
 }
 

@@ -5,7 +5,9 @@
 use crate::env::{csv_row, Color};
 use crate::fs_modify::{extract_archive, npm_install, npm_pack, write_pkg};
 use crate::public::{bad, explicit_path, fmt_bytes, kb, read_pkg};
-use crate::refs::{as_ref_str, cache_key, explicit_ref, installed_ref, npm_hint_use, parse_npm_ref};
+use crate::refs::{
+    as_ref_str, cache_key, explicit_ref, installed_ref, npm_hint_use, parse_npm_ref,
+};
 use crate::registries::{is_registry_selector, parse_registry_ref, registry_context};
 use anyhow::{bail, Result};
 use similar::{ChangeTag, TextDiff};
@@ -59,7 +61,9 @@ fn walk(root: &Path, rel: &str, out: &mut HashMap<String, u64>) {
     } else {
         root.join(rel)
     };
-    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if SKIP.contains(&name.as_str()) {
@@ -138,7 +142,11 @@ pub fn diff_target(out_dir: &Path, raw: &str, cwd: &Path, bundle: bool) -> Resul
             dir: got.pkg_dir,
             label,
             local_dir: None,
-            sel: if r.path.is_empty() { None } else { Some(r.path) },
+            sel: if r.path.is_empty() {
+                None
+            } else {
+                Some(r.path)
+            },
             tarball: None,
         });
     }
@@ -179,7 +187,11 @@ pub fn diff_target(out_dir: &Path, raw: &str, cwd: &Path, bundle: bool) -> Resul
             dir: got.pkg_dir,
             label,
             local_dir: None,
-            sel: if r.path.is_empty() { None } else { Some(r.path) },
+            sel: if r.path.is_empty() {
+                None
+            } else {
+                Some(r.path)
+            },
             tarball: None,
         });
     }
@@ -187,7 +199,11 @@ pub fn diff_target(out_dir: &Path, raw: &str, cwd: &Path, bundle: bool) -> Resul
     bail!(
         "--diff expects package refs or directories, not {}{}",
         bad(raw),
-        if use_hint.is_empty() { String::new() } else { format!("; {}", use_hint) }
+        if use_hint.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", use_hint)
+        }
     )
 }
 
@@ -200,7 +216,10 @@ pub fn pack_local_side(out_dir: &Path, side: DiffSide) -> DiffSide {
         return side;
     }
     let label = format!("{} (npm pack)", side.label);
-    let tarball = match npm_pack(&side.dir, &out_dir.join(format!("pack-{}", cache_key(&side.label)))) {
+    let tarball = match npm_pack(
+        &side.dir,
+        &out_dir.join(format!("pack-{}", cache_key(&side.label))),
+    ) {
         Ok(t) => t,
         Err(_) => return side,
     };
@@ -227,7 +246,9 @@ pub fn measured_side(out_dir: &Path, side: DiffSide) -> DiffSide {
     if !pkg_file.is_file() {
         return side;
     }
-    let Ok(pkg) = read_pkg(&pkg_file, false) else { return side };
+    let Ok(pkg) = read_pkg(&pkg_file, false) else {
+        return side;
+    };
     let pkg_name = pkg.name.clone();
     let dir = out_dir.join(format!("install-{}", cache_key(&side.label)));
     let pkg_json = format!(
@@ -381,10 +402,20 @@ pub fn render_unified_highlighted(
                 a_dir
             };
             let content = fs::read_to_string(side.join(&entry.path)).unwrap_or_default();
-            let prefix = if entry.status == DiffStatus::Added { "+" } else { "-" };
+            let prefix = if entry.status == DiffStatus::Added {
+                "+"
+            } else {
+                "-"
+            };
             let col = if color {
-                if entry.status == DiffStatus::Added { Color::GREEN } else { Color::RED }
-            } else { "" };
+                if entry.status == DiffStatus::Added {
+                    Color::GREEN
+                } else {
+                    Color::RED
+                }
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 "{}--- {}\n+++ {}\n{}",
                 if color { Color::BOLD } else { "" },
@@ -414,16 +445,17 @@ pub fn render_unified_highlighted(
     out
 }
 
-pub fn render_text_unified_highlighted(
-    path: &str,
-    a: &str,
-    b: &str,
-    color: bool,
-) -> String {
+pub fn render_text_unified_highlighted(path: &str, a: &str, b: &str, color: bool) -> String {
     let diff = TextDiff::from_lines(a, b);
     let mut out = String::new();
     if color {
-        out.push_str(&format!("{}--- {}\n+++ {}{}\n", Color::BOLD, path, path, Color::RESET));
+        out.push_str(&format!(
+            "{}--- {}\n+++ {}{}\n",
+            Color::BOLD,
+            path,
+            path,
+            Color::RESET
+        ));
     } else {
         out.push_str(&format!("--- {}\n+++ {}\n", path, path));
     }
@@ -436,7 +468,13 @@ pub fn render_text_unified_highlighted(
                     ChangeTag::Equal => (" ", ""),
                 };
                 if color && !col.is_empty() {
-                    out.push_str(&format!("{}{}{}{}\n", col, sign, change.value(), Color::RESET));
+                    out.push_str(&format!(
+                        "{}{}{}{}\n",
+                        col,
+                        sign,
+                        change.value(),
+                        Color::RESET
+                    ));
                 } else {
                     out.push_str(&format!("{}{}\n", sign, change.value()));
                 }
@@ -484,7 +522,9 @@ pub fn diff_bundle_rows(
 }
 
 pub fn bundle_stat_csv(rows: &[BundleRow]) -> String {
-    let mut lines = vec![csv_row(&["id", "a_loc", "b_loc", "a_min", "b_min", "a_gz", "b_gz"])];
+    let mut lines = vec![csv_row(&[
+        "id", "a_loc", "b_loc", "a_min", "b_min", "a_gz", "b_gz",
+    ])];
     for r in rows {
         lines.push(csv_row(&[
             &r.id,
@@ -499,11 +539,19 @@ pub fn bundle_stat_csv(rows: &[BundleRow]) -> String {
     lines.join("\n")
 }
 
-pub fn bundle_stat_human(_a_label: &str, _b_label: &str, rows: &[BundleRow], color: bool) -> String {
+pub fn bundle_stat_human(
+    _a_label: &str,
+    _b_label: &str,
+    rows: &[BundleRow],
+    color: bool,
+) -> String {
     let mut lines = Vec::new();
     let col = if color { Color::CYAN } else { "" };
     let reset = if color { Color::RESET } else { "" };
-    lines.push(format!("{}{:<40} {:>8} {:>8} {:>8} {:>8}{}", col, "id", "a_min", "b_min", "a_gz", "b_gz", reset));
+    lines.push(format!(
+        "{}{:<40} {:>8} {:>8} {:>8} {:>8}{}",
+        col, "id", "a_min", "b_min", "a_gz", "b_gz", reset
+    ));
     for r in rows {
         lines.push(format!(
             "{:<40} {:>8} {:>8} {:>8} {:>8}",

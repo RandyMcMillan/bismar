@@ -47,7 +47,9 @@ fn get_bytes(url: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
-    let bytes = resp.bytes().with_context(|| format!("reading body of {}", url))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading body of {}", url))?;
     if bytes.len() > MAX_METADATA_BYTES {
         bail!("response too large from {}", url);
     }
@@ -67,7 +69,9 @@ fn get_archive(url: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
-    let bytes = resp.bytes().with_context(|| format!("reading archive body of {}", url))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading archive body of {}", url))?;
     if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
         bail!("archive too large from {}", url);
     }
@@ -193,7 +197,11 @@ pub fn parse_registry_ref(raw: &str) -> RegistryRef {
     // Split name@version/path
     let slash = body.find('/').unwrap_or(body.len());
     let name_part = &body[..slash];
-    let path = if slash < body.len() { &body[slash + 1..] } else { "" };
+    let path = if slash < body.len() {
+        &body[slash + 1..]
+    } else {
+        ""
+    };
     let at = name_part.rfind('@').unwrap_or(usize::MAX);
     let (name, version) = if at < name_part.len() {
         (name_part[..at].to_string(), name_part[at + 1..].to_string())
@@ -310,12 +318,7 @@ fn fetch_crate(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
         r.version.clone()
     };
     let label = format!("crate:{}@{}", r.name, version);
-    let download_url = format!(
-        "{}/api/v1/crates/{}/{}/download",
-        crates(),
-        r.name,
-        version
-    );
+    let download_url = format!("{}/api/v1/crates/{}/{}/download", crates(), r.name, version);
     download_and_extract(&label, &download_url, out_dir)
 }
 
@@ -336,12 +339,7 @@ fn fetch_gem(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
         r.version.clone()
     };
     let label = format!("gem:{}@{}", r.name, version);
-    let download_url = format!(
-        "{}/gems/{}-{}.gem",
-        gems(),
-        r.name,
-        version
-    );
+    let download_url = format!("{}/gems/{}-{}.gem", gems(), r.name, version);
     download_and_extract(&label, &download_url, out_dir)
 }
 
@@ -405,8 +403,7 @@ fn fetch_packagist(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     let entry = packages
         .iter()
         .find(|e| {
-            r.version.is_empty()
-                || e.get("version").and_then(|v| v.as_str()) == Some(&r.version)
+            r.version.is_empty() || e.get("version").and_then(|v| v.as_str()) == Some(&r.version)
         })
         .and_then(|e| serde_json::from_value::<P2Entry>(e.clone()).ok())
         .ok_or_else(|| anyhow::anyhow!("packagist: no matching version for {}", r.name))?;
@@ -561,7 +558,11 @@ fn search_npm(query: &str) -> Result<Vec<SearchHit>> {
 }
 
 fn search_jsr(query: &str) -> Result<Vec<SearchHit>> {
-    let url = format!("{}/packages?query={}&limit=10", jsr_api(), urlencoded(query));
+    let url = format!(
+        "{}/packages?query={}&limit=10",
+        jsr_api(),
+        urlencoded(query)
+    );
     let meta: serde_json::Value = get_json(&url)?;
     Ok(meta["items"]
         .as_array()
@@ -580,7 +581,11 @@ fn search_jsr(query: &str) -> Result<Vec<SearchHit>> {
 }
 
 fn search_crates(query: &str) -> Result<Vec<SearchHit>> {
-    let url = format!("{}/api/v1/crates?q={}&per_page=10", crates(), urlencoded(query));
+    let url = format!(
+        "{}/api/v1/crates?q={}&per_page=10",
+        crates(),
+        urlencoded(query)
+    );
     let meta: serde_json::Value = get_json(&url)?;
     Ok(meta["crates"]
         .as_array()
@@ -599,7 +604,11 @@ fn search_crates(query: &str) -> Result<Vec<SearchHit>> {
 }
 
 fn search_gems(query: &str) -> Result<Vec<SearchHit>> {
-    let url = format!("{}/api/v1/search.json?query={}&per_page=10", gems(), urlencoded(query));
+    let url = format!(
+        "{}/api/v1/search.json?query={}&per_page=10",
+        gems(),
+        urlencoded(query)
+    );
     let meta: serde_json::Value = get_json(&url)?;
     Ok(meta
         .as_array()
@@ -619,13 +628,21 @@ fn search_gems(query: &str) -> Result<Vec<SearchHit>> {
 
 fn search_pypi(query: &str) -> Result<Vec<SearchHit>> {
     // PyPI doesn't have a simple JSON search API; use the JSON API for exact name lookup.
-    let _url = format!("{}/search/?q={}&o=&c=&format=json", pypi(), urlencoded(query));
+    let _url = format!(
+        "{}/search/?q={}&o=&c=&format=json",
+        pypi(),
+        urlencoded(query)
+    );
     // Fallback: just return an empty list (PyPI search requires HTML parsing).
     Ok(vec![])
 }
 
 fn search_packagist(query: &str) -> Result<Vec<SearchHit>> {
-    let url = format!("{}/search.json?q={}&per_page=10", packagist(), urlencoded(query));
+    let url = format!(
+        "{}/search.json?q={}&per_page=10",
+        packagist(),
+        urlencoded(query)
+    );
     let meta: serde_json::Value = get_json(&url)?;
     Ok(meta["results"]
         .as_array()
@@ -695,7 +712,10 @@ pub fn parse_profile_ref(raw: &str) -> Option<ProfileRef> {
 }
 
 pub fn can_profile(prefix: &str) -> bool {
-    matches!(prefix, "github" | "gitlab" | "npm" | "jsr" | "crate" | "gem")
+    matches!(
+        prefix,
+        "github" | "gitlab" | "npm" | "jsr" | "crate" | "gem"
+    )
 }
 
 pub fn profile_hits(prefix: &str, user: &str) -> Result<Vec<SearchHit>> {
@@ -755,7 +775,11 @@ pub fn js_hit_stats(prefix: &str, hit: &SearchHit) -> Result<Option<HitStats>> {
         .to_string();
     let tgz_bytes = meta["versions"][&version]["dist"]["unpackedSize"]
         .as_u64()
-        .or_else(|| meta["versions"][&version]["dist"]["tarball"].as_str().map(|_| 0));
+        .or_else(|| {
+            meta["versions"][&version]["dist"]["tarball"]
+                .as_str()
+                .map(|_| 0)
+        });
     Ok(Some(HitStats {
         deps: None,
         tgz_bytes,
@@ -773,7 +797,10 @@ pub fn registry_archive(_out_dir: &Path, r: &RegistryRef) -> Result<Vec<u8>> {
             r.version
         ),
         "gem" => format!("{}/gems/{}-{}.gem", gems(), r.name, r.version),
-        _ => bail!("raw archive download not supported for prefix: {}", r.prefix),
+        _ => bail!(
+            "raw archive download not supported for prefix: {}",
+            r.prefix
+        ),
     };
     get_archive(&url)
 }

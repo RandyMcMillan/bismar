@@ -247,7 +247,11 @@ pub fn csv_cell(val: &str) -> String {
 }
 
 pub fn csv_row(values: &[&str]) -> String {
-    values.iter().map(|v| csv_cell(v)).collect::<Vec<_>>().join(",")
+    values
+        .iter()
+        .map(|v| csv_cell(v))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn csv_row_owned(values: &[String]) -> String {
@@ -283,7 +287,14 @@ fn progress_write(text: &str) {
         return;
     }
     let msg = paint(
-        &format!("Loading…{}", if text.is_empty() { String::new() } else { format!(" {}", text) }),
+        &format!(
+            "Loading…{}",
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", text)
+            }
+        ),
         Color::DIM,
         want_color(),
     );
@@ -303,7 +314,11 @@ pub fn progress_update(text: &str) {
         progress_write(&show_text);
     } else if state.start.is_none() {
         state.start = Some(Instant::now());
-    } else if state.start.map(|s| s.elapsed() >= PROGRESS_DELAY).unwrap_or(false) {
+    } else if state
+        .start
+        .map(|s| s.elapsed() >= PROGRESS_DELAY)
+        .unwrap_or(false)
+    {
         state.shown = true;
         progress_write(&show_text);
     }

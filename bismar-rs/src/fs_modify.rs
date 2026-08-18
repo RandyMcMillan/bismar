@@ -32,8 +32,7 @@ pub fn rm_temp_dir(path: &Path) -> Result<()> {
         bail!("refusing to remove non-bismar path: {}", path.display());
     }
     if path.exists() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
 }
@@ -58,10 +57,7 @@ fn in_bismar_tmp(path: &Path) -> bool {
     let base = std::env::temp_dir();
     if let Ok(rel) = path.strip_prefix(&base) {
         if let Some(first) = rel.components().next() {
-            return first
-                .as_os_str()
-                .to_string_lossy()
-                .starts_with("bismar-");
+            return first.as_os_str().to_string_lossy().starts_with("bismar-");
         }
     }
     false
@@ -107,7 +103,10 @@ pub fn append_log(path: &Path, data: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(data.as_bytes())?;
     Ok(())
 }
@@ -171,8 +170,8 @@ fn safe_member_path(path: &Path) -> Result<PathBuf> {
 fn check_windows_safe(name: &str) -> Result<()> {
     // Reject Windows reserved device names when running cross-platform.
     static RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     let stem = name.split('.').next().unwrap_or(name).to_uppercase();
     if RESERVED.contains(&stem.as_str()) {
@@ -326,10 +325,7 @@ pub fn write_pkg(path: &Path, content: &str) -> Result<()> {
 /// Write a .npmrc that points npm at the JSR npm-compat registry.
 pub fn write_jsr_npmrc(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
-    write_text(
-        &dir.join(".npmrc"),
-        "@jsr:registry=https://npm.jsr.io\n",
-    )
+    write_text(&dir.join(".npmrc"), "@jsr:registry=https://npm.jsr.io\n")
 }
 
 /// Compute the SHA-256 digest of a byte slice.
