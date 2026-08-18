@@ -26,7 +26,6 @@ jobs:
           components: rustfmt
       - name: Cargo check
         run: cargo check --locked
-        continue-on-error: true
       - name: Check formatting
         run: cargo fmt --check
       - name: Build
