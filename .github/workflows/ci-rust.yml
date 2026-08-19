@@ -32,6 +32,22 @@ jobs:
         run: cargo fmt --check
       - name: Build
         run: cargo build --locked
+      - name: Run bismar for the bismar package
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import tomllib
+
+          cargo_toml = pathlib.Path("Cargo.toml")
+          package_name = tomllib.loads(cargo_toml.read_text()).get("package", {}).get("name", "")
+
+          if package_name:
+            selector = f"rs:{package_name}"
+            print(f"::group::bismar {selector}")
+            subprocess.run(["cargo", "run", "--locked", "--", "-s", selector], check=True)
+            print("::endgroup::")
+          PY
       - name: Run bismar for Cargo.toml dependencies
         run: |
           python - <<'PY'
