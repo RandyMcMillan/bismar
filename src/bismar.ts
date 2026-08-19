@@ -5,6 +5,7 @@
  */
 import { readFileSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   bundleStatCsv,
   bundleStatHuman,
@@ -35,16 +36,27 @@ import {
 } from './env.ts';
 import { clearTempCaches, rmTempDir, tempDir } from './fs-modify.ts';
 import type { InteractiveIo } from './interactive.ts';
-import { bad, err, explicitPath, fmtBytes, kb, runSelf } from './public.ts';
-import { asRef, explicitRef, type ExternalRef, installedRef, parseNpmRef } from './refs.ts';
+import { bad, err, explicitPath, fmtBytes, kb, readJson, readPkg, runSelf } from './public.ts';
+import {
+  asRef,
+  explicitRef,
+  type ExternalRef,
+  installedRef,
+  npmHintUse,
+  parseNpmRef,
+  PINNED,
+} from './refs.ts';
 import {
   canonSelector,
   isRegistrySelector,
   parseProfileRef,
+  npmReleaseDate,
   parseRegistryRef,
   profileHits,
   registryArchive,
   registryContext,
+  registryReleaseDate,
+  resolveRegistryVersion,
 } from './registries.ts';
 import { buildFirst, type Built, measureRows, type RowData, runSize } from './size.ts';
 import { fileSizesCsv, fileSizesHuman, registrySurface, sizesCsv, sizesHuman } from './surface.ts';
@@ -59,11 +71,13 @@ export type CliArgs = {
   minify: boolean;
   paths: string[];
   size: boolean;
+  version: boolean;
 };
 const usage = `usage:
   bismar [<selector>] [--bundle] [--minify] [--size] [--list]
   bismar [-bms] [<selector>]
   bismar --diff <a> <b>
+  bismar --version [<selector>]
 
 flags:
   <no flag>     open interactive navigator
@@ -77,6 +91,8 @@ flags:
       -dbs      (JS) diff of bundle sizes
       -dbsm     (JS) diff of bundle sizes, minified+gzipped 
   -l, --list    list all public exports
+  -v, --version bismar's version; with a selector, its resolved version
+                and release date (gh:/gitlab: pin to a commit hash)
       --clear   clean-up bismar cache
 
 selectors (package / ref / dir / archive):
@@ -125,11 +141,13 @@ const FLAGS: Record<string, string> = {
   '--list': '--list',
   '--minify': '--minify',
   '--size': '--size',
+  '--version': '--version',
   '-b': '--bundle',
   '-d': '--diff',
   '-l': '--list',
   '-m': '--minify',
   '-s': '--size',
+  '-v': '--version',
 };
 export const parseArgs = (argv: string[]): CliArgs => {
   const flags = new Set<string>();
@@ -173,9 +191,12 @@ export const parseArgs = (argv: string[]): CliArgs => {
     minify: flags.has('--minify'),
     paths,
     size: flags.has('--size'),
+    version: flags.has('--version'),
   };
   // Cross-mode combos are contradictions, not no-ops; refuse instead of guessing.
   if (args.clear && argv.length > 1) err('--clear runs alone; drop other arguments');
+  if (args.version && (args.bundle || args.minify || args.size || args.list || args.diff))
+    err('--version prints resolved versions alone; drop other flags');
   const reg = args.paths.find(isRegistrySelector);
   // Minification can only name a JS bundle, in every base/diff combination.
   if (reg && args.minify)
@@ -206,6 +227,82 @@ const noBundle = (selector: string, hint: '-d' | '-ds'): never => {
   const use = hint === '-ds' ? 'use -ds for shipped file sizes' : 'use -d to diff shipped files';
   return err(`${ns} refs have no JS to bundle: ${bad(selector)}; ${use}`);
 };
+// bismar's own version. The compiled entry sits beside package.json (outDir is
+// the repo root), the source entry one level below it — probe both, trusting
+// only a manifest that names this package.
+const selfVersion = (): string => {
+  for (const rel of ['./package.json', '../package.json']) {
+    try {
+      const pkg = readJson<{ name?: unknown; version?: unknown }>(
+        fileURLToPath(new URL(rel, import.meta.url))
+      );
+      if (pkg.name === 'bismar' && typeof pkg.version === 'string' && pkg.version)
+        return pkg.version;
+    } catch {
+      // Not at this level; try the other.
+    }
+  }
+  return err('cannot find the bismar package.json');
+};
+// `-v <selector>`: the concrete version the caches key on — an exact registry
+// version, a resolved npm/jsr version, a gh:/gitlab: commit hash, or a local
+// package.json's version — plus, when the registry says, its release date.
+const selectorVersion = async (
+  sel: string,
+  cwd: string
+): Promise<{ released: string; version: string }> => {
+  if (isRegistrySelector(sel)) {
+    const ref = parseRegistryRef(sel);
+    if (ref.path) err(`versions name whole packages; drop /${bad(ref.path)}`);
+    const version = await resolveRegistryVersion(ref);
+    return { released: await registryReleaseDate(ref, version), version };
+  }
+  if (explicitRef(sel)) {
+    const ref = parseNpmRef(asRef(sel));
+    if (ref.path) err(`versions name whole packages; drop /${bad(ref.path)}`);
+    let version = ref.version;
+    if (!PINNED.test(version)) {
+      // Floating specs resolve through the same cached install as every other
+      // mode, so the answer matches what a follow-up -bs would measure.
+      const tmp = tempDir('version');
+      try {
+        version = installedRef(tmp, ref, true).pkg.version;
+        if (!version) err(`no version in ${ref.label}'s package.json`);
+      } finally {
+        rmTempDir(tmp);
+      }
+    }
+    return { released: await npmReleaseDate(ref.bare, version, ref.jsr), version };
+  }
+  if (explicitPath(sel) || /^\.\.?$/.test(sel)) {
+    const dir = resolve(cwd, sel);
+    if (statSync(dir, { throwIfNoEntry: false })?.isFile())
+      err(`${bad(sel)} is a file; point --version at a package directory`);
+    const pkgFile = join(dir, 'package.json');
+    const version = readPkg(pkgFile, true).version || err(`no version in ${pkgFile}`);
+    // Local manifests carry no release timestamp; mtimes would only mislead.
+    return { released: '', version };
+  }
+  const use = npmHintUse(sel);
+  return err(`bare names never imply a registry: ${bad(sel)}${use ? `; ${use}` : ''}`);
+};
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// The gray tail after a resolved version: releases under a day old read as an
+// age (` from 22h ago`), older ones as the registry's calendar date, in UTC so
+// output is machine-independent (` from 6 Aug 2026`). An unknown or garbled
+// date prints nothing — the version alone is still the answer.
+const releasedText = (iso: string): string => {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return '';
+  const age = Date.now() - at;
+  const hour = 3_600_000;
+  if (age >= 0 && age < 24 * hour) {
+    const hours = Math.floor(age / hour);
+    return ` from ${hours ? `${hours}h` : `${Math.max(1, Math.floor(age / 60_000))}m`} ago`;
+  }
+  const d = new Date(at);
+  return ` from ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+};
 const decoder = new TextDecoder();
 const tarballSelector = /\.(?:tgz|tar\.gz)$/i;
 // Terminals never receive payload dumps: bundles and bundle diffs open in the
@@ -221,6 +318,19 @@ export const runCli = async (argv: string[], opts: Opts = {}): Promise<void> => 
     // Hidden maintenance hatch: wipe every bismar-* tmp cache and report.
     const { bytes, dirs } = clearTempCaches();
     return console.log(`removed ${dirs} cache dir${dirs === 1 ? '' : 's'}, ${fmtBytes(bytes)}`);
+  }
+  if (args.version) {
+    if (!args.paths.length) return console.log(selfVersion());
+    progressUpdate('');
+    const cwd = opts.cwd ?? process.cwd();
+    const on = stdoutColor(undefined, opts.tty);
+    for (const sel of args.paths) {
+      const { released, version } = await selectorVersion(sel, cwd);
+      progressDone();
+      const when = releasedText(released);
+      console.log(when ? version + paint(when, color.gray, on) : version);
+    }
+    return;
   }
   // Arm the startup progress line ('Loading…' after one silent second on a TTY);
   // installs, enumeration, and measurement refine its detail as they run.

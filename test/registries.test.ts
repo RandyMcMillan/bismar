@@ -559,6 +559,47 @@ it('js hit stats find packed tarball bytes and dep counts, then cache', async ()
   }
 });
 
+it('bismar -v prints resolved versions with their registry release dates', async () => {
+  const fresh = new Date(Date.now() - 22 * 3_600_000).toISOString();
+  const { port, server } = await serve({
+    '/qr': () => ({
+      body: JSON.stringify({ time: { '0.6.0': '2020-08-06T12:00:00.000Z', '0.7.0': fresh } }),
+      json: true,
+    }),
+    '/scopes/scope/packages/x/versions/1.2.3': () => ({
+      body: JSON.stringify({ createdAt: '2021-01-02T03:04:05.000Z' }),
+      json: true,
+    }),
+  });
+  process.env.BISMAR_NPM_API = `http://127.0.0.1:${port}`;
+  process.env.BISMAR_JSR_API = `http://127.0.0.1:${port}`;
+  const capture = async (argv: string[]): Promise<string> => {
+    const prevLog = console.log;
+    let out = '';
+    console.log = (...args: unknown[]) => {
+      out += `${args.join(' ')}\n`;
+    };
+    try {
+      await runCli(argv, { tty: false });
+    } finally {
+      console.log = prevLog;
+    }
+    return out;
+  };
+  try {
+    // Old releases read as a UTC calendar date, fresh ones (<24h) as an age.
+    deepStrictEqual(await capture(['-v', 'npm:qr@0.6.0']), '0.6.0 from 6 Aug 2020\n');
+    deepStrictEqual(await capture(['-v', 'npm:qr@0.7.0']), '0.7.0 from 22h ago\n');
+    deepStrictEqual(await capture(['-v', 'jsr:@scope/x@1.2.3']), '1.2.3 from 2 Jan 2021\n');
+    // A version the registry has no timestamp for prints bare, never errors.
+    deepStrictEqual(await capture(['-v', 'npm:qr@9.9.9']), '9.9.9\n');
+  } finally {
+    delete process.env.BISMAR_NPM_API;
+    delete process.env.BISMAR_JSR_API;
+    await closeServer(server);
+  }
+});
+
 it('github search rate limits surface as a one-line hint, not a retry storm', async () => {
   // Anonymous github search allows 10 queries a minute and answers 403; that
   // must map to a friendly message after exactly one request (403 never retries).

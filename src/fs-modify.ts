@@ -149,7 +149,7 @@ export const privateCacheDir = (name: string, ...children: string[]): string => 
   return mkdir(join(root, ...children));
 };
 
-export type TempKind = 'bundle' | 'check' | 'diff' | 'size';
+export type TempKind = 'bundle' | 'check' | 'diff' | 'size' | 'version';
 export const tempDir = (kind: TempKind): string => mkdtempSync(join(tmpdir(), `bismar-${kind}-`));
 export const rmTempDir = (dir: string): boolean => (
   rmSync(assertTemp(dir), { force: true, recursive: true }),
