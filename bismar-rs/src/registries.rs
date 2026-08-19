@@ -225,6 +225,17 @@ pub struct RegistryContext {
 
 pub fn registry_context(out_dir: &Path, r: &RegistryRef) -> Result<RegistryContext> {
     match r.prefix.as_str() {
+        "npm" | "jsr" => {
+            // Delegate to refs module for npm/jsr packages (installed via npm/jsr)
+            let npm_ref_str = format!("{}:{}", r.prefix, r.name);
+            let npm_ref = crate::refs::parse_npm_ref(&npm_ref_str)?;
+            let installed = crate::refs::installed_ref(out_dir, &npm_ref, true)?;
+            Ok(RegistryContext {
+                archive_bytes: None,
+                label: installed.label,
+                pkg_dir: installed.pkg_dir,
+            })
+        }
         "crate" => fetch_crate(out_dir, r),
         "gem" => fetch_gem(out_dir, r),
         "pypi" => fetch_pypi(out_dir, r),
