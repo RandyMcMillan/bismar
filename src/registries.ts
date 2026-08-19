@@ -275,6 +275,10 @@ type Registry = {
   // Mutable-ref registries (github): canonicalize any ref — or none, meaning
   // HEAD — to an immutable commit id. Replaces `resolve`.
   pin?: (name: string, refspec: string) => Promise<string>;
+  // Release timestamp (ISO 8601) of an exact version — for gh:/gitlab:, the
+  // pinned commit's date; '' when the registry doesn't say. Display garnish
+  // only: callers treat any failure as unknown, never as an error.
+  released?: (name: string, version: string) => Promise<string>;
   // Resolve the floating "latest" to a concrete version ('' when unresolvable).
   resolve?: (name: string) => Promise<string>;
   // Fixed name arity in `/`-segments; set, the segments past it are a `/path`
@@ -297,7 +301,10 @@ type CrateMeta = { crate?: { max_stable_version?: string | null; newest_version?
 const gems = (): string => base('BISMAR_GEMS_API', 'https://rubygems.org');
 type GemMeta = { version?: string };
 const pypi = (): string => base('BISMAR_PYPI_API', 'https://pypi.org');
-type PypiMeta = { info?: { version?: string }; urls?: { packagetype?: string; url?: string }[] };
+type PypiMeta = {
+  info?: { version?: string };
+  urls?: { packagetype?: string; upload_time_iso_8601?: string; url?: string }[];
+};
 // Memoized per run, like p2: the name-level meta serves resolve (latest version)
 // and, when the versions line up, fetch (that release's artifact list).
 const pypiMetaCache = new Map<string, Promise<PypiMeta>>();
@@ -311,7 +318,7 @@ const pypiMeta = (name: string): Promise<PypiMeta> => {
   return got;
 };
 const composer = (): string => base('BISMAR_COMPOSER_API', 'https://repo.packagist.org');
-type P2Entry = { dist?: { url?: string }; version?: string };
+type P2Entry = { dist?: { url?: string }; time?: string; version?: string };
 type P2Meta = { packages?: Record<string, P2Entry[]> };
 // Packagist p2 metadata is "minified": each entry lists only the fields that
 // changed from the previous one; expansion is a progressive shallow merge.
@@ -380,6 +387,11 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     name: /^[a-z0-9][\w.-]*\/[a-z0-9][\w.-]*$/i,
     segs: 2,
+    released: async (name, version) => {
+      const bare = (v: string): string => v.replace(/^v/, '');
+      const entry = (await p2(name)).find((e) => bare(e.version || '') === bare(version));
+      return entry?.time || '';
+    },
     resolve: async (name) => {
       // Newest first; prefer the newest stable, like crates' max_stable_version.
       const list = await p2(name);
@@ -403,6 +415,13 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/,
     segs: 1,
+    released: async (name, version) => {
+      const url = `${crates()}/api/v1/crates/${name}/${version}`;
+      const meta = await jsonOf<{ version?: { created_at?: string } }>(url, () =>
+        noVersion(REGISTRIES['crate:'], `crate:${name}@${version}`)
+      );
+      return meta.version?.created_at || '';
+    },
     resolve: async (name) => {
       const url = `${crates()}/api/v1/crates/${name}`;
       const meta = await jsonOf<CrateMeta>(url, () => notFound(REGISTRIES['crate:'], name));
@@ -440,6 +459,13 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     name: /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/,
     segs: 1,
+    released: async (name, version) => {
+      const url = `${gems()}/api/v2/rubygems/${name}/versions/${version}.json`;
+      const meta = await jsonOf<{ created_at?: string }>(url, () =>
+        noVersion(REGISTRIES['gem:'], `gem:${name}@${version}`)
+      );
+      return meta.created_at || '';
+    },
     resolve: async (name) => {
       const url = `${gems()}/api/v1/gems/${name}.json`;
       const meta = await jsonOf<GemMeta>(url, () => notFound(REGISTRIES['gem:'], name));
@@ -477,6 +503,13 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     name: /^[a-z\d][a-z\d-]*\/[\w.-]+$/i,
     segs: 2,
+    released: async (name, version) => {
+      const url = `${ghApi()}/repos/${name}/commits/${version}`;
+      const meta = await jsonOf<{
+        commit?: { author?: { date?: string }; committer?: { date?: string } };
+      }>(url, () => err(`commit not found: ${bad(`gh:${name}@${version}`)}`));
+      return meta.commit?.committer?.date || meta.commit?.author?.date || '';
+    },
     pin: async (name, refspec) => {
       const id = `gh:${name}${refspec ? `@${refspec}` : ''}`;
       const url = `${ghApi()}/repos/${name}/commits/${refspec || 'HEAD'}`;
@@ -511,6 +544,13 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.tar.gz' };
     },
     name: /^[a-z\d][\w.-]*(?:\/[\w.-]+)+$/i,
+    released: async (name, version) => {
+      const url = `${gitlabProject(name)}/repository/commits/${version}`;
+      const meta = await jsonOf<{ committed_date?: string }>(url, () =>
+        err(`commit not found: ${bad(`gitlab:${name}@${version}`)}`)
+      );
+      return meta.committed_date || '';
+    },
     pin: async (name, refspec) => {
       const id = `gitlab:${name}${refspec ? `@${refspec}` : ''}`;
       // The commit list resolves branches, tags, and shas alike; without
@@ -541,6 +581,13 @@ export const REGISTRIES: Record<string, Registry> = {
       return { bytes, ext: '.zip' };
     },
     name: /^[a-z0-9][\w.-]*(?:\/[\w.~-]+)*$/i,
+    released: async (name, version) => {
+      const url = `${goProxy()}/${goEsc(name)}/@v/${goEsc(version)}.info`;
+      const meta = await jsonOf<{ Time?: string }>(url, () =>
+        noVersion(REGISTRIES['go:'], `go:${name}@${version}`)
+      );
+      return meta.Time || '';
+    },
     resolve: async (name) => {
       const url = `${goProxy()}/${goEsc(name)}/@latest`;
       const meta = await jsonOf<{ Version?: string }>(url, () => notFound(REGISTRIES['go:'], name));
@@ -585,6 +632,18 @@ export const REGISTRIES: Record<string, Registry> = {
     },
     name: /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/,
     segs: 1,
+    released: async (name, version) => {
+      // Same reuse as fetch: the name-level meta usually already lists the
+      // latest release's artifacts, each stamped with its upload time.
+      const named = pypiMetaCache.get(name) ? await pypiMeta(name) : undefined;
+      const meta =
+        named?.info?.version === version && named.urls?.length
+          ? named
+          : await jsonOf<PypiMeta>(`${pypi()}/pypi/${name}/${version}/json`, () =>
+              noVersion(REGISTRIES['pypi:'], `pypi:${name}@${version}`)
+            );
+      return meta.urls?.find((u) => u.upload_time_iso_8601)?.upload_time_iso_8601 || '';
+    },
     resolve: async (name) => (await pypiMeta(name)).info?.version || '',
     site: 'pypi.org',
     use: 'name@version',
@@ -1170,15 +1229,10 @@ const hasFiles = (dir: string): boolean => {
     return false;
   }
 };
-// Fetch + extract a registry ref, reusing the pinned machine cache (`bismar-refs`,
-// same as npm refs): exact versions are immutable on their registries, so a warm
-// run touches neither the network nor an extractor. Versionless refs re-resolve
-// "latest" at most every 15 minutes via the shared tag cache (gh: every 30, per
-// its tagTtlScale).
-export const registryContext = async (
-  outDir: string,
-  ref: RegistryRef
-): Promise<{ archiveBytes?: number; label: string; pkgDir: string }> => {
+// The concrete version a ref's caches key on — an exact registry version, or
+// for pinning registries (gh:/gitlab:) the immutable commit id — resolved
+// through the shared tag cache. Resolution only; nothing is downloaded.
+export const resolveRegistryVersion = async (ref: RegistryRef): Promise<string> => {
   const reg = REGISTRIES[ref.prefix];
   let version = ref.version;
   if (reg.pin) {
@@ -1212,6 +1266,52 @@ export const registryContext = async (
       writeVersionTag(`${ref.prefix}${ref.name}`, version);
     }
   }
+  return version;
+};
+// Best-effort release timestamp for -v's display garnish: the registry's
+// publish date for an exact version (gh:/gitlab: the pinned commit's date).
+// '' means unknown — a resolved version must still print, so misses, offline
+// runs, and rate limits all collapse to it instead of erroring.
+export const registryReleaseDate = async (ref: RegistryRef, version: string): Promise<string> => {
+  try {
+    return (await REGISTRIES[ref.prefix].released?.(ref.name, version)) ?? '';
+  } catch {
+    return '';
+  }
+};
+// The npm/jsr twin, same contract: npm's full packument carries the `time` map
+// (the abbreviated one drops it); jsr's public api serves per-version metadata.
+export const npmReleaseDate = async (
+  bare: string,
+  version: string,
+  jsr: boolean
+): Promise<string> => {
+  try {
+    if (jsr) {
+      const [scope, name] = bare.slice(1).split('/');
+      const url = `${jsrApi()}/scopes/${scope}/packages/${name}/versions/${version}`;
+      const meta = await jsonOf<{ createdAt?: string }>(url, () => err(''));
+      return meta.createdAt || '';
+    }
+    const url = `${npmApi()}/${bare.replace('/', '%2f')}`;
+    const meta = await jsonOf<{ time?: Record<string, unknown> }>(url, () => err(''));
+    const at = meta.time?.[version];
+    return typeof at === 'string' ? at : '';
+  } catch {
+    return '';
+  }
+};
+// Fetch + extract a registry ref, reusing the pinned machine cache (`bismar-refs`,
+// same as npm refs): exact versions are immutable on their registries, so a warm
+// run touches neither the network nor an extractor. Versionless refs re-resolve
+// "latest" at most every 15 minutes via the shared tag cache (gh: every 30, per
+// its tagTtlScale).
+export const registryContext = async (
+  outDir: string,
+  ref: RegistryRef
+): Promise<{ archiveBytes?: number; label: string; pkgDir: string }> => {
+  const reg = REGISTRIES[ref.prefix];
+  const version = await resolveRegistryVersion(ref);
   const label = `${ref.prefix}${ref.name}@${version}`;
   const pinnedDir = refsCacheDir(label);
   if (hasFiles(pinnedDir) && hasCacheIdentity(label))
