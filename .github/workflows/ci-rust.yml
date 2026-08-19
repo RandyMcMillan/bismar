@@ -64,5 +64,38 @@ jobs:
             subprocess.run(["cargo", "run", "--locked", "--", "-s", selector], check=True)
             print("::endgroup::")
           PY
+      - name: Run bismar for the npm bismar package
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          package_json = pathlib.Path("../package.json")
+          package_name = json.loads(package_json.read_text()).get("name", "")
+
+          if package_name:
+            selector = f"npm:{package_name}"
+            print(f"::group::bismar {selector}")
+            subprocess.run(["cargo", "run", "--locked", "--", "-s", selector], check=True)
+            print("::endgroup::")
+          PY
+      - name: Run bismar for package.json dependencies
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          package_json = pathlib.Path("../package.json")
+          data = json.loads(package_json.read_text())
+          dependencies = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+
+          for dep in dependencies:
+            selector = f"npm:{dep}"
+            print(f"::group::bismar {selector}")
+            subprocess.run(["cargo", "run", "--locked", "--", "-s", selector], check=True)
+            print("::endgroup::")
+          PY
       - name: Test
         run: cargo test --locked
