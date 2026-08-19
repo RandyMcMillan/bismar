@@ -5,14 +5,23 @@
 //! Rust port of the TypeScript bismar CLI.
 
 mod cli;
+#[allow(dead_code)]
 mod diff;
+#[allow(dead_code)]
 mod env;
+#[allow(dead_code)]
 mod fs_modify;
+#[allow(dead_code)]
 mod interactive;
+#[allow(dead_code)]
 mod public;
+#[allow(dead_code)]
 mod refs;
+#[allow(dead_code)]
 mod registries;
+#[allow(dead_code)]
 mod size;
+#[allow(dead_code)]
 mod surface;
 
 use crate::cli::{parse_args, USAGE};

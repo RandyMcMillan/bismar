@@ -159,6 +159,7 @@ fn safe_member_path(path: &Path) -> Result<PathBuf> {
             }
             out.push(c);
         }
+        // Drop leading '/', CurDir, and ParentDir.
     }
     Ok(out)
 }
